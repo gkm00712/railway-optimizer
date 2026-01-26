@@ -8,10 +8,10 @@ import math
 # ==========================================
 st.set_page_config(page_title="Railway Logic Optimizer", layout="wide")
 st.title("🚂 BOXN Rake Demurrage Optimization Dashboard")
-st.markdown("Upload your `INSIGHT DETAILS.csv`. **Add Downtimes or Edit Finish Times to simulate scenarios.**")
+st.markdown("Upload your `INSIGHT DETAILS.csv`. **Edit Finish Times & Click Re-Calculate to update Start Times & Demurrage.**")
 
 # ==========================================
-# 2. HELPER FUNCTIONS & LOGIC
+# 2. HELPER FUNCTIONS
 # ==========================================
 
 def parse_wagons(val):
@@ -27,13 +27,21 @@ def format_dt(dt):
     return dt.strftime('%d-%H:%M')
 
 def restore_dt(dt_str, ref_dt):
+    """Restores datetime from 'dd-HH:MM' string using reference year/month."""
     if not isinstance(dt_str, str) or dt_str == "": return pd.NaT
     try:
         parts = dt_str.split('-') 
         day = int(parts[0])
         time_parts = parts[1].split(':')
         hour, minute = int(time_parts[0]), int(time_parts[1])
+        # Handle month boundaries roughly
         new_dt = ref_dt.replace(day=day, hour=hour, minute=minute, second=0)
+        # If new day is > ref day + 15, assume it's previous month (unlikely in future plan)
+        # If new day is < ref day - 15, assume next month
+        if day < ref_dt.day - 15: 
+            new_dt = new_dt + pd.DateOffset(months=1)
+        elif day > ref_dt.day + 15:
+            new_dt = new_dt - pd.DateOffset(months=1)
         return new_dt
     except: return pd.NaT
 
@@ -49,7 +57,6 @@ def format_duration_hhmm(delta):
 def check_downtime_impact(tippler_id, proposed_start, downtime_list):
     relevant_dts = [d for d in downtime_list if d['Tippler'] == tippler_id]
     relevant_dts.sort(key=lambda x: x['Start'])
-    
     current_start = proposed_start
     changed = True
     while changed:
@@ -59,6 +66,8 @@ def check_downtime_impact(tippler_id, proposed_start, downtime_list):
                 current_start = dt['End']
                 changed = True
     return current_start
+
+# --- CORE SIMULATION LOGIC ---
 
 def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtime_list, 
                            rate_t1, rate_t2, rate_t3, rate_t4, 
@@ -79,12 +88,14 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtim
     w_first = min(wagons, wagons_first_batch)
     w_second = wagons - w_first
     
+    # Primary Batch
     proposed_start_prim = max(ready_time, tippler_state[t_primary])
     actual_start_prim = check_downtime_impact(t_primary, proposed_start_prim, downtime_list)
     finish_primary = actual_start_prim + timedelta(hours=(w_first / resources[t_primary]))
     
     updated_times = {t_primary: finish_primary}
     
+    # Secondary Batch
     if w_second > 0:
         start_sec_theory = ready_time + timedelta(minutes=inter_tippler_delay)
         proposed_start_sec = max(start_sec_theory, tippler_state[t_secondary])
@@ -117,9 +128,7 @@ def find_specific_line(group, entry, status, last_idx):
     return cands[0]
 
 def run_full_simulation(df, params):
-    """
-    Initial Simulation Logic.
-    """
+    """Initial Simulation Logic."""
     r_t1, r_t2, r_t3, r_t4 = params['rt1'], params['rt2'], params['rt3'], params['rt4']
     s_a, s_b = params['sa'], params['sb']
     f_a, f_b = params['fa'], params['fb']
@@ -149,6 +158,8 @@ def run_full_simulation(df, params):
     assignments = []
     
     for _, rake in df.iterrows():
+        # ... (Same simulation logic as before, just wrapped) ...
+        # Calc A
         shunt_A = timedelta(minutes=s_a)
         entry_A = get_line_entry_time('Group_Lines_8_10', rake['arrival_dt'], line_groups)
         ready_A = entry_A + shunt_A
@@ -157,6 +168,7 @@ def run_full_simulation(df, params):
             r_t1, r_t2, r_t3, r_t4, w_batch, w_delay
         )
         
+        # Calc B
         shunt_B = timedelta(minutes=s_b)
         entry_B = get_line_entry_time('Group_Line_11', rake['arrival_dt'], line_groups)
         ready_B = entry_B + shunt_B
@@ -165,25 +177,28 @@ def run_full_simulation(df, params):
             r_t1, r_t2, r_t3, r_t4, w_batch, w_delay
         )
         
+        # Compare
         if fin_A <= fin_B:
-            best_pair, best_grp, best_entry, best_ready, best_start, best_fin = 'Pair A (T1&T2)', 'Group_Lines_8_10', entry_A, ready_A, start_A, fin_A
+            best_grp, best_entry, best_ready, best_start, best_fin = 'Group_Lines_8_10', entry_A, ready_A, start_A, fin_A
             best_tips, best_idle, best_form_mins = used_A, idle_A, f_a
             for k,v in up_A.items(): tippler_state[k] = v
             sel_line = find_specific_line(best_grp, best_entry, spec_line_status, rr_tracker_A)
             if sel_line in [8,9,10]: rr_tracker_A = {8:0,9:1,10:2}[sel_line]
             res_t1, res_t2, res_t3, res_t4 = up_A.get('T1', pd.NaT), up_A.get('T2', pd.NaT), pd.NaT, pd.NaT
         else:
-            best_pair, best_grp, best_entry, best_ready, best_start, best_fin = 'Pair B (T3&T4)', 'Group_Line_11', entry_B, ready_B, start_B, fin_B
+            best_grp, best_entry, best_ready, best_start, best_fin = 'Group_Line_11', entry_B, ready_B, start_B, fin_B
             best_tips, best_idle, best_form_mins = used_B, idle_B, f_b
             for k,v in up_B.items(): tippler_state[k] = v
             sel_line = 11
             res_t1, res_t2, res_t3, res_t4 = pd.NaT, pd.NaT, up_B.get('T3', pd.NaT), up_B.get('T4', pd.NaT)
             
+        # Update Lines
         clr_mins = line_groups[best_grp]['clearance_mins']
         line_free = best_entry + timedelta(minutes=clr_mins)
         line_groups[best_grp]['line_free_times'].append(line_free)
         spec_line_status[sel_line] = line_free
         
+        # Final Metrics
         wait_delta = best_start - best_ready
         form_delta = timedelta(minutes=best_form_mins)
         tot_dur = (best_fin - rake['arrival_dt']) + form_delta
@@ -218,18 +233,28 @@ def run_full_simulation(df, params):
 
 def recalculate_cascade(edited_df, free_time_hours):
     """
-    Cascading Re-calculation based on user manual edits.
-    Updates daily_demurrage_tracker during iteration.
+    Advanced Cascade:
+    1. Resets Tippler State.
+    2. Iterates rows.
+    3. Finds which tipplers a row uses.
+    4. Finds earliest valid start = Max(Ready Time, Tippler Free Time).
+    5. Checks if User manually delayed Start/Finish.
+    6. Updates Tippler State for next row.
+    7. Calculates Demurrage & Aggregates Daily.
     """
     recalc_rows = []
+    
+    # State reset is key for cascade
     tippler_state = {'T1': pd.Timestamp.min, 'T2': pd.Timestamp.min, 'T3': pd.Timestamp.min, 'T4': pd.Timestamp.min}
     daily_demurrage_tracker = {}
     
     for _, row in edited_df.iterrows():
+        # Restore Base Objects
         arrival = pd.to_datetime(row['_Arrival_DT'])
         ready = pd.to_datetime(row['_Shunt_Ready_DT'])
         form_mins = float(row['_Form_Mins'])
         
+        # Identify Resources
         used_str = str(row['Tipplers Used'])
         current_tipplers = []
         if 'T1' in used_str: current_tipplers.append('T1')
@@ -237,41 +262,72 @@ def recalculate_cascade(edited_df, free_time_hours):
         if 'T3' in used_str: current_tipplers.append('T3')
         if 'T4' in used_str: current_tipplers.append('T4')
         
+        # 1. Determine Earliest Physically Possible Start
+        # This is where the 'next rake' logic happens. 
+        # If previous rake finished T1 at 12:00, this rake cannot start T1 before 12:00.
         resource_free_at = pd.Timestamp.min
         for t in current_tipplers:
             resource_free_at = max(resource_free_at, tippler_state[t])
         
-        calculated_start = max(ready, resource_free_at)
+        # Start Time Constraint: Must be Ready AND Tippler Must be Free
+        valid_start = max(ready, resource_free_at)
         
-        try:
-            old_start = restore_dt(row['Tippler Start Time'], ready)
-            final_start = max(calculated_start, old_start)
-        except:
-            final_start = calculated_start
+        # 2. Check for Manual User Edits
+        # User might have typed "26-14:00" in the Start Time column
+        user_start = restore_dt(row['Tippler Start Time'], ready)
+        
+        # If user explicitly delays it (User > Valid), take User.
+        # If user explicitly rushes it (User < Valid), ignore User and enforce Valid (Physics).
+        if pd.notnull(user_start):
+            final_start = max(valid_start, user_start)
+        else:
+            final_start = valid_start
             
+        # 3. Determine Finish Time
+        # Check if user edited individual tipplers finish times
         tippler_finish_map = {}
         max_finish = final_start 
+        
+        # Logic: If user edited finish time, we respect it. 
+        # If not, we calculate finish based on original duration + new start.
+        
+        # Helper to get original duration logic if needed
+        # (Simplified: we assume if user cleared cell, we add 2 hours default)
         
         for t_id in ['T1', 'T2', 'T3', 'T4']:
             if t_id in current_tipplers:
                 col_name = f"{t_id} Finish"
+                # Check user edit
                 t_edit = restore_dt(row[col_name], final_start)
-                if pd.isnull(t_edit): 
-                    t_edit = final_start + timedelta(hours=2) 
                 
+                # If no edit, or invalid, we need a duration.
+                # Ideally we pull wagon count/rate, but for re-calc we preserve duration implied by row
+                if pd.isnull(t_edit):
+                    # Fallback: keep existing duration relative to new start? 
+                    # OR just assume user updated 'Finish Unload'.
+                    # For simplicity: Use main Finish Unload duration if available, else 2h
+                    user_main_finish = restore_dt(row['Finish Unload'], final_start)
+                    if pd.notnull(user_main_finish):
+                        dur = user_main_finish - restore_dt(row['Tippler Start Time'], ready) # Old duration
+                        t_edit = final_start + dur
+                    else:
+                        t_edit = final_start + timedelta(hours=2)
+
                 tippler_finish_map[t_id] = t_edit
-                tippler_state[t_id] = t_edit
+                tippler_state[t_id] = t_edit # UPDATE STATE FOR NEXT ROW
                 max_finish = max(max_finish, t_edit)
 
         final_finish = max_finish
             
+        # 4. Calculate Metrics
         wait_delta = final_start - ready
         form_delta = timedelta(minutes=form_mins)
         tot_dur = (final_finish - arrival) + form_delta
         
-        # --- NEW DEMURRAGE CALCULATION ---
+        # 5. Demurrage
         demurrage = max(timedelta(0), tot_dur - timedelta(hours=free_time_hours))
         
+        # 6. Update Row Values
         row['Tippler Start Time'] = format_dt(final_start)
         row['Finish Unload'] = format_dt(final_finish)
         
@@ -284,7 +340,7 @@ def recalculate_cascade(edited_df, free_time_hours):
         row['Total Duration'] = format_duration_hhmm(tot_dur)
         row['Demurrage'] = format_duration_hhmm(demurrage)
         
-        # --- AGGREGATE DAILY ---
+        # 7. Aggregate Daily
         date_str = arrival.strftime('%Y-%m-%d')
         daily_demurrage_tracker[date_str] = daily_demurrage_tracker.get(date_str, 0) + demurrage.total_seconds()
         
@@ -339,7 +395,7 @@ with st.sidebar.form("downtime_form"):
         if 'raw_data' in st.session_state:
             sim_params['downtimes'] = st.session_state.downtimes
             st.session_state.sim_result = run_full_simulation(st.session_state.raw_data, sim_params)
-            # FORCE RECALC STATS
+            # Init stats if needed
             _, st.session_state.daily_stats = recalculate_cascade(st.session_state.sim_result, sim_params['ft'])
             st.rerun()
 
@@ -376,7 +432,6 @@ if uploaded_file is not None:
         st.session_state.raw_data = df_raw
         st.session_state.last_uploaded_file = uploaded_file
         st.session_state.sim_result = run_full_simulation(df_raw, sim_params)
-        # INITIAL CALC OF DAILY STATS
         _, st.session_state.daily_stats = recalculate_cascade(st.session_state.sim_result, sim_params['ft'])
 
 # 2. RENDER DASHBOARD
@@ -400,12 +455,13 @@ if 'raw_data' in st.session_state:
     )
     
     if st.button("🔄 Re-Calculate (Cascade Delays)"):
+        # This will update SIM STATE with the result of the cascade
         new_result, daily_stats = recalculate_cascade(edited_df, sim_params['ft'])
         st.session_state.sim_result = new_result
         st.session_state.daily_stats = daily_stats
         st.rerun()
 
-    # RENDER SUMMARY FROM STATE
+    # Calc stats if missing
     if 'daily_stats' not in st.session_state:
         _, st.session_state.daily_stats = recalculate_cascade(st.session_state.sim_result, sim_params['ft'])
         
