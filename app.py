@@ -5,7 +5,7 @@ import math
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Railway Logic Optimizer", layout="wide")
-st.title("🚂 Railway Rake Demurrage Optimization Dashboard")
+st.title("🚂 BOXN Rake Demurrage Optimization Dashboard")
 st.markdown("Upload your `INSIGHT DETAILS.csv` to run the simulation based on your offline logic.")
 
 # ==========================================
@@ -177,3 +177,4 @@ if uploaded_file is not None:
             mime="text/csv",
 
         )
+
