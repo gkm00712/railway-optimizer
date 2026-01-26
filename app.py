@@ -15,6 +15,10 @@ st.markdown("Upload your `INSIGHT DETAILS.csv` to run the simulation based on yo
 # ==========================================
 st.sidebar.header("⚙️ Infrastructure Settings")
 
+# Demurrage Settings (NEW)
+st.sidebar.subheader("Demurrage Rules")
+FREE_TIME_HOURS = st.sidebar.number_input("Free Time Allowed (Hours)", value=7.0, step=0.5)
+
 # Unloading Rates
 st.sidebar.subheader("Individual Tippler Rates")
 RATE_T1 = st.sidebar.number_input("Tippler 1 Rate (Wagons/hr)", value=6.0, step=0.5)
@@ -66,11 +70,9 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
     # 3. Calculate IDLE TIME (Gap between Machine Free and Train Ready)
     machine_free_at = tippler_state[t_primary]
     
-    # --- CRITICAL FIX: Check for Timestamp.min BEFORE subtraction ---
     if machine_free_at == pd.Timestamp.min:
         idle_delta = timedelta(0)
     else:
-        # Only calculate if valid. Max ensures we don't get negative idle.
         idle_delta = max(timedelta(0), ready_time - machine_free_at)
 
     # 4. Split Wagons
@@ -189,6 +191,7 @@ if uploaded_file is not None:
         rr_tracker_A = -1 
         
         assignments = []
+        daily_demurrage_tracker = {} # Key: Date String, Value: Total Seconds
         
         for _, rake in df.iterrows():
             
@@ -265,6 +268,17 @@ if uploaded_file is not None:
             formation_delta = timedelta(minutes=best_formation_mins)
             total_duration_delta = (best_finish - rake['arrival_dt']) + formation_delta
             
+            # --- DEMURRAGE CALCULATION ---
+            # Demurrage = Max(0, Total Duration - Free Time)
+            free_time_delta = timedelta(hours=FREE_TIME_HOURS)
+            demurrage_delta = max(timedelta(0), total_duration_delta - free_time_delta)
+            
+            # Aggregate Daily Demurrage
+            arrival_date_str = rake['arrival_dt'].strftime('%Y-%m-%d')
+            if arrival_date_str not in daily_demurrage_tracker:
+                daily_demurrage_tracker[arrival_date_str] = 0.0
+            daily_demurrage_tracker[arrival_date_str] += demurrage_delta.total_seconds()
+            
             assignments.append({
                 'Rake': rake['RAKE NAME'],
                 'Station From': rake.get('STTN FROM', 'N/A'),
@@ -287,12 +301,30 @@ if uploaded_file is not None:
                 'Tippler Idle Time': format_duration_hhmm(best_idle), 
                 'Formation Time': f"{int(best_formation_mins)} m",
                 'Total Duration': format_duration_hhmm(total_duration_delta),
+                'Demurrage': format_duration_hhmm(demurrage_delta), # NEW COLUMN
                 'Placement Reason': rake.get('PLCT RESN', 'N/A')
             })
 
         res_df = pd.DataFrame(assignments)
+        
+        # --- DISPLAY MAIN TABLE ---
         st.success(f"Optimization Complete! Processed {len(res_df)} trains.")
         st.dataframe(res_df, use_container_width=True)
+        
+        # --- DISPLAY DAILY DEMURRAGE SUMMARY ---
+        st.markdown("### 📅 Daily Demurrage Summary")
+        if daily_demurrage_tracker:
+            daily_data = []
+            for date_str, total_seconds in daily_demurrage_tracker.items():
+                hours = int(total_seconds // 3600)
+                minutes = int((total_seconds % 3600) // 60)
+                formatted_time = f"{hours:02d}:{minutes:02d}"
+                daily_data.append({'Date': date_str, 'Total Demurrage Hours': formatted_time})
+            
+            daily_df = pd.DataFrame(daily_data).sort_values('Date')
+            st.dataframe(daily_df, use_container_width=True)
+        else:
+            st.info("No demurrage incurred based on current settings.")
         
         csv = res_df.to_csv(index=False).encode('utf-8')
         st.download_button("📥 Download Optimized Schedule", csv, "optimized_schedule.csv", "text/csv")
