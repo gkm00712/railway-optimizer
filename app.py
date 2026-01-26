@@ -27,7 +27,7 @@ st.sidebar.subheader("Shunting Delays")
 SHUNT_MINS_A = st.sidebar.number_input("Pair A Initial Shunt (Mins)", value=25.0, step=5.0)
 SHUNT_MINS_B = st.sidebar.number_input("Pair B Initial Shunt (Mins)", value=50.0, step=5.0)
 
-# Rake Formation Time (NEW)
+# Rake Formation Time
 st.sidebar.subheader("Rake Formation Time")
 FORMATION_MINS_A = st.sidebar.number_input("Pair A Formation (Mins)", value=20.0, step=5.0)
 FORMATION_MINS_B = st.sidebar.number_input("Pair B Formation (Mins)", value=50.0, step=5.0)
@@ -49,7 +49,7 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
     Calculates finish time using DYNAMIC ASSIGNMENT.
     """
     if wagons == 0: 
-        return ready_time, "None", ready_time, {}
+        return ready_time, "None", ready_time, {}, timedelta(0)
     
     # 1. Define Resources based on Pair
     if pair_name == 'Pair A (T1&T2)':
@@ -63,11 +63,23 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
     t_primary = sorted_tipplers[0]   # The one free earliest
     t_secondary = sorted_tipplers[1] # The one free later
     
-    # 3. Split Wagons
+    # 3. Calculate IDLE TIME (Gap between Machine Free and Train Ready)
+    # We track idle time for the PRIMARY tippler (since it starts the job)
+    machine_free_at = tippler_state[t_primary]
+    
+    # If machine was free at 10:00 and Train Ready at 10:30 -> Idle = 30 mins
+    # If machine was free at 10:30 and Train Ready at 10:00 -> Idle = 0 mins (Machine was busy)
+    idle_delta = max(timedelta(0), ready_time - machine_free_at)
+    
+    # Only count idle time if the machine has been used before (not Pd.Timestamp.min)
+    if machine_free_at == pd.Timestamp.min:
+        idle_delta = timedelta(0)
+
+    # 4. Split Wagons
     w_first = min(wagons, WAGONS_FIRST_BATCH)
     w_second = wagons - w_first
     
-    # 4. Calculate Timings
+    # 5. Calculate Timings
     
     # Primary Batch
     start_primary = max(ready_time, tippler_state[t_primary])
@@ -91,7 +103,7 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
         used_str = f"{t_primary} Only"
         updated_times[t_secondary] = tippler_state[t_secondary]
 
-    return overall_finish, used_str, start_primary, updated_times
+    return overall_finish, used_str, start_primary, updated_times, idle_delta
 
 def get_line_entry_time(group_name, arrival_time, line_groups):
     group = line_groups[group_name]
@@ -186,7 +198,7 @@ if uploaded_file is not None:
             entry_time_A = get_line_entry_time('Group_Lines_8_10', rake['arrival_dt'], line_groups)
             ready_to_unload_A = entry_time_A + shunt_offset_A
             
-            finish_A, used_A, start_A, updated_times_A = calculate_split_finish(
+            finish_A, used_A, start_A, updated_times_A, idle_A = calculate_split_finish(
                 rake['wagon_count'], 'Pair A (T1&T2)', ready_to_unload_A, tippler_state
             )
             
@@ -195,7 +207,7 @@ if uploaded_file is not None:
             entry_time_B = get_line_entry_time('Group_Line_11', rake['arrival_dt'], line_groups)
             ready_to_unload_B = entry_time_B + shunt_offset_B
             
-            finish_B, used_B, start_B, updated_times_B = calculate_split_finish(
+            finish_B, used_B, start_B, updated_times_B, idle_B = calculate_split_finish(
                 rake['wagon_count'], 'Pair B (T3&T4)', ready_to_unload_B, tippler_state
             )
             
@@ -208,6 +220,7 @@ if uploaded_file is not None:
                 best_start = start_A
                 best_finish = finish_A
                 best_tipplers = used_A
+                best_idle = idle_A
                 best_formation_mins = FORMATION_MINS_A
                 
                 # Update State
@@ -229,6 +242,7 @@ if uploaded_file is not None:
                 best_start = start_B
                 best_finish = finish_B
                 best_tipplers = used_B
+                best_idle = idle_B
                 best_formation_mins = FORMATION_MINS_B
                 
                 # Update State
@@ -249,8 +263,6 @@ if uploaded_file is not None:
             # --- CALCULATE DURATIONS ---
             wait_delta = best_start - best_ready
             
-            # Total Duration Calculation
-            # Formula: (Unloading Finish Time - Arrival Time) + Formation Time
             formation_delta = timedelta(minutes=best_formation_mins)
             total_duration_delta = (best_finish - rake['arrival_dt']) + formation_delta
             
@@ -266,14 +278,15 @@ if uploaded_file is not None:
                 'Shunting Complete': format_dt(best_ready), 
                 'Assigned Pair': best_pair,
                 'Tipplers Used': best_tipplers,
-                'Tippler Start Time': format_dt(best_start), # Renamed for clarity
+                'Tippler Start Time': format_dt(best_start),
                 'Finish Unload': format_dt(best_finish),
                 'T1 Finish': format_dt(res_t1),
                 'T2 Finish': format_dt(res_t2),
                 'T3 Finish': format_dt(res_t3),
                 'T4 Finish': format_dt(res_t4),
                 'Wait (Tippler)': format_duration_hhmm(wait_delta),
-                'Formation Time': f"{int(best_formation_mins)} m", # NEW COLUMN
+                'Tippler Idle Time': format_duration_hhmm(best_idle), # NEW COLUMN
+                'Formation Time': f"{int(best_formation_mins)} m",
                 'Total Duration': format_duration_hhmm(total_duration_delta),
                 'Placement Reason': rake.get('PLCT RESN', 'N/A')
             })
