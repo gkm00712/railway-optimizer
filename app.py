@@ -8,31 +8,26 @@ import math
 # ==========================================
 st.set_page_config(page_title="Railway Logic Optimizer", layout="wide")
 st.title("🚂 BOXN Rake Demurrage Optimization Dashboard")
-st.markdown("Upload your `INSIGHT DETAILS.csv` to run the simulation.")
+st.markdown("Upload your `INSIGHT DETAILS.csv`. **Edit the table below and click 'Re-Calculate' to update metrics.**")
 
 # ==========================================
 # 1. SIDEBAR CONFIGURATION
 # ==========================================
 st.sidebar.header("⚙️ Infrastructure Settings")
 
-# Unloading Rates
+# Rates
 st.sidebar.subheader("Individual Tippler Rates")
 RATE_T1 = st.sidebar.number_input("Tippler 1 Rate (Wagons/hr)", value=6.0, step=0.5)
 RATE_T2 = st.sidebar.number_input("Tippler 2 Rate (Wagons/hr)", value=6.0, step=0.5)
 RATE_T3 = st.sidebar.number_input("Tippler 3 Rate (Wagons/hr)", value=9.0, step=0.5)
 RATE_T4 = st.sidebar.number_input("Tippler 4 Rate (Wagons/hr)", value=9.0, step=0.5)
 
-# Shunting Penalties
-st.sidebar.subheader("Shunting Delays")
-SHUNT_MINS_A = st.sidebar.number_input("Pair A Initial Shunt (Mins)", value=25.0, step=5.0)
-SHUNT_MINS_B = st.sidebar.number_input("Pair B Initial Shunt (Mins)", value=50.0, step=5.0)
-
-# Rake Formation Time
-st.sidebar.subheader("Rake Formation Time")
+# Penalties & Delays
+st.sidebar.subheader("Delays & Free Time")
+SHUNT_MINS_A = st.sidebar.number_input("Pair A Shunt (Mins)", value=25.0, step=5.0)
+SHUNT_MINS_B = st.sidebar.number_input("Pair B Shunt (Mins)", value=50.0, step=5.0)
 FORMATION_MINS_A = st.sidebar.number_input("Pair A Formation (Mins)", value=20.0, step=5.0)
 FORMATION_MINS_B = st.sidebar.number_input("Pair B Formation (Mins)", value=50.0, step=5.0)
-
-# Demurrage
 FREE_TIME_HOURS = st.sidebar.number_input("Free Time Allowed (Hours)", value=7.0, step=0.5)
 
 # Stagger Logic
@@ -40,13 +35,9 @@ st.sidebar.subheader("Split Logic")
 WAGONS_FIRST_BATCH = st.sidebar.number_input("Wagons in 1st Batch", value=30, step=1)
 INTER_TIPPLER_DELAY = st.sidebar.number_input("Delay for 2nd Tippler Start (Mins)", value=0.0, step=5.0)
 
-# ------------------------------------------
-# NEW: DOWNTIME MANAGER
-# ------------------------------------------
+# Downtime Manager
 st.sidebar.markdown("---")
 st.sidebar.subheader("🛠️ Tippler Downtime Manager")
-st.sidebar.info("Add breakdown or maintenance periods here to simulate delays.")
-
 if 'downtimes' not in st.session_state:
     st.session_state.downtimes = []
 
@@ -60,144 +51,22 @@ with st.sidebar.form("downtime_form"):
     if add_dt:
         start_dt = datetime.combine(dt_start_date, dt_start_time)
         end_dt = start_dt + timedelta(minutes=dt_duration)
-        st.session_state.downtimes.append({
-            "Tippler": dt_tippler,
-            "Start": start_dt,
-            "End": end_dt
-        })
+        st.session_state.downtimes.append({"Tippler": dt_tippler, "Start": start_dt, "End": end_dt})
         st.success(f"Added {dt_tippler} downtime.")
 
-# Display Active Downtimes
 if st.session_state.downtimes:
-    st.sidebar.markdown("##### Active Downtimes")
     dt_df = pd.DataFrame(st.session_state.downtimes)
-    # Convert to readable format
     dt_display = dt_df.copy()
     dt_display['Start'] = dt_display['Start'].dt.strftime('%d-%H:%M')
     dt_display['End'] = dt_display['End'].dt.strftime('%d-%H:%M')
     st.sidebar.dataframe(dt_display, use_container_width=True)
-    if st.sidebar.button("Clear All Downtimes"):
+    if st.sidebar.button("Clear Downtimes"):
         st.session_state.downtimes = []
         st.rerun()
 
-st.sidebar.info(f"Line 8-10 Clearance: 50 mins\nLine 11 Clearance: 100 mins")
-
 # ==========================================
-# 2. CALCULATION LOGIC
+# 2. HELPER FUNCTIONS
 # ==========================================
-
-def check_downtime_impact(tippler_id, proposed_start, downtime_list):
-    """
-    Checks if 'proposed_start' falls inside a downtime window.
-    If yes, returns the End Time of that downtime.
-    Recursively checks in case the new time also falls in a downtime.
-    """
-    # Filter downtimes for this specific tippler
-    relevant_dts = [d for d in downtime_list if d['Tippler'] == tippler_id]
-    
-    # Sort by start time
-    relevant_dts.sort(key=lambda x: x['Start'])
-    
-    current_start = proposed_start
-    
-    for dt in relevant_dts:
-        # If our start time is inside a downtime window
-        if dt['Start'] <= current_start < dt['End']:
-            # Push start to end of downtime
-            current_start = dt['End']
-            # We might need to check subsequent downtimes, so loop continues or recurses
-            # Ideally, we restart check, but sorted list helps.
-    
-    return current_start
-
-def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtime_list):
-    """
-    Calculates finish time using DYNAMIC ASSIGNMENT & DOWNTIME AWARENESS.
-    """
-    if wagons == 0: 
-        return ready_time, "None", ready_time, {}, timedelta(0)
-    
-    # 1. Define Resources based on Pair
-    if pair_name == 'Pair A (T1&T2)':
-        resources = {'T1': RATE_T1, 'T2': RATE_T2}
-    else:
-        resources = {'T3': RATE_T3, 'T4': RATE_T4}
-        
-    # 2. DYNAMIC SORT: Find which tippler is free earliest
-    sorted_tipplers = sorted(resources.keys(), key=lambda x: tippler_state[x])
-    
-    t_primary = sorted_tipplers[0]
-    t_secondary = sorted_tipplers[1]
-    
-    # 3. Calculate IDLE TIME (Gap between Machine Free and Train Ready)
-    machine_free_at = tippler_state[t_primary]
-    if machine_free_at == pd.Timestamp.min:
-        idle_delta = timedelta(0)
-    else:
-        idle_delta = max(timedelta(0), ready_time - machine_free_at)
-
-    # 4. Split Wagons
-    w_first = min(wagons, WAGONS_FIRST_BATCH)
-    w_second = wagons - w_first
-    
-    # 5. Calculate Timings with DOWNTIME CHECK
-    
-    # --- Primary Batch ---
-    # Proposed Start = Max(Ready, Previous Finish)
-    proposed_start_prim = max(ready_time, tippler_state[t_primary])
-    
-    # CHECK DOWNTIME: If T_Primary is down, push start time
-    actual_start_prim = check_downtime_impact(t_primary, proposed_start_prim, downtime_list)
-    
-    duration_prim = timedelta(hours=(w_first / resources[t_primary]))
-    # Note: We assume once started, it finishes. 
-    # (Advanced logic would be needed to pause mid-unloading, simplified here to start-check)
-    finish_primary = actual_start_prim + duration_prim
-    
-    updated_times = {}
-    updated_times[t_primary] = finish_primary
-    
-    # --- Secondary Batch ---
-    if w_second > 0:
-        start_secondary_theoretical = ready_time + timedelta(minutes=INTER_TIPPLER_DELAY)
-        proposed_start_sec = max(start_secondary_theoretical, tippler_state[t_secondary])
-        
-        # CHECK DOWNTIME for Secondary
-        actual_start_sec = check_downtime_impact(t_secondary, proposed_start_sec, downtime_list)
-        
-        duration_sec = timedelta(hours=(w_second / resources[t_secondary]))
-        finish_secondary = actual_start_sec + duration_sec
-        
-        updated_times[t_secondary] = finish_secondary
-        
-        overall_finish = max(finish_primary, finish_secondary)
-        used_str = f"{t_primary} & {t_secondary}"
-    else:
-        overall_finish = finish_primary
-        used_str = f"{t_primary} Only"
-        updated_times[t_secondary] = tippler_state[t_secondary]
-
-    return overall_finish, used_str, actual_start_prim, updated_times, idle_delta
-
-def get_line_entry_time(group_name, arrival_time, line_groups):
-    group = line_groups[group_name]
-    active_line_blocks = sorted([t for t in group['line_free_times'] if t > arrival_time])
-    if len(active_line_blocks) < group['capacity']:
-        return arrival_time
-    slots_needed_to_free = len(active_line_blocks) - group['capacity'] + 1
-    return active_line_blocks[slots_needed_to_free - 1]
-
-def find_specific_line(group_name, entry_time, specific_line_status, last_used_index):
-    if group_name == 'Group_Lines_8_10':
-        base_candidates = [8, 9, 10]
-        start_idx = (last_used_index + 1) % 3
-        priority_candidates = base_candidates[start_idx:] + base_candidates[:start_idx]
-    else:
-        priority_candidates = [11]
-    for line_num in priority_candidates:
-        if specific_line_status[line_num] <= entry_time:
-            return line_num
-    return priority_candidates[0]
 
 def parse_wagons(val):
     try:
@@ -211,194 +80,291 @@ def format_dt(dt):
     if pd.isnull(dt): return ""
     return dt.strftime('%d-%H:%M')
 
+def parse_dt_str(dt_str):
+    """Parses 'dd-HH:MM' string back to datetime object relative to current year/month approximation."""
+    if not dt_str or str(dt_str).lower() == 'nan' or str(dt_str).strip() == "":
+        return pd.NaT
+    try:
+        # Assuming current year/month for simulation context if not present
+        # Ideally, we should keep the full datetime object in the dataframe but display it formatted.
+        # For re-calculation, we will try to carry over the original Year/Month from the original arrival if possible.
+        # SIMPLIFICATION: We will assume the dataframe 'Sim_Object' column holds the real datetime.
+        return pd.to_datetime(dt_str, format='%d-%H:%M', errors='coerce')
+    except:
+        return pd.NaT
+
 def format_duration_hhmm(delta):
+    if pd.isnull(delta): return "00:00"
     total_seconds = int(delta.total_seconds())
+    sign = "-" if total_seconds < 0 else ""
+    total_seconds = abs(total_seconds)
     hours = total_seconds // 3600
     minutes = (total_seconds % 3600) // 60
-    return f"{hours:02d}:{minutes:02d}"
+    return f"{sign}{hours:02d}:{minutes:02d}"
+
+def check_downtime_impact(tippler_id, proposed_start, downtime_list):
+    relevant_dts = [d for d in downtime_list if d['Tippler'] == tippler_id]
+    relevant_dts.sort(key=lambda x: x['Start'])
+    current_start = proposed_start
+    for dt in relevant_dts:
+        if dt['Start'] <= current_start < dt['End']:
+            current_start = dt['End']
+    return current_start
+
+def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtime_list):
+    if wagons == 0: return ready_time, "None", ready_time, {}, timedelta(0)
+    
+    if pair_name == 'Pair A (T1&T2)':
+        resources = {'T1': RATE_T1, 'T2': RATE_T2}
+    else:
+        resources = {'T3': RATE_T3, 'T4': RATE_T4}
+        
+    sorted_tipplers = sorted(resources.keys(), key=lambda x: tippler_state[x])
+    t_primary, t_secondary = sorted_tipplers[0], sorted_tipplers[1]
+    
+    machine_free_at = tippler_state[t_primary]
+    idle_delta = timedelta(0) if machine_free_at == pd.Timestamp.min else max(timedelta(0), ready_time - machine_free_at)
+
+    w_first = min(wagons, WAGONS_FIRST_BATCH)
+    w_second = wagons - w_first
+    
+    proposed_start_prim = max(ready_time, tippler_state[t_primary])
+    actual_start_prim = check_downtime_impact(t_primary, proposed_start_prim, downtime_list)
+    finish_primary = actual_start_prim + timedelta(hours=(w_first / resources[t_primary]))
+    
+    updated_times = {t_primary: finish_primary}
+    
+    if w_second > 0:
+        start_sec_theory = ready_time + timedelta(minutes=INTER_TIPPLER_DELAY)
+        proposed_start_sec = max(start_sec_theory, tippler_state[t_secondary])
+        actual_start_sec = check_downtime_impact(t_secondary, proposed_start_sec, downtime_list)
+        finish_secondary = actual_start_sec + timedelta(hours=(w_second / resources[t_secondary]))
+        updated_times[t_secondary] = finish_secondary
+        overall_finish = max(finish_primary, finish_secondary)
+        used_str = f"{t_primary} & {t_secondary}"
+    else:
+        overall_finish = finish_primary
+        used_str = f"{t_primary} Only"
+        updated_times[t_secondary] = tippler_state[t_secondary]
+
+    return overall_finish, used_str, actual_start_prim, updated_times, idle_delta
+
+def get_line_entry_time(group, arrival, line_groups):
+    grp = line_groups[group]
+    active = sorted([t for t in grp['line_free_times'] if t > arrival])
+    if len(active) < grp['capacity']: return arrival
+    return active[len(active) - grp['capacity']]
+
+def find_specific_line(group, entry, status, last_idx):
+    cands = [8, 9, 10] if group == 'Group_Lines_8_10' else [11]
+    if group == 'Group_Lines_8_10':
+        start = (last_idx + 1) % 3
+        cands = cands[start:] + cands[:start]
+    for l in cands:
+        if status[l] <= entry: return l
+    return cands[0]
 
 # ==========================================
-# 3. MAIN APP EXECUTION
+# 3. MAIN SIMULATION ENGINE
+# ==========================================
+
+def run_full_simulation(df):
+    """Runs the initial logic from scratch."""
+    df['wagon_count'] = df['TOTL UNTS'].apply(parse_wagons)
+    df['exp_arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce')
+    
+    if 'STTS CODE' in df.columns and 'STTS TIME' in df.columns:
+        df['stts_time_dt'] = pd.to_datetime(df['STTS TIME'], errors='coerce')
+        df['arrival_dt'] = df.apply(lambda r: r['stts_time_dt'] if str(r.get('STTS CODE')).strip()=='PL' and pd.notnull(r['stts_time_dt']) else r['exp_arrival_dt'], axis=1)
+    else:
+        df['arrival_dt'] = df['exp_arrival_dt']
+
+    df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt').reset_index(drop=True)
+    
+    tippler_state = {'T1': pd.Timestamp.min, 'T2': pd.Timestamp.min, 'T3': pd.Timestamp.min, 'T4': pd.Timestamp.min}
+    spec_line_status = {8: pd.Timestamp.min, 9: pd.Timestamp.min, 10: pd.Timestamp.min, 11: pd.Timestamp.min}
+    line_groups = {
+        'Group_Lines_8_10': {'capacity': 2, 'clearance_mins': 50, 'line_free_times': []}, 
+        'Group_Line_11': {'capacity': 1, 'clearance_mins': 100, 'line_free_times': []}
+    }
+    rr_tracker_A = -1 
+    assignments = []
+    
+    for _, rake in df.iterrows():
+        # A
+        shunt_A = timedelta(minutes=SHUNT_MINS_A)
+        entry_A = get_line_entry_time('Group_Lines_8_10', rake['arrival_dt'], line_groups)
+        ready_A = entry_A + shunt_A
+        fin_A, used_A, start_A, up_A, idle_A = calculate_split_finish(rake['wagon_count'], 'Pair A (T1&T2)', ready_A, tippler_state, st.session_state.downtimes)
+        
+        # B
+        shunt_B = timedelta(minutes=SHUNT_MINS_B)
+        entry_B = get_line_entry_time('Group_Line_11', rake['arrival_dt'], line_groups)
+        ready_B = entry_B + shunt_B
+        fin_B, used_B, start_B, up_B, idle_B = calculate_split_finish(rake['wagon_count'], 'Pair B (T3&T4)', ready_B, tippler_state, st.session_state.downtimes)
+        
+        if fin_A <= fin_B:
+            best_pair, best_grp, best_entry, best_ready, best_start, best_fin = 'Pair A (T1&T2)', 'Group_Lines_8_10', entry_A, ready_A, start_A, fin_A
+            best_tips, best_idle, best_form_mins = used_A, idle_A, FORMATION_MINS_A
+            for k,v in up_A.items(): tippler_state[k] = v
+            sel_line = find_specific_line(best_grp, best_entry, spec_line_status, rr_tracker_A)
+            if sel_line in [8,9,10]: rr_tracker_A = {8:0,9:1,10:2}[sel_line]
+            res_t1, res_t2, res_t3, res_t4 = up_A.get('T1', pd.NaT), up_A.get('T2', pd.NaT), pd.NaT, pd.NaT
+        else:
+            best_pair, best_grp, best_entry, best_ready, best_start, best_fin = 'Pair B (T3&T4)', 'Group_Line_11', entry_B, ready_B, start_B, fin_B
+            best_tips, best_idle, best_form_mins = used_B, idle_B, FORMATION_MINS_B
+            for k,v in up_B.items(): tippler_state[k] = v
+            sel_line = 11
+            res_t1, res_t2, res_t3, res_t4 = pd.NaT, pd.NaT, up_B.get('T3', pd.NaT), up_B.get('T4', pd.NaT)
+            
+        clr_mins = line_groups[best_grp]['clearance_mins']
+        line_free = best_entry + timedelta(minutes=clr_mins)
+        line_groups[best_grp]['line_free_times'].append(line_free)
+        spec_line_status[sel_line] = line_free
+        
+        # Initial Calcs
+        wait_delta = best_start - best_ready
+        form_delta = timedelta(minutes=best_form_mins)
+        tot_dur = (best_fin - rake['arrival_dt']) + form_delta
+        demurrage = max(timedelta(0), tot_dur - timedelta(hours=FREE_TIME_HOURS))
+
+        assignments.append({
+            'Rake': rake['RAKE NAME'],
+            'Wagons': rake['wagon_count'],
+            'Status': rake.get('STTS CODE', 'N/A'),
+            # HIDDEN COLUMNS FOR CALCULATION (Keep as datetime objects)
+            '_Arrival_DT': rake['arrival_dt'],
+            '_Shunt_Ready_DT': best_ready,
+            '_Form_Mins': best_form_mins,
+            # DISPLAY COLUMNS (Strings/Formatted)
+            'Revised Arrival Time': format_dt(rake['arrival_dt']),
+            'Line Allotted': sel_line,
+            'Line Entry Time': format_dt(best_entry),
+            'Shunting Complete': format_dt(best_ready),
+            'Tippler Start Time': format_dt(best_start),  # EDITABLE TARGET
+            'Finish Unload': format_dt(best_fin),         # EDITABLE TARGET
+            'Tipplers Used': best_tips,
+            'Wait (Tippler)': format_duration_hhmm(wait_delta),
+            'Tippler Idle Time': format_duration_hhmm(best_idle),
+            'Formation Time': f"{int(best_form_mins)} m",
+            'Total Duration': format_duration_hhmm(tot_dur),
+            'Demurrage': format_duration_hhmm(demurrage),
+            'Placement Reason': rake.get('PLCT RESN', 'N/A'),
+            # Tippler specifics
+            'T1 Finish': format_dt(res_t1), 'T2 Finish': format_dt(res_t2),
+            'T3 Finish': format_dt(res_t3), 'T4 Finish': format_dt(res_t4)
+        })
+    return pd.DataFrame(assignments)
+
+def recalculate_metrics(edited_df):
+    """Re-runs Duration/Demurrage math based on EDITED timestamps."""
+    recalc_rows = []
+    
+    daily_demurrage_tracker = {}
+    
+    for _, row in edited_df.iterrows():
+        # Retrieve Hidden Calculation Objects
+        arrival = pd.to_datetime(row['_Arrival_DT'])
+        ready = pd.to_datetime(row['_Shunt_Ready_DT'])
+        form_mins = float(row['_Form_Mins'])
+        
+        # Retrieve Edited Strings and try to parse them back to DT
+        # Note: format_dt outputs "dd-HH:MM". We need to attach the correct Year/Month.
+        # Quick Hack: combine year/month from 'arrival' with the edited day/time string.
+        
+        try:
+            # Helper to stitch edited "dd-HH:MM" back to full datetime using original arrival year/month
+            def restore_dt(dt_str, ref_dt):
+                if not isinstance(dt_str, str) or dt_str == "": return ref_dt # Fallback
+                try:
+                    parts = dt_str.split('-') # "26-14:30"
+                    day = int(parts[0])
+                    time_parts = parts[1].split(':')
+                    hour, minute = int(time_parts[0]), int(time_parts[1])
+                    # Construct new DT
+                    return ref_dt.replace(day=day, hour=hour, minute=minute, second=0)
+                except: return ref_dt
+            
+            # 1. Get Edited Start/Finish
+            start_dt = restore_dt(row['Tippler Start Time'], ready) # Default to Ready if fail
+            finish_dt = restore_dt(row['Finish Unload'], start_dt)
+            
+            # 2. Re-Calculate Metrics
+            wait_delta = start_dt - ready
+            form_delta = timedelta(minutes=form_mins)
+            tot_dur = (finish_dt - arrival) + form_delta
+            demurrage = max(timedelta(0), tot_dur - timedelta(hours=FREE_TIME_HOURS))
+            
+            # 3. Update Row
+            row['Wait (Tippler)'] = format_duration_hhmm(wait_delta)
+            row['Total Duration'] = format_duration_hhmm(tot_dur)
+            row['Demurrage'] = format_duration_hhmm(demurrage)
+            
+            # 4. Update Daily Tracker
+            date_str = arrival.strftime('%Y-%m-%d')
+            daily_demurrage_tracker[date_str] = daily_demurrage_tracker.get(date_str, 0) + demurrage.total_seconds()
+            
+        except Exception as e:
+            # If parsing fails, keep old values
+            pass
+            
+        recalc_rows.append(row)
+        
+    return pd.DataFrame(recalc_rows), daily_demurrage_tracker
+
+# ==========================================
+# 4. FILE HANDLING & INTERFACE
 # ==========================================
 
 uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
 
 if uploaded_file is not None:
-    df = pd.read_csv(uploaded_file)
-    df.columns = df.columns.str.strip().str.upper()
+    # 1. INITIAL RUN (Only if not in session state)
+    if 'raw_data' not in st.session_state:
+        df_raw = pd.read_csv(uploaded_file)
+        df_raw.columns = df_raw.columns.str.strip().str.upper()
+        if 'PLCT RESN' in df_raw.columns:
+            df_raw = df_raw[~df_raw['PLCT RESN'].astype(str).str.upper().str.contains('LDNG', na=False)]
+        st.session_state.raw_data = df_raw
+        st.session_state.sim_result = run_full_simulation(df_raw)
+
+    # 2. DISPLAY EDITOR
+    st.markdown("### 📝 Schedule Editor")
     
-    required_cols = ['TOTL UNTS', 'EXPD ARVLTIME']
+    # We define the column config to make specific columns text-editable
+    edited_df = st.data_editor(
+        st.session_state.sim_result,
+        use_container_width=True,
+        num_rows="fixed",
+        column_config={
+            "_Arrival_DT": None, "_Shunt_Ready_DT": None, "_Form_Mins": None, # Hide helper cols
+            "Tippler Start Time": st.column_config.TextColumn("Tippler Start (dd-HH:MM)", help="Edit this to re-calc Wait Time"),
+            "Finish Unload": st.column_config.TextColumn("Finish Unload (dd-HH:MM)", help="Edit this to re-calc Duration")
+        },
+        disabled=["Rake", "Wagons", "Line Allotted", "Wait (Tippler)", "Total Duration", "Demurrage"] # Disable derived cols
+    )
     
-    if not all(col in df.columns for col in required_cols):
-        missing = [c for c in required_cols if c not in df.columns]
-        st.error(f"Error: Missing columns {missing}")
-    else:
-        if 'PLCT RESN' in df.columns:
-            df = df[~df['PLCT RESN'].astype(str).str.upper().str.contains('LDNG', na=False)]
+    # 3. RE-CALCULATE BUTTON
+    if st.button("🔄 Re-Calculate Metrics based on Edits"):
+        new_result, daily_stats = recalculate_metrics(edited_df)
+        st.session_state.sim_result = new_result
+        st.session_state.daily_stats = daily_stats
+        st.rerun()
 
-        df['wagon_count'] = df['TOTL UNTS'].apply(parse_wagons)
-        df['exp_arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce')
+    # 4. SHOW RESULTS (Daily Summary & Download)
+    if 'daily_stats' not in st.session_state:
+        # Initial calculation for daily stats
+        _, st.session_state.daily_stats = recalculate_metrics(st.session_state.sim_result)
         
-        if 'STTS CODE' in df.columns and 'STTS TIME' in df.columns:
-            df['stts_time_dt'] = pd.to_datetime(df['STTS TIME'], errors='coerce')
-            def calculate_effective_arrival(row):
-                if str(row.get('STTS CODE')).strip() == 'PL' and pd.notnull(row['stts_time_dt']):
-                    return row['stts_time_dt']
-                return row['exp_arrival_dt']
-            df['arrival_dt'] = df.apply(calculate_effective_arrival, axis=1)
-        else:
-            df['arrival_dt'] = df['exp_arrival_dt']
+    st.markdown("### 📅 Daily Demurrage Summary")
+    daily_data = [{'Date': k, 'Total Demurrage': format_duration_hhmm(timedelta(seconds=v))} for k,v in st.session_state.daily_stats.items()]
+    daily_df = pd.DataFrame(daily_data).sort_values('Date')
+    st.dataframe(daily_df, use_container_width=True)
+    
+    csv = st.session_state.sim_result.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins"]).to_csv(index=False).encode('utf-8')
+    st.download_button("📥 Download Final Report", csv, "optimized_schedule.csv", "text/csv")
 
-        df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt').reset_index(drop=True)
-
-        # --- STATE VARIABLES ---
-        tippler_state = {
-            'T1': pd.Timestamp.min, 'T2': pd.Timestamp.min,
-            'T3': pd.Timestamp.min, 'T4': pd.Timestamp.min
-        }
-        specific_line_status = {8: pd.Timestamp.min, 9: pd.Timestamp.min, 10: pd.Timestamp.min, 11: pd.Timestamp.min}
-        line_groups = {
-            'Group_Lines_8_10': {'capacity': 2, 'clearance_mins': 50, 'line_free_times': []}, 
-            'Group_Line_11': {'capacity': 1, 'clearance_mins': 100, 'line_free_times': []}    
-        }
-        rr_tracker_A = -1 
-        
-        assignments = []
-        daily_demurrage_tracker = {}
-        
-        # Load Downtimes
-        downtime_list = st.session_state.downtimes
-        
-        for _, rake in df.iterrows():
-            
-            # --- SCENARIO A: Pair A ---
-            shunt_offset_A = timedelta(minutes=SHUNT_MINS_A)
-            entry_time_A = get_line_entry_time('Group_Lines_8_10', rake['arrival_dt'], line_groups)
-            ready_to_unload_A = entry_time_A + shunt_offset_A
-            
-            finish_A, used_A, start_A, updated_times_A, idle_A = calculate_split_finish(
-                rake['wagon_count'], 'Pair A (T1&T2)', ready_to_unload_A, tippler_state, downtime_list
-            )
-            
-            # --- SCENARIO B: Pair B ---
-            shunt_offset_B = timedelta(minutes=SHUNT_MINS_B)
-            entry_time_B = get_line_entry_time('Group_Line_11', rake['arrival_dt'], line_groups)
-            ready_to_unload_B = entry_time_B + shunt_offset_B
-            
-            finish_B, used_B, start_B, updated_times_B, idle_B = calculate_split_finish(
-                rake['wagon_count'], 'Pair B (T3&T4)', ready_to_unload_B, tippler_state, downtime_list
-            )
-            
-            # --- DECISION ---
-            if finish_A <= finish_B:
-                best_pair = 'Pair A (T1&T2)'
-                best_grp = 'Group_Lines_8_10'
-                best_entry = entry_time_A
-                best_ready = ready_to_unload_A
-                best_start = start_A
-                best_finish = finish_A
-                best_tipplers = used_A
-                best_idle = idle_A
-                best_formation_mins = FORMATION_MINS_A
-                
-                for t_id, t_time in updated_times_A.items(): tippler_state[t_id] = t_time
-                res_t1 = updated_times_A.get('T1', pd.NaT)
-                res_t2 = updated_times_A.get('T2', pd.NaT)
-                res_t3 = pd.NaT
-                res_t4 = pd.NaT
-                
-                selected_line = find_specific_line(best_grp, best_entry, specific_line_status, rr_tracker_A)
-                if selected_line in [8, 9, 10]:
-                    mapping = {8:0, 9:1, 10:2}
-                    rr_tracker_A = mapping[selected_line]
-            else:
-                best_pair = 'Pair B (T3&T4)'
-                best_grp = 'Group_Line_11'
-                best_entry = entry_time_B
-                best_ready = ready_to_unload_B
-                best_start = start_B
-                best_finish = finish_B
-                best_tipplers = used_B
-                best_idle = idle_B
-                best_formation_mins = FORMATION_MINS_B
-                
-                for t_id, t_time in updated_times_B.items(): tippler_state[t_id] = t_time
-                res_t1 = pd.NaT
-                res_t2 = pd.NaT
-                res_t3 = updated_times_B.get('T3', pd.NaT)
-                res_t4 = updated_times_B.get('T4', pd.NaT)
-                
-                selected_line = 11
-                
-            # --- UPDATE INFRASTRUCTURE ---
-            clearance_mins = line_groups[best_grp]['clearance_mins']
-            line_free_at = best_entry + timedelta(minutes=clearance_mins)
-            line_groups[best_grp]['line_free_times'].append(line_free_at)
-            specific_line_status[selected_line] = line_free_at
-            
-            # --- CALCULATIONS ---
-            wait_delta = best_start - best_ready
-            formation_delta = timedelta(minutes=best_formation_mins)
-            total_duration_delta = (best_finish - rake['arrival_dt']) + formation_delta
-            
-            free_time_delta = timedelta(hours=FREE_TIME_HOURS)
-            demurrage_delta = max(timedelta(0), total_duration_delta - free_time_delta)
-            
-            arrival_date_str = rake['arrival_dt'].strftime('%Y-%m-%d')
-            if arrival_date_str not in daily_demurrage_tracker:
-                daily_demurrage_tracker[arrival_date_str] = 0.0
-            daily_demurrage_tracker[arrival_date_str] += demurrage_delta.total_seconds()
-            
-            assignments.append({
-                'Rake': rake['RAKE NAME'],
-                'Station From': rake.get('STTN FROM', 'N/A'),
-                'Status': rake.get('STTS CODE', 'N/A'),
-                'Wagons': rake['wagon_count'],
-                'Original Arrival': format_dt(rake['exp_arrival_dt']),
-                'Revised Arrival Time': format_dt(rake['arrival_dt']),
-                'Line Allotted': selected_line,
-                'Line Entry Time': format_dt(best_entry), 
-                'Shunting Complete': format_dt(best_ready), 
-                'Assigned Pair': best_pair,
-                'Tipplers Used': best_tipplers,
-                'Tippler Start Time': format_dt(best_start),
-                'Finish Unload': format_dt(best_finish),
-                'T1 Finish': format_dt(res_t1),
-                'T2 Finish': format_dt(res_t2),
-                'T3 Finish': format_dt(res_t3),
-                'T4 Finish': format_dt(res_t4),
-                'Wait (Tippler)': format_duration_hhmm(wait_delta),
-                'Tippler Idle Time': format_duration_hhmm(best_idle), 
-                'Formation Time': f"{int(best_formation_mins)} m",
-                'Total Duration': format_duration_hhmm(total_duration_delta),
-                'Demurrage': format_duration_hhmm(demurrage_delta),
-                'Placement Reason': rake.get('PLCT RESN', 'N/A')
-            })
-
-        res_df = pd.DataFrame(assignments)
-        
-        st.success(f"Optimization Complete! Processed {len(res_df)} trains.")
-        
-        # --- EDITABLE OUTPUT ---
-        st.markdown("### 📝 Optimized Schedule (Editable)")
-        st.markdown("You can edit the cells below to customize the report before downloading.")
-        edited_df = st.data_editor(res_df, use_container_width=True, num_rows="dynamic")
-        
-        # --- DAILY DEMURRAGE SUMMARY ---
-        st.markdown("### 📅 Daily Demurrage Summary")
-        if daily_demurrage_tracker:
-            daily_data = []
-            for date_str, total_seconds in daily_demurrage_tracker.items():
-                hours = int(total_seconds // 3600)
-                minutes = int((total_seconds % 3600) // 60)
-                formatted_time = f"{hours:02d}:{minutes:02d}"
-                daily_data.append({'Date': date_str, 'Total Demurrage Hours': formatted_time})
-            
-            daily_df = pd.DataFrame(daily_data).sort_values('Date')
-            st.dataframe(daily_df, use_container_width=True)
-        else:
-            st.info("No demurrage incurred based on current settings.")
-        
-        # Download Button uses the EDITED dataframe
-        csv = edited_df.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Schedule", csv, "optimized_schedule.csv", "text/csv")
+elif 'raw_data' in st.session_state:
+    # Reset state if file removed
+    del st.session_state.raw_data
+    del st.session_state.sim_result
