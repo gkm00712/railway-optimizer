@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import timedelta
+from datetime import timedelta, datetime
 import math
 
 # ==========================================
@@ -8,16 +8,12 @@ import math
 # ==========================================
 st.set_page_config(page_title="Railway Logic Optimizer", layout="wide")
 st.title("🚂 BOXN Rake Demurrage Optimization Dashboard")
-st.markdown("Upload your `INSIGHT DETAILS.csv` to run the simulation based on your offline logic.")
+st.markdown("Upload your `INSIGHT DETAILS.csv` to run the simulation.")
 
 # ==========================================
 # 1. SIDEBAR CONFIGURATION
 # ==========================================
 st.sidebar.header("⚙️ Infrastructure Settings")
-
-# Demurrage Settings (NEW)
-st.sidebar.subheader("Demurrage Rules")
-FREE_TIME_HOURS = st.sidebar.number_input("Free Time Allowed (Hours)", value=7.0, step=0.5)
 
 # Unloading Rates
 st.sidebar.subheader("Individual Tippler Rates")
@@ -36,21 +32,87 @@ st.sidebar.subheader("Rake Formation Time")
 FORMATION_MINS_A = st.sidebar.number_input("Pair A Formation (Mins)", value=20.0, step=5.0)
 FORMATION_MINS_B = st.sidebar.number_input("Pair B Formation (Mins)", value=50.0, step=5.0)
 
+# Demurrage
+FREE_TIME_HOURS = st.sidebar.number_input("Free Time Allowed (Hours)", value=7.0, step=0.5)
+
 # Stagger Logic
 st.sidebar.subheader("Split Logic")
 WAGONS_FIRST_BATCH = st.sidebar.number_input("Wagons in 1st Batch", value=30, step=1)
 INTER_TIPPLER_DELAY = st.sidebar.number_input("Delay for 2nd Tippler Start (Mins)", value=0.0, step=5.0)
 
-# Line Clearance Constraints
-st.sidebar.info(f"Line 8-10 Clearance: 50 mins (Parallel Processing)\nLine 11 Clearance: 100 mins (Parallel Processing)")
+# ------------------------------------------
+# NEW: DOWNTIME MANAGER
+# ------------------------------------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("🛠️ Tippler Downtime Manager")
+st.sidebar.info("Add breakdown or maintenance periods here to simulate delays.")
+
+if 'downtimes' not in st.session_state:
+    st.session_state.downtimes = []
+
+with st.sidebar.form("downtime_form"):
+    dt_tippler = st.selectbox("Select Tippler", ["T1", "T2", "T3", "T4"])
+    dt_start_date = st.date_input("Start Date", value=datetime.now())
+    dt_start_time = st.time_input("Start Time", value=datetime.now().time())
+    dt_duration = st.number_input("Duration (Minutes)", min_value=15, step=15, value=60)
+    add_dt = st.form_submit_button("Add Downtime")
+
+    if add_dt:
+        start_dt = datetime.combine(dt_start_date, dt_start_time)
+        end_dt = start_dt + timedelta(minutes=dt_duration)
+        st.session_state.downtimes.append({
+            "Tippler": dt_tippler,
+            "Start": start_dt,
+            "End": end_dt
+        })
+        st.success(f"Added {dt_tippler} downtime.")
+
+# Display Active Downtimes
+if st.session_state.downtimes:
+    st.sidebar.markdown("##### Active Downtimes")
+    dt_df = pd.DataFrame(st.session_state.downtimes)
+    # Convert to readable format
+    dt_display = dt_df.copy()
+    dt_display['Start'] = dt_display['Start'].dt.strftime('%d-%H:%M')
+    dt_display['End'] = dt_display['End'].dt.strftime('%d-%H:%M')
+    st.sidebar.dataframe(dt_display, use_container_width=True)
+    if st.sidebar.button("Clear All Downtimes"):
+        st.session_state.downtimes = []
+        st.rerun()
+
+st.sidebar.info(f"Line 8-10 Clearance: 50 mins\nLine 11 Clearance: 100 mins")
 
 # ==========================================
 # 2. CALCULATION LOGIC
 # ==========================================
 
-def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
+def check_downtime_impact(tippler_id, proposed_start, downtime_list):
     """
-    Calculates finish time using DYNAMIC ASSIGNMENT.
+    Checks if 'proposed_start' falls inside a downtime window.
+    If yes, returns the End Time of that downtime.
+    Recursively checks in case the new time also falls in a downtime.
+    """
+    # Filter downtimes for this specific tippler
+    relevant_dts = [d for d in downtime_list if d['Tippler'] == tippler_id]
+    
+    # Sort by start time
+    relevant_dts.sort(key=lambda x: x['Start'])
+    
+    current_start = proposed_start
+    
+    for dt in relevant_dts:
+        # If our start time is inside a downtime window
+        if dt['Start'] <= current_start < dt['End']:
+            # Push start to end of downtime
+            current_start = dt['End']
+            # We might need to check subsequent downtimes, so loop continues or recurses
+            # Ideally, we restart check, but sorted list helps.
+    
+    return current_start
+
+def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtime_list):
+    """
+    Calculates finish time using DYNAMIC ASSIGNMENT & DOWNTIME AWARENESS.
     """
     if wagons == 0: 
         return ready_time, "None", ready_time, {}, timedelta(0)
@@ -64,12 +126,11 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
     # 2. DYNAMIC SORT: Find which tippler is free earliest
     sorted_tipplers = sorted(resources.keys(), key=lambda x: tippler_state[x])
     
-    t_primary = sorted_tipplers[0]   # The one free earliest
-    t_secondary = sorted_tipplers[1] # The one free later
+    t_primary = sorted_tipplers[0]
+    t_secondary = sorted_tipplers[1]
     
     # 3. Calculate IDLE TIME (Gap between Machine Free and Train Ready)
     machine_free_at = tippler_state[t_primary]
-    
     if machine_free_at == pd.Timestamp.min:
         idle_delta = timedelta(0)
     else:
@@ -79,20 +140,33 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
     w_first = min(wagons, WAGONS_FIRST_BATCH)
     w_second = wagons - w_first
     
-    # 5. Calculate Timings
+    # 5. Calculate Timings with DOWNTIME CHECK
     
-    # Primary Batch
-    start_primary = max(ready_time, tippler_state[t_primary])
-    finish_primary = start_primary + timedelta(hours=(w_first / resources[t_primary]))
+    # --- Primary Batch ---
+    # Proposed Start = Max(Ready, Previous Finish)
+    proposed_start_prim = max(ready_time, tippler_state[t_primary])
+    
+    # CHECK DOWNTIME: If T_Primary is down, push start time
+    actual_start_prim = check_downtime_impact(t_primary, proposed_start_prim, downtime_list)
+    
+    duration_prim = timedelta(hours=(w_first / resources[t_primary]))
+    # Note: We assume once started, it finishes. 
+    # (Advanced logic would be needed to pause mid-unloading, simplified here to start-check)
+    finish_primary = actual_start_prim + duration_prim
     
     updated_times = {}
     updated_times[t_primary] = finish_primary
     
-    # Secondary Batch
+    # --- Secondary Batch ---
     if w_second > 0:
         start_secondary_theoretical = ready_time + timedelta(minutes=INTER_TIPPLER_DELAY)
-        start_secondary = max(start_secondary_theoretical, tippler_state[t_secondary])
-        finish_secondary = start_secondary + timedelta(hours=(w_second / resources[t_secondary]))
+        proposed_start_sec = max(start_secondary_theoretical, tippler_state[t_secondary])
+        
+        # CHECK DOWNTIME for Secondary
+        actual_start_sec = check_downtime_impact(t_secondary, proposed_start_sec, downtime_list)
+        
+        duration_sec = timedelta(hours=(w_second / resources[t_secondary]))
+        finish_secondary = actual_start_sec + duration_sec
         
         updated_times[t_secondary] = finish_secondary
         
@@ -103,7 +177,7 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
         used_str = f"{t_primary} Only"
         updated_times[t_secondary] = tippler_state[t_secondary]
 
-    return overall_finish, used_str, start_primary, updated_times, idle_delta
+    return overall_finish, used_str, actual_start_prim, updated_times, idle_delta
 
 def get_line_entry_time(group_name, arrival_time, line_groups):
     group = line_groups[group_name]
@@ -159,7 +233,6 @@ if uploaded_file is not None:
         missing = [c for c in required_cols if c not in df.columns]
         st.error(f"Error: Missing columns {missing}")
     else:
-        # FILTER: Exclude 'LDNG'
         if 'PLCT RESN' in df.columns:
             df = df[~df['PLCT RESN'].astype(str).str.upper().str.contains('LDNG', na=False)]
 
@@ -191,7 +264,10 @@ if uploaded_file is not None:
         rr_tracker_A = -1 
         
         assignments = []
-        daily_demurrage_tracker = {} # Key: Date String, Value: Total Seconds
+        daily_demurrage_tracker = {}
+        
+        # Load Downtimes
+        downtime_list = st.session_state.downtimes
         
         for _, rake in df.iterrows():
             
@@ -201,7 +277,7 @@ if uploaded_file is not None:
             ready_to_unload_A = entry_time_A + shunt_offset_A
             
             finish_A, used_A, start_A, updated_times_A, idle_A = calculate_split_finish(
-                rake['wagon_count'], 'Pair A (T1&T2)', ready_to_unload_A, tippler_state
+                rake['wagon_count'], 'Pair A (T1&T2)', ready_to_unload_A, tippler_state, downtime_list
             )
             
             # --- SCENARIO B: Pair B ---
@@ -210,7 +286,7 @@ if uploaded_file is not None:
             ready_to_unload_B = entry_time_B + shunt_offset_B
             
             finish_B, used_B, start_B, updated_times_B, idle_B = calculate_split_finish(
-                rake['wagon_count'], 'Pair B (T3&T4)', ready_to_unload_B, tippler_state
+                rake['wagon_count'], 'Pair B (T3&T4)', ready_to_unload_B, tippler_state, downtime_list
             )
             
             # --- DECISION ---
@@ -225,7 +301,6 @@ if uploaded_file is not None:
                 best_idle = idle_A
                 best_formation_mins = FORMATION_MINS_A
                 
-                # Update State
                 for t_id, t_time in updated_times_A.items(): tippler_state[t_id] = t_time
                 res_t1 = updated_times_A.get('T1', pd.NaT)
                 res_t2 = updated_times_A.get('T2', pd.NaT)
@@ -247,7 +322,6 @@ if uploaded_file is not None:
                 best_idle = idle_B
                 best_formation_mins = FORMATION_MINS_B
                 
-                # Update State
                 for t_id, t_time in updated_times_B.items(): tippler_state[t_id] = t_time
                 res_t1 = pd.NaT
                 res_t2 = pd.NaT
@@ -262,18 +336,14 @@ if uploaded_file is not None:
             line_groups[best_grp]['line_free_times'].append(line_free_at)
             specific_line_status[selected_line] = line_free_at
             
-            # --- CALCULATE DURATIONS ---
+            # --- CALCULATIONS ---
             wait_delta = best_start - best_ready
-            
             formation_delta = timedelta(minutes=best_formation_mins)
             total_duration_delta = (best_finish - rake['arrival_dt']) + formation_delta
             
-            # --- DEMURRAGE CALCULATION ---
-            # Demurrage = Max(0, Total Duration - Free Time)
             free_time_delta = timedelta(hours=FREE_TIME_HOURS)
             demurrage_delta = max(timedelta(0), total_duration_delta - free_time_delta)
             
-            # Aggregate Daily Demurrage
             arrival_date_str = rake['arrival_dt'].strftime('%Y-%m-%d')
             if arrival_date_str not in daily_demurrage_tracker:
                 daily_demurrage_tracker[arrival_date_str] = 0.0
@@ -301,17 +371,20 @@ if uploaded_file is not None:
                 'Tippler Idle Time': format_duration_hhmm(best_idle), 
                 'Formation Time': f"{int(best_formation_mins)} m",
                 'Total Duration': format_duration_hhmm(total_duration_delta),
-                'Demurrage': format_duration_hhmm(demurrage_delta), # NEW COLUMN
+                'Demurrage': format_duration_hhmm(demurrage_delta),
                 'Placement Reason': rake.get('PLCT RESN', 'N/A')
             })
 
         res_df = pd.DataFrame(assignments)
         
-        # --- DISPLAY MAIN TABLE ---
         st.success(f"Optimization Complete! Processed {len(res_df)} trains.")
-        st.dataframe(res_df, use_container_width=True)
         
-        # --- DISPLAY DAILY DEMURRAGE SUMMARY ---
+        # --- EDITABLE OUTPUT ---
+        st.markdown("### 📝 Optimized Schedule (Editable)")
+        st.markdown("You can edit the cells below to customize the report before downloading.")
+        edited_df = st.data_editor(res_df, use_container_width=True, num_rows="dynamic")
+        
+        # --- DAILY DEMURRAGE SUMMARY ---
         st.markdown("### 📅 Daily Demurrage Summary")
         if daily_demurrage_tracker:
             daily_data = []
@@ -326,5 +399,6 @@ if uploaded_file is not None:
         else:
             st.info("No demurrage incurred based on current settings.")
         
-        csv = res_df.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Optimized Schedule", csv, "optimized_schedule.csv", "text/csv")
+        # Download Button uses the EDITED dataframe
+        csv = edited_df.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Schedule", csv, "optimized_schedule.csv", "text/csv")
