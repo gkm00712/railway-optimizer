@@ -1,18 +1,30 @@
 import streamlit as st
 import pandas as pd
 from datetime import timedelta, datetime
-import math
+import pytz # NEW IMPORT FOR TIMEZONES
 
 # ==========================================
 # 1. PAGE CONFIGURATION
 # ==========================================
-st.set_page_config(page_title="Railway Logic Optimizer", layout="wide")
-st.title("🚂 BOXN Rake Demurrage Optimization Dashboard")
-st.markdown("Upload your `INSIGHT DETAILS.csv`. **Edit the table -> Daily Summary updates automatically.**")
+st.set_page_config(page_title="Railway Logic Optimizer (IST)", layout="wide")
+st.title("🚂 BOXN Rake Demurrage Optimization Dashboard (IST)")
+st.markdown("Upload your `INSIGHT DETAILS.csv`. **All times are processed in Indian Standard Time.**")
+
+# Define IST Timezone
+IST = pytz.timezone('Asia/Kolkata')
 
 # ==========================================
 # 2. HELPER FUNCTIONS
 # ==========================================
+
+def to_ist(dt):
+    """Ensures a datetime object is in IST."""
+    if pd.isnull(dt): return pd.NaT
+    # If it has no timezone, assume it's already IST and localize it
+    if dt.tzinfo is None:
+        return IST.localize(dt)
+    # If it has a timezone (e.g. UTC), convert it to IST
+    return dt.astimezone(IST)
 
 def parse_wagons(val):
     try:
@@ -23,17 +35,27 @@ def parse_wagons(val):
     except: return 0
 
 def format_dt(dt):
+    """Formats datetime as dd-HH:MM string."""
     if pd.isnull(dt): return ""
+    # Ensure we format the IST time
+    if dt.tzinfo is None: dt = IST.localize(dt)
     return dt.strftime('%d-%H:%M')
 
 def restore_dt(dt_str, ref_dt):
-    """Restores datetime from 'dd-HH:MM' string using reference year/month."""
-    if not isinstance(dt_str, str) or dt_str == "": return pd.NaT
+    """
+    Restores datetime from 'dd-HH:MM' string using reference year/month.
+    Returns an IST-aware datetime.
+    """
+    if not isinstance(dt_str, str) or dt_str.strip() == "": return pd.NaT
     try:
         parts = dt_str.split('-') 
         day = int(parts[0])
         time_parts = parts[1].split(':')
         hour, minute = int(time_parts[0]), int(time_parts[1])
+        
+        # Ensure ref_dt is IST
+        if ref_dt.tzinfo is None: ref_dt = IST.localize(ref_dt)
+        
         new_dt = ref_dt.replace(day=day, hour=hour, minute=minute, second=0)
         
         # Handle month boundary logic
@@ -41,6 +63,7 @@ def restore_dt(dt_str, ref_dt):
             new_dt = new_dt + pd.DateOffset(months=1)
         elif day > ref_dt.day + 15:
             new_dt = new_dt - pd.DateOffset(months=1)
+            
         return new_dt
     except: return pd.NaT
 
@@ -54,6 +77,10 @@ def format_duration_hhmm(delta):
     return f"{sign}{hours:02d}:{minutes:02d}"
 
 def check_downtime_impact(tippler_id, proposed_start, downtime_list):
+    # Ensure proposed_start is IST
+    if proposed_start != pd.Timestamp.min and proposed_start.tzinfo is None:
+        proposed_start = IST.localize(proposed_start)
+        
     relevant_dts = [d for d in downtime_list if d['Tippler'] == tippler_id]
     relevant_dts.sort(key=lambda x: x['Start'])
     
@@ -62,8 +89,12 @@ def check_downtime_impact(tippler_id, proposed_start, downtime_list):
     while changed:
         changed = False
         for dt in relevant_dts:
-            if dt['Start'] <= current_start < dt['End']:
-                current_start = dt['End']
+            # Ensure downtime comparison matches timezone
+            dt_start = dt['Start']
+            dt_end = dt['End']
+            
+            if dt_start <= current_start < dt_end:
+                current_start = dt_end
                 changed = True
     return current_start
 
@@ -74,7 +105,6 @@ def check_downtime_impact(tippler_id, proposed_start, downtime_list):
 def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtime_list, 
                            rate_t1, rate_t2, rate_t3, rate_t4, 
                            wagons_first_batch, inter_tippler_delay):
-    # Standard logic for initial run
     if wagons == 0: return ready_time, "None", ready_time, {}, timedelta(0)
     
     if pair_name == 'Pair A (T1&T2)':
@@ -85,23 +115,34 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtim
     sorted_tipplers = sorted(resources.keys(), key=lambda x: tippler_state[x])
     t_primary, t_secondary = sorted_tipplers[0], sorted_tipplers[1]
     
+    # Ensure state times are timezone aware for comparison
     machine_free_at = tippler_state[t_primary]
-    idle_delta = timedelta(0) if machine_free_at == pd.Timestamp.min else max(timedelta(0), ready_time - machine_free_at)
+    if machine_free_at != pd.Timestamp.min and machine_free_at.tzinfo is None:
+        machine_free_at = IST.localize(machine_free_at)
+    
+    # Calculate Idle
+    if machine_free_at == pd.Timestamp.min:
+        idle_delta = timedelta(0)
+    else:
+        idle_delta = max(timedelta(0), ready_time - machine_free_at)
 
     w_first = min(wagons, wagons_first_batch)
     w_second = wagons - w_first
     
+    # Primary Batch
     proposed_start_prim = max(ready_time, tippler_state[t_primary])
     actual_start_prim = check_downtime_impact(t_primary, proposed_start_prim, downtime_list)
     finish_primary = actual_start_prim + timedelta(hours=(w_first / resources[t_primary]))
     
     updated_times = {t_primary: finish_primary}
     
+    # Secondary Batch
     if w_second > 0:
         start_sec_theory = ready_time + timedelta(minutes=inter_tippler_delay)
         proposed_start_sec = max(start_sec_theory, tippler_state[t_secondary])
         actual_start_sec = check_downtime_impact(t_secondary, proposed_start_sec, downtime_list)
         finish_secondary = actual_start_sec + timedelta(hours=(w_second / resources[t_secondary]))
+        
         updated_times[t_secondary] = finish_secondary
         overall_finish = max(finish_primary, finish_secondary)
         used_str = f"{t_primary} & {t_secondary}"
@@ -138,18 +179,23 @@ def run_full_simulation_initial(df, params):
 
     df = df.copy()
     df['wagon_count'] = df['TOTL UNTS'].apply(parse_wagons)
-    df['exp_arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce')
+    
+    # Parse dates and convert to IST immediately
+    df['exp_arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce').apply(to_ist)
     
     if 'STTS CODE' in df.columns and 'STTS TIME' in df.columns:
-        df['stts_time_dt'] = pd.to_datetime(df['STTS TIME'], errors='coerce')
+        df['stts_time_dt'] = pd.to_datetime(df['STTS TIME'], errors='coerce').apply(to_ist)
         df['arrival_dt'] = df.apply(lambda r: r['stts_time_dt'] if str(r.get('STTS CODE')).strip()=='PL' and pd.notnull(r['stts_time_dt']) else r['exp_arrival_dt'], axis=1)
     else:
         df['arrival_dt'] = df['exp_arrival_dt']
 
     df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt').reset_index(drop=True)
     
-    tippler_state = {'T1': pd.Timestamp.min, 'T2': pd.Timestamp.min, 'T3': pd.Timestamp.min, 'T4': pd.Timestamp.min}
-    spec_line_status = {8: pd.Timestamp.min, 9: pd.Timestamp.min, 10: pd.Timestamp.min, 11: pd.Timestamp.min}
+    # Initialize State with IST Min Time
+    min_time_ist = IST.localize(pd.Timestamp.min)
+    
+    tippler_state = {'T1': min_time_ist, 'T2': min_time_ist, 'T3': min_time_ist, 'T4': min_time_ist}
+    spec_line_status = {8: min_time_ist, 9: min_time_ist, 10: min_time_ist, 11: min_time_ist}
     line_groups = {
         'Group_Lines_8_10': {'capacity': 2, 'clearance_mins': 50, 'line_free_times': []}, 
         'Group_Line_11': {'capacity': 1, 'clearance_mins': 100, 'line_free_times': []}
@@ -227,19 +273,24 @@ def run_full_simulation_initial(df, params):
 
 def recalculate_cascade_reactive(edited_df, free_time_hours):
     """
-    REACTIVE SIMULATION:
-    Takes edited data -> Recalculates Physics -> Updates Daily Demurrage Summary.
+    REACTIVE SIMULATION with IST Awareness.
     """
     recalc_rows = []
-    tippler_state = {'T1': pd.Timestamp.min, 'T2': pd.Timestamp.min, 'T3': pd.Timestamp.min, 'T4': pd.Timestamp.min}
     
-    # 1. Initialize Daily Demurrage Tracker
+    # Init State with IST Min
+    min_time_ist = IST.localize(pd.Timestamp.min)
+    tippler_state = {'T1': min_time_ist, 'T2': min_time_ist, 'T3': min_time_ist, 'T4': min_time_ist}
+    
     daily_demurrage_tracker = {}
     
     for _, row in edited_df.iterrows():
-        # Restore Base Objects
+        # Restore Base Objects (Should be IST aware from initial run)
         arrival = pd.to_datetime(row['_Arrival_DT'])
+        if arrival.tzinfo is None: arrival = IST.localize(arrival)
+        
         ready = pd.to_datetime(row['_Shunt_Ready_DT'])
+        if ready.tzinfo is None: ready = IST.localize(ready)
+        
         form_mins = float(row['_Form_Mins'])
         
         used_str = str(row['Tipplers Used'])
@@ -250,14 +301,15 @@ def recalculate_cascade_reactive(edited_df, free_time_hours):
         if 'T4' in used_str: current_tipplers.append('T4')
         
         # Physics Check
-        resource_free_at = pd.Timestamp.min
+        resource_free_at = min_time_ist
         for t in current_tipplers:
             resource_free_at = max(resource_free_at, tippler_state[t])
         
         valid_start = max(ready, resource_free_at)
         
-        # User Edits to Start
+        # User Edits to Start (restore_dt handles IST conversion)
         user_start_input = restore_dt(row['Tippler Start Time'], ready)
+        
         if pd.notnull(user_start_input):
             final_start = max(valid_start, user_start_input)
         else:
@@ -291,7 +343,6 @@ def recalculate_cascade_reactive(edited_df, free_time_hours):
         form_delta = timedelta(minutes=form_mins)
         tot_dur = (final_finish - arrival) + form_delta
         
-        # 2. Recalculate Demurrage based on NEW total duration
         demurrage = max(timedelta(0), tot_dur - timedelta(hours=free_time_hours))
         
         # Write Updates
@@ -307,7 +358,7 @@ def recalculate_cascade_reactive(edited_df, free_time_hours):
         row['Total Duration'] = format_duration_hhmm(tot_dur)
         row['Demurrage'] = format_duration_hhmm(demurrage)
         
-        # 3. Add to Daily Summary
+        # Aggregate Daily (Using IST Date)
         date_str = arrival.strftime('%Y-%m-%d')
         daily_demurrage_tracker[date_str] = daily_demurrage_tracker.get(date_str, 0) + demurrage.total_seconds()
         
@@ -332,33 +383,44 @@ sim_params['ft'] = st.sidebar.number_input("Free Time (Hours)", value=7.0, step=
 sim_params['wb'] = st.sidebar.number_input("Wagons 1st Batch", value=30, step=1)
 sim_params['wd'] = st.sidebar.number_input("Delay 2nd Tippler (Mins)", value=0.0, step=5.0)
 
-# DOWNTIME
+# DOWNTIME (Using IST)
 st.sidebar.markdown("---")
 st.sidebar.subheader("🛠️ Tippler Downtime Manager")
 if 'downtimes' not in st.session_state: st.session_state.downtimes = []
 with st.sidebar.form("downtime_form"):
     dt_tippler = st.selectbox("Select Tippler", ["T1", "T2", "T3", "T4"])
-    dt_start_date = st.date_input("Start Date", value=datetime.now())
-    dt_start_time = st.time_input("Start Time", value=datetime.now().time())
+    # Default to current IST time
+    now_ist = datetime.now(IST)
+    dt_start_date = st.date_input("Start Date", value=now_ist.date())
+    dt_start_time = st.time_input("Start Time", value=now_ist.time())
     dt_duration = st.number_input("Duration (Minutes)", min_value=15, step=15, value=60)
     add_dt = st.form_submit_button("Add Downtime")
     if add_dt:
-        start_dt = datetime.combine(dt_start_date, dt_start_time)
+        # Create IST Aware Datetime
+        start_naive = datetime.combine(dt_start_date, dt_start_time)
+        start_dt = IST.localize(start_naive)
         end_dt = start_dt + timedelta(minutes=dt_duration)
+        
         st.session_state.downtimes.append({"Tippler": dt_tippler, "Start": start_dt, "End": end_dt})
         if 'raw_data' in st.session_state:
             sim_params['downtimes'] = st.session_state.downtimes
             st.session_state.sim_result = run_full_simulation_initial(st.session_state.raw_data, sim_params)
+            _, st.session_state.daily_stats = recalculate_cascade_reactive(st.session_state.sim_result, sim_params['ft'])
             st.rerun()
 
 if st.session_state.downtimes:
     dt_df = pd.DataFrame(st.session_state.downtimes)
-    st.sidebar.dataframe(dt_df[['Tippler', 'Start', 'End']], use_container_width=True)
+    # Convert to string for display to verify IST
+    display_df = dt_df.copy()
+    display_df['Start'] = display_df['Start'].dt.strftime('%d-%H:%M')
+    display_df['End'] = display_df['End'].dt.strftime('%d-%H:%M')
+    st.sidebar.dataframe(display_df[['Tippler', 'Start', 'End']], use_container_width=True)
     if st.sidebar.button("Clear Downtimes"):
         st.session_state.downtimes = []
         if 'raw_data' in st.session_state:
             sim_params['downtimes'] = []
             st.session_state.sim_result = run_full_simulation_initial(st.session_state.raw_data, sim_params)
+            _, st.session_state.daily_stats = recalculate_cascade_reactive(st.session_state.sim_result, sim_params['ft'])
         st.rerun()
 
 sim_params['downtimes'] = st.session_state.downtimes
@@ -378,14 +440,12 @@ if uploaded_file is not None:
         
         st.session_state.raw_data = df_raw
         st.session_state.last_uploaded_file = uploaded_file
-        # Initial Physics Run
         st.session_state.sim_result = run_full_simulation_initial(df_raw, sim_params)
         _, st.session_state.daily_stats = recalculate_cascade_reactive(st.session_state.sim_result, sim_params['ft'])
 
 if 'raw_data' in st.session_state:
-    st.markdown("### 📝 Schedule Editor")
+    st.markdown("### 📝 Schedule Editor (IST)")
     
-    # 1. DISPLAY EDITOR (Interactive)
     edited_df = st.data_editor(
         st.session_state.sim_result,
         use_container_width=True,
@@ -403,13 +463,8 @@ if 'raw_data' in st.session_state:
         key="data_editor"
     )
 
-    # 2. AUTO-CALCULATION LOGIC
-    # Run the cascade simulation on the *current state* of the table (edited_df)
     new_result, daily_stats = recalculate_cascade_reactive(edited_df, sim_params['ft'])
     
-    # 3. DETECT CHANGES & UPDATE
-    # We compare specific columns to see if the calculation resulted in different values 
-    # than what is currently shown (which means user edit triggered a change)
     cols_to_compare = ['Tippler Start Time', 'Finish Unload', 'Wait (Tippler)', 'Demurrage', 
                        'T1 Finish', 'T2 Finish', 'T3 Finish', 'T4 Finish']
     
@@ -423,13 +478,12 @@ if 'raw_data' in st.session_state:
         if is_changed:
             st.session_state.sim_result = new_result
             st.session_state.daily_stats = daily_stats
-            st.rerun() # Forces the UI to refresh with the new calculated values
+            st.rerun()
             
     except Exception as e:
         pass 
 
-    # 4. DISPLAY SUMMARY
-    st.markdown("### 📅 Daily Demurrage Summary")
+    st.markdown("### 📅 Daily Demurrage Summary (IST)")
     if 'daily_stats' in st.session_state:
         daily_data = [{'Date': k, 'Total Demurrage': format_duration_hhmm(timedelta(seconds=v))} for k,v in st.session_state.daily_stats.items()]
         if daily_data:
