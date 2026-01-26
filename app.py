@@ -22,7 +22,7 @@ SHUNT_MINS_A = st.sidebar.number_input("Pair A Shunt Penalty (Mins)", value=50.0
 SHUNT_MINS_B = st.sidebar.number_input("Pair B Shunt Penalty (Mins)", value=100.0, step=5.0)
 
 # Line Clearance Constraints
-st.sidebar.info(f"Line 8-10 Clearance: 25 mins\nLine 11 Clearance: 100 mins")
+st.sidebar.info(f"Line 8-10 Clearance: 50 mins\nLine 11 Clearance: 100 mins")
 
 # ==========================================
 # 2. CALCULATION LOGIC
@@ -58,25 +58,30 @@ def get_line_entry_time(group_name, arrival_time, line_groups):
         return arrival_time
     
     # Otherwise, wait for the 'Nth' train to leave to free up a slot
-    # We take the Nth earliest finish time where N is capacity
     slots_needed_to_free = len(active_busy_times) - group['capacity'] + 1
     return active_busy_times[slots_needed_to_free - 1]
 
-def find_specific_line(group_name, start_time, specific_line_status):
+def find_specific_line(group_name, start_time, specific_line_status, last_used_index):
     """
     Determines exactly which line number (8, 9, 10, or 11) is used.
+    Uses ROUND-ROBIN rotation for Group A.
     """
     if group_name == 'Group_Lines_8_10':
-        candidates = [8, 9, 10]
-    else:
-        candidates = [11]
+        base_candidates = [8, 9, 10]
+        # Rotate list: Start looking from the (last_index + 1)
+        start_idx = (last_used_index + 1) % 3
         
-    # Pick the first candidate that is free at or before start_time
-    for line_num in candidates:
+        # Create priority list: e.g. [9, 10, 8]
+        priority_candidates = base_candidates[start_idx:] + base_candidates[:start_idx]
+    else:
+        priority_candidates = [11]
+        
+    # Pick the first candidate in PRIORITY list that is free at or before start_time
+    for line_num in priority_candidates:
         if specific_line_status[line_num] <= start_time:
             return line_num
             
-    return candidates[0] # Fallback
+    return priority_candidates[0] # Fallback
 
 def parse_wagons(val):
     """Handles standard integers and '58+1' wagon formats."""
@@ -132,7 +137,7 @@ if uploaded_file is not None:
             df['stts_time_dt'] = pd.to_datetime(df['STTS TIME'], errors='coerce')
             
             def calculate_effective_arrival(row):
-                status_val = str(row['STTS CODE']).strip()
+                status_val = str(row.get('STTS CODE')).strip()
                 # IF Status is "PL" AND STTS TIME is valid -> Use STTS TIME
                 if status_val == 'PL' and pd.notnull(row['stts_time_dt']):
                     return row['stts_time_dt']
@@ -161,11 +166,11 @@ if uploaded_file is not None:
             11: pd.Timestamp.min
         }
         
-        # Reset Line Constraints (Note: changed 'active_until' to 'active_slots')
+        # Reset Line Constraints
         line_groups = {
             'Group_Lines_8_10': {
                 'capacity': 2, # Limits usage to 2 lines, keeping 1 vacant
-                'clearance_mins': 25, 
+                'clearance_mins': 50, # UPDATED to 50 mins
                 'active_slots': [] 
             }, 
             'Group_Line_11': {
@@ -174,6 +179,10 @@ if uploaded_file is not None:
                 'active_slots': []
             }    
         }
+        
+        # --- ROUND ROBIN INDEX TRACKER ---
+        # 0=Line8, 1=Line9, 2=Line10
+        rr_tracker_A = -1 
         
         assignments = []
         
@@ -205,8 +214,14 @@ if uploaded_file is not None:
                 # Update Tippler State
                 pair_state['Pair A (T1&T2)'] = finish_A
                 
-                # Find Specific Line (8, 9, or 10)
-                selected_line = find_specific_line(grp_A, best_start, specific_line_status)
+                # Find Specific Line using ROTATION logic
+                selected_line = find_specific_line(grp_A, best_start, specific_line_status, rr_tracker_A)
+                
+                # Update Rotation Tracker
+                if selected_line in [8, 9, 10]:
+                    mapping = {8:0, 9:1, 10:2}
+                    rr_tracker_A = mapping[selected_line]
+                    
             else:
                 best_pair = 'Pair B (T3&T4)'
                 best_grp = grp_B
@@ -242,7 +257,7 @@ if uploaded_file is not None:
                 'Wagons': rake['wagon_count'],
                 'Original Arrival': rake['exp_arrival_dt'].strftime('%d-%H:%M'),
                 'Revised Arrival Time': rake['arrival_dt'].strftime('%d-%H:%M'),
-                'Line Allotted': selected_line,  # NEW COLUMN
+                'Line Allotted': selected_line, 
                 'Assigned': best_pair,
                 'Duration': f"{best_dur:.2f}h",
                 'Start': best_start.strftime('%d-%H:%M'),
