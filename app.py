@@ -3,7 +3,9 @@ import pandas as pd
 from datetime import timedelta
 import math
 
-# --- PAGE CONFIGURATION ---
+# ==========================================
+# PAGE CONFIGURATION
+# ==========================================
 st.set_page_config(page_title="Railway Logic Optimizer", layout="wide")
 st.title("🚂 BOXN Rake Demurrage Optimization Dashboard")
 st.markdown("Upload your `INSIGHT DETAILS.csv` to run the simulation based on your offline logic.")
@@ -22,7 +24,7 @@ SHUNT_MINS_A = st.sidebar.number_input("Pair A Shunt Penalty (Mins)", value=50.0
 SHUNT_MINS_B = st.sidebar.number_input("Pair B Shunt Penalty (Mins)", value=100.0, step=5.0)
 
 # Line Clearance Constraints
-st.sidebar.info(f"Line 8-10 Clearance: 50 mins\nLine 11 Clearance: 100 mins")
+st.sidebar.info(f"Line 8-10 Clearance: 50 mins (Parallel Processing)\nLine 11 Clearance: 100 mins (Parallel Processing)")
 
 # ==========================================
 # 2. CALCULATION LOGIC
@@ -31,8 +33,6 @@ st.sidebar.info(f"Line 8-10 Clearance: 50 mins\nLine 11 Clearance: 100 mins")
 def get_duration(wagons, pair_name):
     """Calculates total processing time for a split rake."""
     if wagons == 0: return 0
-    
-    # Split Rake: Half wagons go to each tippler
     w_per_tippler = wagons / 2.0
     
     if pair_name == 'Pair A (T1&T2)':
@@ -46,45 +46,46 @@ def get_duration(wagons, pair_name):
 
 def get_line_entry_time(group_name, arrival_time, line_groups):
     """
-    Finds the earliest time a train can enter the group based on CAPACITY.
-    Group 8-10: Capacity 2 (Ensures 1 out of 3 is always vacant).
+    Finds the earliest time a train can physically ENTER the line.
+    This depends ONLY on the Line Clearance (50/100 mins), not the Tippler.
     """
     group = line_groups[group_name]
-    # Filter for active trains that finish AFTER arrival
-    active_busy_times = sorted([t for t in group['active_slots'] if t > arrival_time])
     
-    # If currently active trains < capacity, we can start immediately
-    if len(active_busy_times) < group['capacity']:
+    # 1. Filter for trains that are currently blocking the lines (50/100 min timer)
+    active_line_blocks = sorted([t for t in group['line_free_times'] if t > arrival_time])
+    
+    # 2. Capacity Check
+    # If fewer lines are blocked than the allowed capacity, we can enter immediately.
+    # Group A Cap = 2 (Means 2 lines busy, 1 kept vacant).
+    if len(active_line_blocks) < group['capacity']:
         return arrival_time
     
-    # Otherwise, wait for the 'Nth' train to leave to free up a slot
-    slots_needed_to_free = len(active_busy_times) - group['capacity'] + 1
-    return active_busy_times[slots_needed_to_free - 1]
+    # 3. Queue Logic
+    # If lines are full, we wait for the 'Nth' train's line timer to expire.
+    # e.g. If Capacity is 2, and 2 trains are blocking lines, wait for the 1st one to clear.
+    slots_needed_to_free = len(active_line_blocks) - group['capacity'] + 1
+    return active_line_blocks[slots_needed_to_free - 1]
 
-def find_specific_line(group_name, start_time, specific_line_status, last_used_index):
+def find_specific_line(group_name, entry_time, specific_line_status, last_used_index):
     """
-    Determines exactly which line number (8, 9, 10, or 11) is used.
-    Uses ROUND-ROBIN rotation for Group A.
+    Selects a specific line number using Round-Robin logic.
+    It checks which specific line is free at 'entry_time'.
     """
     if group_name == 'Group_Lines_8_10':
         base_candidates = [8, 9, 10]
-        # Rotate list: Start looking from the (last_index + 1)
+        # Rotate logic: Start checking from next index
         start_idx = (last_used_index + 1) % 3
-        
-        # Create priority list: e.g. [9, 10, 8]
         priority_candidates = base_candidates[start_idx:] + base_candidates[:start_idx]
     else:
         priority_candidates = [11]
         
-    # Pick the first candidate in PRIORITY list that is free at or before start_time
     for line_num in priority_candidates:
-        if specific_line_status[line_num] <= start_time:
+        if specific_line_status[line_num] <= entry_time:
             return line_num
             
     return priority_candidates[0] # Fallback
 
 def parse_wagons(val):
-    """Handles standard integers and '58+1' wagon formats."""
     try:
         if '+' in str(val):
             parts = str(val).split('+')
@@ -96,189 +97,156 @@ def parse_wagons(val):
 # 3. MAIN APP EXECUTION
 # ==========================================
 
-# File Uploader
 uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
 
 if uploaded_file is not None:
     # Load Data
     df = pd.read_csv(uploaded_file)
-
-    # --- CLEAN COLUMN NAMES ---
-    # This removes hidden spaces and forces uppercase
     df.columns = df.columns.str.strip().str.upper()
     
-    # --- DATA PARSING & CLEANING ---
-    # Required columns check
     required_cols = ['TOTL UNTS', 'EXPD ARVLTIME']
     
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    
-    if missing_cols:
-        st.error(f"Error: Missing columns {missing_cols}. Please check CSV headers.")
-        st.write("Columns found:", df.columns.tolist())
+    if not all(col in df.columns for col in required_cols):
+        # Helper to find missing columns
+        missing = [c for c in required_cols if c not in df.columns]
+        st.error(f"Error: Missing columns {missing}")
     else:
-        # --- NEW REQUIREMENT: "Only show uldg" ---
-        # Filter strictly for Loaded trains (L/E == 'L')
+        # Filter Loaded
         if 'L/E' in df.columns:
             initial_count = len(df)
             df = df[df['L/E'].astype(str).str.strip().str.upper() == 'L']
-            filtered_count = len(df)
-            if initial_count != filtered_count:
-                st.warning(f"⚠️ Filtered out {initial_count - filtered_count} empty/non-loading trains. Processing {filtered_count} loaded trains.")
+            if len(df) != initial_count:
+                st.warning(f"⚠️ Filtered {initial_count - len(df)} empty trains.")
         
-        # 1. Parse Wagon Counts
+        # Parse Data
         df['wagon_count'] = df['TOTL UNTS'].apply(parse_wagons)
-        
-        # 2. Parse Timestamp Columns
         df['exp_arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce')
         
-        # --- LOGIC: REVISED ARRIVAL TIME ---
+        # Revised Arrival Logic
         if 'STTS CODE' in df.columns and 'STTS TIME' in df.columns:
             df['stts_time_dt'] = pd.to_datetime(df['STTS TIME'], errors='coerce')
-            
             def calculate_effective_arrival(row):
-                status_val = str(row.get('STTS CODE')).strip()
-                # IF Status is "PL" AND STTS TIME is valid -> Use STTS TIME
-                if status_val == 'PL' and pd.notnull(row['stts_time_dt']):
+                if str(row.get('STTS CODE')).strip() == 'PL' and pd.notnull(row['stts_time_dt']):
                     return row['stts_time_dt']
-                # ELSE -> Use Expected Arrival Time
                 return row['exp_arrival_dt']
-            
             df['arrival_dt'] = df.apply(calculate_effective_arrival, axis=1)
         else:
-            st.warning("Columns 'STTS CODE' or 'STTS TIME' not found. Defaulting to 'EXPD ARVLTIME'.")
             df['arrival_dt'] = df['exp_arrival_dt']
 
-        # 3. Sort and Drop Invalid Rows
         df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt').reset_index(drop=True)
 
-        # Initialize State Variables
+        # --- STATE VARIABLES ---
+        
+        # 1. Tippler State (When is the UNLOADER free?)
         pair_state = {
             'Pair A (T1&T2)': pd.Timestamp.min, 
             'Pair B (T3&T4)': pd.Timestamp.min 
         }
         
-        # Track when specific lines (8,9,10,11) become free
-        specific_line_status = {
-            8: pd.Timestamp.min,
-            9: pd.Timestamp.min,
-            10: pd.Timestamp.min,
-            11: pd.Timestamp.min
-        }
+        # 2. Specific Line State (When is Line X free?)
+        specific_line_status = {8: pd.Timestamp.min, 9: pd.Timestamp.min, 10: pd.Timestamp.min, 11: pd.Timestamp.min}
         
-        # Reset Line Constraints
+        # 3. Group Capacity State (To track the "50 min" slots)
         line_groups = {
             'Group_Lines_8_10': {
-                'capacity': 2, # Limits usage to 2 lines, keeping 1 vacant
-                'clearance_mins': 50, # UPDATED to 50 mins
-                'active_slots': [] 
+                'capacity': 2, 
+                'clearance_mins': 50, 
+                'line_free_times': [] # Stores when the *LINE* becomes free (Entry + 50)
             }, 
             'Group_Line_11': {
                 'capacity': 1, 
                 'clearance_mins': 100, 
-                'active_slots': []
+                'line_free_times': [] 
             }    
         }
         
-        # --- ROUND ROBIN INDEX TRACKER ---
-        # 0=Line8, 1=Line9, 2=Line10
         rr_tracker_A = -1 
         
         assignments = []
         
-        # Run Simulation Loop
         for _, rake in df.iterrows():
             
-            # --- Option 1: Pair A (Lines 8, 9, 10) ---
+            # --- SCENARIO A: Pair A ---
             dur_A = get_duration(rake['wagon_count'], 'Pair A (T1&T2)')
             grp_A = 'Group_Lines_8_10'
-            line_free_A = get_line_entry_time(grp_A, rake['arrival_dt'], line_groups)
-            start_A = max(rake['arrival_dt'], line_free_A, pair_state['Pair A (T1&T2)'])
-            finish_A = start_A + timedelta(hours=dur_A)
             
-            # --- Option 2: Pair B (Line 11) ---
+            # Step 1: When can we enter the line? (Decoupled from Tippler)
+            entry_time_A = get_line_entry_time(grp_A, rake['arrival_dt'], line_groups)
+            
+            # Step 2: When does unloading start? (Max of Entry OR Tippler Free)
+            start_unload_A = max(entry_time_A, pair_state['Pair A (T1&T2)'])
+            finish_A = start_unload_A + timedelta(hours=dur_A)
+            
+            # --- SCENARIO B: Pair B ---
             dur_B = get_duration(rake['wagon_count'], 'Pair B (T3&T4)')
             grp_B = 'Group_Line_11'
-            line_free_B = get_line_entry_time(grp_B, rake['arrival_dt'], line_groups)
-            start_B = max(rake['arrival_dt'], line_free_B, pair_state['Pair B (T3&T4)'])
-            finish_B = start_B + timedelta(hours=dur_B)
             
-            # --- Decision: Earliest Finish ---
+            entry_time_B = get_line_entry_time(grp_B, rake['arrival_dt'], line_groups)
+            start_unload_B = max(entry_time_B, pair_state['Pair B (T3&T4)'])
+            finish_B = start_unload_B + timedelta(hours=dur_B)
+            
+            # --- DECISION ---
             if finish_A <= finish_B:
                 best_pair = 'Pair A (T1&T2)'
                 best_grp = grp_A
-                best_start = start_A
+                best_entry = entry_time_A
+                best_start = start_unload_A
                 best_finish = finish_A
                 best_dur = dur_A
                 
-                # Update Tippler State
+                # Update Tippler
                 pair_state['Pair A (T1&T2)'] = finish_A
                 
-                # Find Specific Line using ROTATION logic
-                selected_line = find_specific_line(grp_A, best_start, specific_line_status, rr_tracker_A)
-                
-                # Update Rotation Tracker
+                # Assign Line
+                selected_line = find_specific_line(grp_A, best_entry, specific_line_status, rr_tracker_A)
                 if selected_line in [8, 9, 10]:
                     mapping = {8:0, 9:1, 10:2}
                     rr_tracker_A = mapping[selected_line]
-                    
             else:
                 best_pair = 'Pair B (T3&T4)'
                 best_grp = grp_B
-                best_start = start_B
+                best_entry = entry_time_B
+                best_start = start_unload_B
                 best_finish = finish_B
                 best_dur = dur_B
                 
-                # Update Tippler State
                 pair_state['Pair B (T3&T4)'] = finish_B
-                
-                # Find Specific Line (11)
                 selected_line = 11
                 
-            # --- UPDATE INFRASTRUCTURE STATE ---
-            clearance = line_groups[best_grp]['clearance_mins']
-            block_until = best_start + timedelta(minutes=clearance)
+            # --- UPDATE INFRASTRUCTURE ---
+            # IMPORTANT: The Line is blocked from Entry Time -> Entry Time + Clearance
+            # It does NOT wait for unloading to finish.
+            clearance_mins = line_groups[best_grp]['clearance_mins']
+            line_free_at = best_entry + timedelta(minutes=clearance_mins)
             
-            # 1. Update Group Capacity Slots
-            line_groups[best_grp]['active_slots'].append(block_until)
+            # Update Group State (for capacity check)
+            line_groups[best_grp]['line_free_times'].append(line_free_at)
             
-            # 2. Update Specific Line Status
-            specific_line_status[selected_line] = block_until
+            # Update Specific Line State
+            specific_line_status[selected_line] = line_free_at
             
-            # --- CAPTURE DETAILS ---
-            status_code = rake.get('STTS CODE', 'N/A')
-            
-            # Log Result
             wait_mins = (best_start - rake['arrival_dt']).total_seconds() / 60
+            
             assignments.append({
                 'Rake': rake['RAKE NAME'],
                 'Station From': rake.get('STTN FROM', 'N/A'),
-                'Status': status_code,
+                'Status': rake.get('STTS CODE', 'N/A'),
                 'Wagons': rake['wagon_count'],
                 'Original Arrival': rake['exp_arrival_dt'].strftime('%d-%H:%M'),
                 'Revised Arrival Time': rake['arrival_dt'].strftime('%d-%H:%M'),
-                'Line Allotted': selected_line, 
+                'Line Allotted': selected_line,
+                'Line Entry Time': best_entry.strftime('%d-%H:%M'), # NEW COLUMN
                 'Assigned': best_pair,
                 'Duration': f"{best_dur:.2f}h",
-                'Start': best_start.strftime('%d-%H:%M'),
-                'Finish': best_finish.strftime('%d-%H:%M'),
+                'Start Unload': best_start.strftime('%d-%H:%M'),
+                'Finish Unload': best_finish.strftime('%d-%H:%M'),
                 'Wait': f"{int(wait_mins)} m",
                 'Placement Reason': rake.get('PLCT RESN', 'N/A')
             })
 
-        # --- OUTPUT RESULTS ---
         res_df = pd.DataFrame(assignments)
-        
         st.success(f"Optimization Complete! Processed {len(res_df)} loaded trains.")
-        
-        # Display Dataframe
         st.dataframe(res_df, use_container_width=True)
         
-        # Download Button
         csv = res_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Download Optimized Schedule",
-            data=csv,
-            file_name="optimized_schedule.csv",
-            mime="text/csv",
-        )
+        st.download_button("📥 Download Optimized Schedule", csv, "optimized_schedule.csv", "text/csv")
