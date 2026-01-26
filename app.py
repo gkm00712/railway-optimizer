@@ -42,13 +42,6 @@ def get_duration(wagons, pair_name):
         
     return unload_hrs
 
-def get_shunt_time(pair_name):
-    """Returns the shunting delay in hours."""
-    if pair_name == 'Pair A (T1&T2)':
-        return SHUNT_MINS_A / 60.0
-    else:
-        return SHUNT_MINS_B / 60.0
-
 def get_line_entry_time(group_name, arrival_time, line_groups):
     """
     Finds the earliest time a train can physically ENTER the line.
@@ -60,19 +53,24 @@ def get_line_entry_time(group_name, arrival_time, line_groups):
     active_line_blocks = sorted([t for t in group['line_free_times'] if t > arrival_time])
     
     # 2. Capacity Check
+    # If fewer lines are blocked than the allowed capacity, we can enter immediately.
+    # Group A Cap = 2 (Means 2 lines busy, 1 kept vacant).
     if len(active_line_blocks) < group['capacity']:
         return arrival_time
     
     # 3. Queue Logic
+    # If lines are full, we wait for the 'Nth' train's line timer to expire.
     slots_needed_to_free = len(active_line_blocks) - group['capacity'] + 1
     return active_line_blocks[slots_needed_to_free - 1]
 
 def find_specific_line(group_name, entry_time, specific_line_status, last_used_index):
     """
     Selects a specific line number using Round-Robin logic.
+    It checks which specific line is free at 'entry_time'.
     """
     if group_name == 'Group_Lines_8_10':
         base_candidates = [8, 9, 10]
+        # Rotate logic: Start checking from next index
         start_idx = (last_used_index + 1) % 3
         priority_candidates = base_candidates[start_idx:] + base_candidates[:start_idx]
     else:
@@ -99,22 +97,26 @@ def parse_wagons(val):
 uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
 
 if uploaded_file is not None:
+    # Load Data
     df = pd.read_csv(uploaded_file)
     df.columns = df.columns.str.strip().str.upper()
     
     required_cols = ['TOTL UNTS', 'EXPD ARVLTIME']
     
     if not all(col in df.columns for col in required_cols):
+        # Helper to find missing columns
         missing = [c for c in required_cols if c not in df.columns]
         st.error(f"Error: Missing columns {missing}")
     else:
-        # Filter Loaded Logic (Optional - currently removed to show all)
+        # NOTE: Filter strictly for Loaded trains (Optional - uncomment next 2 lines to enable)
         # if 'L/E' in df.columns:
         #    df = df[df['L/E'].astype(str).str.strip().str.upper() == 'L']
         
+        # Parse Data
         df['wagon_count'] = df['TOTL UNTS'].apply(parse_wagons)
         df['exp_arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce')
         
+        # Revised Arrival Logic
         if 'STTS CODE' in df.columns and 'STTS TIME' in df.columns:
             df['stts_time_dt'] = pd.to_datetime(df['STTS TIME'], errors='coerce')
             def calculate_effective_arrival(row):
@@ -128,16 +130,28 @@ if uploaded_file is not None:
         df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt').reset_index(drop=True)
 
         # --- STATE VARIABLES ---
+        
+        # 1. Tippler State (When is the UNLOADER free?)
         pair_state = {
             'Pair A (T1&T2)': pd.Timestamp.min, 
             'Pair B (T3&T4)': pd.Timestamp.min 
         }
         
+        # 2. Specific Line State (When is Line X free?)
         specific_line_status = {8: pd.Timestamp.min, 9: pd.Timestamp.min, 10: pd.Timestamp.min, 11: pd.Timestamp.min}
         
+        # 3. Group Capacity State (To track the "50 min" slots)
         line_groups = {
-            'Group_Lines_8_10': {'capacity': 2, 'clearance_mins': 50, 'line_free_times': []}, 
-            'Group_Line_11': {'capacity': 1, 'clearance_mins': 100, 'line_free_times': []}    
+            'Group_Lines_8_10': {
+                'capacity': 2, 
+                'clearance_mins': 50, 
+                'line_free_times': [] # Stores when the *LINE* becomes free (Entry + 50)
+            }, 
+            'Group_Line_11': {
+                'capacity': 1, 
+                'clearance_mins': 100, 
+                'line_free_times': [] 
+            }    
         }
         
         rr_tracker_A = -1 
@@ -151,7 +165,7 @@ if uploaded_file is not None:
             shunt_offset_A = timedelta(minutes=SHUNT_MINS_A)
             grp_A = 'Group_Lines_8_10'
             
-            # 1. Line Entry
+            # 1. Line Entry Time (Decoupled from Tippler)
             entry_time_A = get_line_entry_time(grp_A, rake['arrival_dt'], line_groups)
             
             # 2. Ready to Unload (Line Entry + Shunting Time)
@@ -179,10 +193,13 @@ if uploaded_file is not None:
                 best_ready = ready_to_unload_A
                 best_start = start_unload_A
                 best_finish = finish_A
-                best_dur = dur_unload_A + (SHUNT_MINS_A/60.0) # Total duration for display
+                # Total Duration = Unloading Time + Shunting Time
+                best_dur_display = dur_unload_A + (SHUNT_MINS_A/60.0) 
                 
+                # Update Tippler
                 pair_state['Pair A (T1&T2)'] = finish_A
                 
+                # Assign Line
                 selected_line = find_specific_line(grp_A, best_entry, specific_line_status, rr_tracker_A)
                 if selected_line in [8, 9, 10]:
                     mapping = {8:0, 9:1, 10:2}
@@ -194,16 +211,20 @@ if uploaded_file is not None:
                 best_ready = ready_to_unload_B
                 best_start = start_unload_B
                 best_finish = finish_B
-                best_dur = dur_unload_B + (SHUNT_MINS_B/60.0)
+                best_dur_display = dur_unload_B + (SHUNT_MINS_B/60.0)
                 
                 pair_state['Pair B (T3&T4)'] = finish_B
                 selected_line = 11
                 
             # --- UPDATE INFRASTRUCTURE ---
+            # Line is blocked from Entry -> Entry + Clearance (50/100 mins)
             clearance_mins = line_groups[best_grp]['clearance_mins']
             line_free_at = best_entry + timedelta(minutes=clearance_mins)
             
+            # Update Group State (for capacity check)
             line_groups[best_grp]['line_free_times'].append(line_free_at)
+            
+            # Update Specific Line State
             specific_line_status[selected_line] = line_free_at
             
             wait_mins = (best_start - rake['arrival_dt']).total_seconds() / 60
@@ -217,12 +238,12 @@ if uploaded_file is not None:
                 'Revised Arrival Time': rake['arrival_dt'].strftime('%d-%H:%M'),
                 'Line Allotted': selected_line,
                 'Line Entry Time': best_entry.strftime('%d-%H:%M'), 
-                'Shunting Complete / Ready': best_ready.strftime('%d-%H:%M'), # NEW COLUMN
+                'Shunting Complete / Ready': best_ready.strftime('%d-%H:%M'), # Time when shunting ends
                 'Assigned': best_pair,
                 'Actual Start Unload': best_start.strftime('%d-%H:%M'),
                 'Finish Unload': best_finish.strftime('%d-%H:%M'),
                 'Wait': f"{int(wait_mins)} m",
-                'Duration (Inc Shunt)': f"{best_dur:.2f}h",
+                'Duration (Inc Shunt)': f"{best_dur_display:.2f}h",
                 'Placement Reason': rake.get('PLCT RESN', 'N/A')
             })
 
