@@ -27,6 +27,11 @@ st.sidebar.subheader("Shunting Delays")
 SHUNT_MINS_A = st.sidebar.number_input("Pair A Initial Shunt (Mins)", value=25.0, step=5.0)
 SHUNT_MINS_B = st.sidebar.number_input("Pair B Initial Shunt (Mins)", value=50.0, step=5.0)
 
+# Rake Formation Time (NEW)
+st.sidebar.subheader("Rake Formation Time")
+FORMATION_MINS_A = st.sidebar.number_input("Pair A Formation (Mins)", value=20.0, step=5.0)
+FORMATION_MINS_B = st.sidebar.number_input("Pair B Formation (Mins)", value=50.0, step=5.0)
+
 # Stagger Logic
 st.sidebar.subheader("Split Logic")
 WAGONS_FIRST_BATCH = st.sidebar.number_input("Wagons in 1st Batch", value=30, step=1)
@@ -42,10 +47,8 @@ st.sidebar.info(f"Line 8-10 Clearance: 50 mins (Parallel Processing)\nLine 11 Cl
 def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
     """
     Calculates finish time using DYNAMIC ASSIGNMENT.
-    The first batch goes to whichever tippler in the pair is free EARLIEST.
     """
     if wagons == 0: 
-        # Return structure: (Finish, Used_Str, Start_Time, {T_ID: Finish_Time})
         return ready_time, "None", ready_time, {}
     
     # 1. Define Resources based on Pair
@@ -55,11 +58,10 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
         resources = {'T3': RATE_T3, 'T4': RATE_T4}
         
     # 2. DYNAMIC SORT: Find which tippler is free earliest
-    # Sort keys (Tippler IDs) based on their current busy-until time
     sorted_tipplers = sorted(resources.keys(), key=lambda x: tippler_state[x])
     
-    t_primary = sorted_tipplers[0]   # The one free earliest (gets Batch 1)
-    t_secondary = sorted_tipplers[1] # The one free later (gets Batch 2)
+    t_primary = sorted_tipplers[0]   # The one free earliest
+    t_secondary = sorted_tipplers[1] # The one free later
     
     # 3. Split Wagons
     w_first = min(wagons, WAGONS_FIRST_BATCH)
@@ -67,21 +69,17 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
     
     # 4. Calculate Timings
     
-    # --- Primary Batch (Goes to Earliest Free Tippler) ---
-    # Starts when Rake is Ready OR Tippler is Free (whichever is later)
+    # Primary Batch
     start_primary = max(ready_time, tippler_state[t_primary])
     finish_primary = start_primary + timedelta(hours=(w_first / resources[t_primary]))
     
     updated_times = {}
     updated_times[t_primary] = finish_primary
     
-    # --- Secondary Batch (Goes to Other Tippler) ---
+    # Secondary Batch
     if w_second > 0:
-        # Constraint: Can start only after Ready + Stagger Delay
-        # AND when the secondary tippler is free
         start_secondary_theoretical = ready_time + timedelta(minutes=INTER_TIPPLER_DELAY)
         start_secondary = max(start_secondary_theoretical, tippler_state[t_secondary])
-        
         finish_secondary = start_secondary + timedelta(hours=(w_second / resources[t_secondary]))
         
         updated_times[t_secondary] = finish_secondary
@@ -89,13 +87,10 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
         overall_finish = max(finish_primary, finish_secondary)
         used_str = f"{t_primary} & {t_secondary}"
     else:
-        # Only one tippler needed
         overall_finish = finish_primary
         used_str = f"{t_primary} Only"
-        # We don't update the secondary tippler time, it remains as is
         updated_times[t_secondary] = tippler_state[t_secondary]
 
-    # Return: Overall Finish, Description, Actual Start Time (of first batch), Dictionary of new finish times
     return overall_finish, used_str, start_primary, updated_times
 
 def get_line_entry_time(group_name, arrival_time, line_groups):
@@ -153,11 +148,7 @@ if uploaded_file is not None:
         st.error(f"Error: Missing columns {missing}")
     else:
         if 'PLCT RESN' in df.columns:
-            initial_len = len(df)
             df = df[~df['PLCT RESN'].astype(str).str.upper().str.contains('LDNG', na=False)]
-            diff = initial_len - len(df)
-            if diff > 0:
-                st.warning(f"⚠️ Excluded {diff} trains with 'LDNG' Placement Reason.")
 
         df['wagon_count'] = df['TOTL UNTS'].apply(parse_wagons)
         df['exp_arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce')
@@ -190,24 +181,20 @@ if uploaded_file is not None:
         
         for _, rake in df.iterrows():
             
-            # --- SCENARIO A: Pair A (Lines 8-10) ---
+            # --- SCENARIO A: Pair A ---
             shunt_offset_A = timedelta(minutes=SHUNT_MINS_A)
-            grp_A = 'Group_Lines_8_10'
-            entry_time_A = get_line_entry_time(grp_A, rake['arrival_dt'], line_groups)
+            entry_time_A = get_line_entry_time('Group_Lines_8_10', rake['arrival_dt'], line_groups)
             ready_to_unload_A = entry_time_A + shunt_offset_A
             
-            # Calculate Finish using DYNAMIC assignment
             finish_A, used_A, start_A, updated_times_A = calculate_split_finish(
                 rake['wagon_count'], 'Pair A (T1&T2)', ready_to_unload_A, tippler_state
             )
             
-            # --- SCENARIO B: Pair B (Line 11) ---
+            # --- SCENARIO B: Pair B ---
             shunt_offset_B = timedelta(minutes=SHUNT_MINS_B)
-            grp_B = 'Group_Line_11'
-            entry_time_B = get_line_entry_time(grp_B, rake['arrival_dt'], line_groups)
+            entry_time_B = get_line_entry_time('Group_Line_11', rake['arrival_dt'], line_groups)
             ready_to_unload_B = entry_time_B + shunt_offset_B
             
-            # Calculate Finish using DYNAMIC assignment
             finish_B, used_B, start_B, updated_times_B = calculate_split_finish(
                 rake['wagon_count'], 'Pair B (T3&T4)', ready_to_unload_B, tippler_state
             )
@@ -215,41 +202,37 @@ if uploaded_file is not None:
             # --- DECISION ---
             if finish_A <= finish_B:
                 best_pair = 'Pair A (T1&T2)'
-                best_grp = grp_A
+                best_grp = 'Group_Lines_8_10'
                 best_entry = entry_time_A
                 best_ready = ready_to_unload_A
                 best_start = start_A
                 best_finish = finish_A
                 best_tipplers = used_A
+                best_formation_mins = FORMATION_MINS_A
                 
-                # Update State from the Dynamic Dictionary
-                for t_id, t_time in updated_times_A.items():
-                    tippler_state[t_id] = t_time
-                
-                # Extract for Reporting
+                # Update State
+                for t_id, t_time in updated_times_A.items(): tippler_state[t_id] = t_time
                 res_t1 = updated_times_A.get('T1', pd.NaT)
                 res_t2 = updated_times_A.get('T2', pd.NaT)
                 res_t3 = pd.NaT
                 res_t4 = pd.NaT
                 
-                selected_line = find_specific_line(grp_A, best_entry, specific_line_status, rr_tracker_A)
+                selected_line = find_specific_line(best_grp, best_entry, specific_line_status, rr_tracker_A)
                 if selected_line in [8, 9, 10]:
                     mapping = {8:0, 9:1, 10:2}
                     rr_tracker_A = mapping[selected_line]
             else:
                 best_pair = 'Pair B (T3&T4)'
-                best_grp = grp_B
+                best_grp = 'Group_Line_11'
                 best_entry = entry_time_B
                 best_ready = ready_to_unload_B
                 best_start = start_B
                 best_finish = finish_B
                 best_tipplers = used_B
+                best_formation_mins = FORMATION_MINS_B
                 
-                # Update State from the Dynamic Dictionary
-                for t_id, t_time in updated_times_B.items():
-                    tippler_state[t_id] = t_time
-                
-                # Extract for Reporting
+                # Update State
+                for t_id, t_time in updated_times_B.items(): tippler_state[t_id] = t_time
                 res_t1 = pd.NaT
                 res_t2 = pd.NaT
                 res_t3 = updated_times_B.get('T3', pd.NaT)
@@ -260,13 +243,16 @@ if uploaded_file is not None:
             # --- UPDATE INFRASTRUCTURE ---
             clearance_mins = line_groups[best_grp]['clearance_mins']
             line_free_at = best_entry + timedelta(minutes=clearance_mins)
-            
             line_groups[best_grp]['line_free_times'].append(line_free_at)
             specific_line_status[selected_line] = line_free_at
             
             # --- CALCULATE DURATIONS ---
             wait_delta = best_start - best_ready
-            total_duration_delta = best_finish - rake['arrival_dt']
+            
+            # Total Duration Calculation
+            # Formula: (Unloading Finish Time - Arrival Time) + Formation Time
+            formation_delta = timedelta(minutes=best_formation_mins)
+            total_duration_delta = (best_finish - rake['arrival_dt']) + formation_delta
             
             assignments.append({
                 'Rake': rake['RAKE NAME'],
@@ -280,13 +266,14 @@ if uploaded_file is not None:
                 'Shunting Complete': format_dt(best_ready), 
                 'Assigned Pair': best_pair,
                 'Tipplers Used': best_tipplers,
-                'Actual Start Unload': format_dt(best_start),
+                'Tippler Start Time': format_dt(best_start), # Renamed for clarity
                 'Finish Unload': format_dt(best_finish),
                 'T1 Finish': format_dt(res_t1),
                 'T2 Finish': format_dt(res_t2),
                 'T3 Finish': format_dt(res_t3),
                 'T4 Finish': format_dt(res_t4),
                 'Wait (Tippler)': format_duration_hhmm(wait_delta),
+                'Formation Time': f"{int(best_formation_mins)} m", # NEW COLUMN
                 'Total Duration': format_duration_hhmm(total_duration_delta),
                 'Placement Reason': rake.get('PLCT RESN', 'N/A')
             })
