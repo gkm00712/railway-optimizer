@@ -74,23 +74,19 @@ if uploaded_file is not None:
     # Load Data
     df = pd.read_csv(uploaded_file)
 
-    # --- CRITICAL FIX: CLEAN COLUMN NAMES ---
-    # This removes hidden spaces and forces uppercase (e.g. " stts " -> "STTS")
+    # --- CLEAN COLUMN NAMES ---
+    # This removes hidden spaces and forces uppercase
     df.columns = df.columns.str.strip().str.upper()
-    
-    # --- DEBUG: Show found columns if still failing ---
-    # st.write("Detected Columns:", df.columns.tolist()) 
     
     # --- DATA PARSING & CLEANING ---
     # Required columns check
     required_cols = ['TOTL UNTS', 'EXPD ARVLTIME']
     
-    # Check if critical columns are missing
     missing_cols = [col for col in required_cols if col not in df.columns]
     
     if missing_cols:
         st.error(f"Error: Missing columns {missing_cols}. Please check CSV headers.")
-        st.write("Columns found in your CSV:", df.columns.tolist())
+        st.write("Columns found:", df.columns.tolist())
     else:
         # 1. Parse Wagon Counts
         df['wagon_count'] = df['TOTL UNTS'].apply(parse_wagons)
@@ -98,14 +94,14 @@ if uploaded_file is not None:
         # 2. Parse Timestamp Columns
         df['exp_arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce')
         
-        # Check if STTS columns exist for the new logic
-        if 'STTS' in df.columns and 'STTS TIME' in df.columns:
+        # --- FIXED LOGIC: CHECK FOR 'STTS CODE' INSTEAD OF 'STTS' ---
+        if 'STTS CODE' in df.columns and 'STTS TIME' in df.columns:
             df['stts_time_dt'] = pd.to_datetime(df['STTS TIME'], errors='coerce')
             
             # --- NEW REQUIREMENT LOGIC START ---
             def calculate_effective_arrival(row):
-                # Clean the STTS value (remove spaces) and check if it is "PL"
-                status_val = str(row['STTS']).strip()
+                # USE 'STTS CODE' HERE
+                status_val = str(row['STTS CODE']).strip()
                 
                 # IF Status is "PL" AND STTS TIME is valid -> Use STTS TIME
                 if status_val == 'PL' and pd.notnull(row['stts_time_dt']):
@@ -117,9 +113,9 @@ if uploaded_file is not None:
             df['arrival_dt'] = df.apply(calculate_effective_arrival, axis=1)
             # --- NEW REQUIREMENT LOGIC END ---
         else:
-            # Fallback if STTS columns are missing in CSV
-            st.warning("Columns 'STTS' or 'STTS TIME' not found. Defaulting to 'EXPD ARVLTIME'.")
-            st.write("Available columns:", df.columns.tolist()) # Help user debug
+            # Fallback
+            st.warning("Columns 'STTS CODE' or 'STTS TIME' not found. Defaulting to 'EXPD ARVLTIME'.")
+            st.write("Available columns:", df.columns.tolist()) 
             df['arrival_dt'] = df['exp_arrival_dt']
 
         # 3. Sort and Drop Invalid Rows
@@ -187,8 +183,8 @@ if uploaded_file is not None:
             placement_reason = rake['PLCT RESN'] if 'PLCT RESN' in df.columns else 'N/A'
             # 2. Station From
             station_from = rake['STTN FROM'] if 'STTN FROM' in df.columns else 'N/A'
-            # 3. Status - Use .get to be safe against missing values, defaulting to empty string
-            status_code = rake.get('STTS', 'N/A')
+            # 3. Status - Updated to 'STTS CODE'
+            status_code = rake.get('STTS CODE', 'N/A')
 
             # Log Result
             wait_mins = (best_start - rake['arrival_dt']).total_seconds() / 60
