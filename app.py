@@ -73,12 +73,24 @@ uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
 if uploaded_file is not None:
     # Load Data
     df = pd.read_csv(uploaded_file)
+
+    # --- CRITICAL FIX: CLEAN COLUMN NAMES ---
+    # This removes hidden spaces and forces uppercase (e.g. " stts " -> "STTS")
+    df.columns = df.columns.str.strip().str.upper()
+    
+    # --- DEBUG: Show found columns if still failing ---
+    # st.write("Detected Columns:", df.columns.tolist()) 
     
     # --- DATA PARSING & CLEANING ---
     # Required columns check
     required_cols = ['TOTL UNTS', 'EXPD ARVLTIME']
-    if not all(col in df.columns for col in required_cols):
-        st.error(f"Error: CSV must contain {required_cols} columns.")
+    
+    # Check if critical columns are missing
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    
+    if missing_cols:
+        st.error(f"Error: Missing columns {missing_cols}. Please check CSV headers.")
+        st.write("Columns found in your CSV:", df.columns.tolist())
     else:
         # 1. Parse Wagon Counts
         df['wagon_count'] = df['TOTL UNTS'].apply(parse_wagons)
@@ -92,10 +104,14 @@ if uploaded_file is not None:
             
             # --- NEW REQUIREMENT LOGIC START ---
             def calculate_effective_arrival(row):
-                # If Status is PL (Placed) and STTS TIME is valid, use STTS TIME
-                if str(row['STTS']).strip().upper() == 'PL' and pd.notnull(row['stts_time_dt']):
+                # Clean the STTS value (remove spaces) and check if it is "PL"
+                status_val = str(row['STTS']).strip()
+                
+                # IF Status is "PL" AND STTS TIME is valid -> Use STTS TIME
+                if status_val == 'PL' and pd.notnull(row['stts_time_dt']):
                     return row['stts_time_dt']
-                # Otherwise, default to Expected Arrival Time
+                
+                # ELSE -> Use Expected Arrival Time
                 return row['exp_arrival_dt']
             
             df['arrival_dt'] = df.apply(calculate_effective_arrival, axis=1)
@@ -103,6 +119,7 @@ if uploaded_file is not None:
         else:
             # Fallback if STTS columns are missing in CSV
             st.warning("Columns 'STTS' or 'STTS TIME' not found. Defaulting to 'EXPD ARVLTIME'.")
+            st.write("Available columns:", df.columns.tolist()) # Help user debug
             df['arrival_dt'] = df['exp_arrival_dt']
 
         # 3. Sort and Drop Invalid Rows
@@ -170,15 +187,15 @@ if uploaded_file is not None:
             placement_reason = rake['PLCT RESN'] if 'PLCT RESN' in df.columns else 'N/A'
             # 2. Station From
             station_from = rake['STTN FROM'] if 'STTN FROM' in df.columns else 'N/A'
-            # 3. Status (Capture for debugging/viewing)
-            status_code = rake['STTS'] if 'STTS' in df.columns else 'N/A'
+            # 3. Status - Use .get to be safe against missing values, defaulting to empty string
+            status_code = rake.get('STTS', 'N/A')
 
             # Log Result
             wait_mins = (best_start - rake['arrival_dt']).total_seconds() / 60
             assignments.append({
                 'Rake': rake['RAKE NAME'],
                 'Station From': station_from,
-                'Status': status_code, # Added to view status in table
+                'Status': status_code,
                 'Wagons': rake['wagon_count'],
                 'Arrival': rake['arrival_dt'].strftime('%d-%H:%M'),
                 'Assigned': best_pair,
