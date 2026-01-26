@@ -8,10 +8,10 @@ import math
 # ==========================================
 st.set_page_config(page_title="Railway Logic Optimizer", layout="wide")
 st.title("🚂 BOXN Rake Demurrage Optimization Dashboard")
-st.markdown("Upload your `INSIGHT DETAILS.csv`. **Edit Finish Times & Click Re-Calculate to update Start Times & Demurrage.**")
+st.markdown("Upload your `INSIGHT DETAILS.csv`. **Edits trigger automatic re-simulation.**")
 
 # ==========================================
-# 2. HELPER FUNCTIONS
+# 2. HELPER FUNCTIONS & LOGIC
 # ==========================================
 
 def parse_wagons(val):
@@ -36,8 +36,7 @@ def restore_dt(dt_str, ref_dt):
         hour, minute = int(time_parts[0]), int(time_parts[1])
         # Handle month boundaries roughly
         new_dt = ref_dt.replace(day=day, hour=hour, minute=minute, second=0)
-        # If new day is > ref day + 15, assume it's previous month (unlikely in future plan)
-        # If new day is < ref day - 15, assume next month
+        # Simple month rollover check
         if day < ref_dt.day - 15: 
             new_dt = new_dt + pd.DateOffset(months=1)
         elif day > ref_dt.day + 15:
@@ -101,7 +100,6 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtim
         proposed_start_sec = max(start_sec_theory, tippler_state[t_secondary])
         actual_start_sec = check_downtime_impact(t_secondary, proposed_start_sec, downtime_list)
         finish_secondary = actual_start_sec + timedelta(hours=(w_second / resources[t_secondary]))
-        
         updated_times[t_secondary] = finish_secondary
         overall_finish = max(finish_primary, finish_secondary)
         used_str = f"{t_primary} & {t_secondary}"
@@ -158,8 +156,6 @@ def run_full_simulation(df, params):
     assignments = []
     
     for _, rake in df.iterrows():
-        # ... (Same simulation logic as before, just wrapped) ...
-        # Calc A
         shunt_A = timedelta(minutes=s_a)
         entry_A = get_line_entry_time('Group_Lines_8_10', rake['arrival_dt'], line_groups)
         ready_A = entry_A + shunt_A
@@ -168,7 +164,6 @@ def run_full_simulation(df, params):
             r_t1, r_t2, r_t3, r_t4, w_batch, w_delay
         )
         
-        # Calc B
         shunt_B = timedelta(minutes=s_b)
         entry_B = get_line_entry_time('Group_Line_11', rake['arrival_dt'], line_groups)
         ready_B = entry_B + shunt_B
@@ -177,28 +172,25 @@ def run_full_simulation(df, params):
             r_t1, r_t2, r_t3, r_t4, w_batch, w_delay
         )
         
-        # Compare
         if fin_A <= fin_B:
-            best_grp, best_entry, best_ready, best_start, best_fin = 'Group_Lines_8_10', entry_A, ready_A, start_A, fin_A
+            best_pair, best_grp, best_entry, best_ready, best_start, best_fin = 'Pair A (T1&T2)', 'Group_Lines_8_10', entry_A, ready_A, start_A, fin_A
             best_tips, best_idle, best_form_mins = used_A, idle_A, f_a
             for k,v in up_A.items(): tippler_state[k] = v
             sel_line = find_specific_line(best_grp, best_entry, spec_line_status, rr_tracker_A)
             if sel_line in [8,9,10]: rr_tracker_A = {8:0,9:1,10:2}[sel_line]
             res_t1, res_t2, res_t3, res_t4 = up_A.get('T1', pd.NaT), up_A.get('T2', pd.NaT), pd.NaT, pd.NaT
         else:
-            best_grp, best_entry, best_ready, best_start, best_fin = 'Group_Line_11', entry_B, ready_B, start_B, fin_B
+            best_pair, best_grp, best_entry, best_ready, best_start, best_fin = 'Pair B (T3&T4)', 'Group_Line_11', entry_B, ready_B, start_B, fin_B
             best_tips, best_idle, best_form_mins = used_B, idle_B, f_b
             for k,v in up_B.items(): tippler_state[k] = v
             sel_line = 11
             res_t1, res_t2, res_t3, res_t4 = pd.NaT, pd.NaT, up_B.get('T3', pd.NaT), up_B.get('T4', pd.NaT)
             
-        # Update Lines
         clr_mins = line_groups[best_grp]['clearance_mins']
         line_free = best_entry + timedelta(minutes=clr_mins)
         line_groups[best_grp]['line_free_times'].append(line_free)
         spec_line_status[sel_line] = line_free
         
-        # Final Metrics
         wait_delta = best_start - best_ready
         form_delta = timedelta(minutes=best_form_mins)
         tot_dur = (best_fin - rake['arrival_dt']) + form_delta
@@ -233,18 +225,11 @@ def run_full_simulation(df, params):
 
 def recalculate_cascade(edited_df, free_time_hours):
     """
-    Advanced Cascade:
-    1. Resets Tippler State.
-    2. Iterates rows.
-    3. Finds which tipplers a row uses.
-    4. Finds earliest valid start = Max(Ready Time, Tippler Free Time).
-    5. Checks if User manually delayed Start/Finish.
-    6. Updates Tippler State for next row.
-    7. Calculates Demurrage & Aggregates Daily.
+    Cascading Re-calculation based on user manual edits.
+    Updates daily_demurrage_tracker during iteration.
     """
     recalc_rows = []
-    
-    # State reset is key for cascade
+    # Reset Tippler State
     tippler_state = {'T1': pd.Timestamp.min, 'T2': pd.Timestamp.min, 'T3': pd.Timestamp.min, 'T4': pd.Timestamp.min}
     daily_demurrage_tracker = {}
     
@@ -262,53 +247,47 @@ def recalculate_cascade(edited_df, free_time_hours):
         if 'T3' in used_str: current_tipplers.append('T3')
         if 'T4' in used_str: current_tipplers.append('T4')
         
-        # 1. Determine Earliest Physically Possible Start
-        # This is where the 'next rake' logic happens. 
-        # If previous rake finished T1 at 12:00, this rake cannot start T1 before 12:00.
+        # 1. Determine Earliest Physically Possible Start based on previous rows
         resource_free_at = pd.Timestamp.min
         for t in current_tipplers:
             resource_free_at = max(resource_free_at, tippler_state[t])
         
         # Start Time Constraint: Must be Ready AND Tippler Must be Free
-        valid_start = max(ready, resource_free_at)
+        calculated_start = max(ready, resource_free_at)
         
-        # 2. Check for Manual User Edits
-        # User might have typed "26-14:00" in the Start Time column
-        user_start = restore_dt(row['Tippler Start Time'], ready)
-        
-        # If user explicitly delays it (User > Valid), take User.
-        # If user explicitly rushes it (User < Valid), ignore User and enforce Valid (Physics).
-        if pd.notnull(user_start):
-            final_start = max(valid_start, user_start)
-        else:
-            final_start = valid_start
+        # 2. Check for Manual User Edits to Start
+        try:
+            user_start = restore_dt(row['Tippler Start Time'], ready)
+            # If User says start LATER than physics, accept it (Delay). 
+            # If User says EARLIER than physics, ignore it (enforce cascade).
+            if pd.notnull(user_start):
+                final_start = max(calculated_start, user_start)
+            else:
+                final_start = calculated_start
+        except:
+            final_start = calculated_start
             
-        # 3. Determine Finish Time
-        # Check if user edited individual tipplers finish times
+        # 3. Determine Finish Time (Manual T1/T2... override or Calc)
         tippler_finish_map = {}
         max_finish = final_start 
-        
-        # Logic: If user edited finish time, we respect it. 
-        # If not, we calculate finish based on original duration + new start.
-        
-        # Helper to get original duration logic if needed
-        # (Simplified: we assume if user cleared cell, we add 2 hours default)
         
         for t_id in ['T1', 'T2', 'T3', 'T4']:
             if t_id in current_tipplers:
                 col_name = f"{t_id} Finish"
-                # Check user edit
                 t_edit = restore_dt(row[col_name], final_start)
                 
-                # If no edit, or invalid, we need a duration.
-                # Ideally we pull wagon count/rate, but for re-calc we preserve duration implied by row
                 if pd.isnull(t_edit):
-                    # Fallback: keep existing duration relative to new start? 
-                    # OR just assume user updated 'Finish Unload'.
-                    # For simplicity: Use main Finish Unload duration if available, else 2h
+                    # No specific edit? Try to maintain duration from 'Finish Unload'
+                    # Or fallback to 2 hours default
                     user_main_finish = restore_dt(row['Finish Unload'], final_start)
                     if pd.notnull(user_main_finish):
-                        dur = user_main_finish - restore_dt(row['Tippler Start Time'], ready) # Old duration
+                        # Calculate original duration logic from input
+                        # Note: This is an approximation. 
+                        # Ideally, we calculate based on wagons/rate again, but we want to respect edits.
+                        # Simple: If Main Finish is present, assume that's the target duration
+                        dur = user_main_finish - restore_dt(row['Tippler Start Time'], ready)
+                        # Handle case where user cleared start time causing restore to fail/zero
+                        if pd.isnull(dur) or dur.total_seconds() <= 0: dur = timedelta(hours=2)
                         t_edit = final_start + dur
                     else:
                         t_edit = final_start + timedelta(hours=2)
@@ -327,7 +306,7 @@ def recalculate_cascade(edited_df, free_time_hours):
         # 5. Demurrage
         demurrage = max(timedelta(0), tot_dur - timedelta(hours=free_time_hours))
         
-        # 6. Update Row Values
+        # 6. Update Row Values (Strings)
         row['Tippler Start Time'] = format_dt(final_start)
         row['Finish Unload'] = format_dt(final_finish)
         
@@ -395,7 +374,6 @@ with st.sidebar.form("downtime_form"):
         if 'raw_data' in st.session_state:
             sim_params['downtimes'] = st.session_state.downtimes
             st.session_state.sim_result = run_full_simulation(st.session_state.raw_data, sim_params)
-            # Init stats if needed
             _, st.session_state.daily_stats = recalculate_cascade(st.session_state.sim_result, sim_params['ft'])
             st.rerun()
 
@@ -438,6 +416,7 @@ if uploaded_file is not None:
 if 'raw_data' in st.session_state:
     
     st.markdown("### 📝 Schedule Editor")
+    # Data Editor that updates 'edited_df' on change
     edited_df = st.data_editor(
         st.session_state.sim_result,
         use_container_width=True,
@@ -454,17 +433,54 @@ if 'raw_data' in st.session_state:
         disabled=["Rake", "Wagons", "Line Allotted", "Wait (Tippler)", "Total Duration", "Demurrage"]
     )
     
-    if st.button("🔄 Re-Calculate (Cascade Delays)"):
-        # This will update SIM STATE with the result of the cascade
-        new_result, daily_stats = recalculate_cascade(edited_df, sim_params['ft'])
-        st.session_state.sim_result = new_result
-        st.session_state.daily_stats = daily_stats
-        st.rerun()
-
-    # Calc stats if missing
-    if 'daily_stats' not in st.session_state:
-        _, st.session_state.daily_stats = recalculate_cascade(st.session_state.sim_result, sim_params['ft'])
+    # 3. AUTO-CALC CHECK
+    # Check if the edited dataframe is different from the stored simulation result
+    # We compare specific editable columns to trigger update
+    # Note: Streamlit data_editor returns the state *after* edit.
+    # To detect change, we compare specific columns or just run logic if user interacted.
+    # Since we can't easily detect "interaction" without button, we rely on the fact that
+    # 'edited_df' is the new state. We feed this into recalc, update state, and rerun.
+    
+    # To prevent infinite loop, we need to check if values actually changed.
+    # Simplification: We add a button for manual triggering if the loop is tricky, 
+    # BUT user requested automatic. 
+    # TRICK: We store 'last_state' hash or comparison.
+    
+    # Logic: 
+    # 1. Calc new result from 'edited_df'
+    # 2. If new result differs from 'st.session_state.sim_result' significantly (metrics changed), update and rerun.
+    
+    # For now, adhering to user request for "Automatic" implies reacting to 'edited_df'.
+    # However, st.data_editor inside a rerun loop updates immediately. 
+    # We can perform the calc and display the stats *below* without writing back to 'sim_result' 
+    # immediately to avoid circular refresh, OR we write back only if button pressed.
+    # USER ASKED: "By changing any value... simulated again automatically".
+    
+    # Let's do the safe approach: Calculate and Display immediately.
+    new_result, daily_stats = recalculate_cascade(edited_df, sim_params['ft'])
+    
+    # Update Daily Stats in State so it persists/displays
+    st.session_state.daily_stats = daily_stats
+    
+    # OPTIONAL: If we want the TABLE to update (snap) to the new calculated values immediately:
+    # We would need to st.rerun(). But we need a condition to stop infinite rerun.
+    # Condition: If 'new_result' is logically different from 'edited_df' (e.g. start times shifted).
+    
+    # Check if start times changed due to cascade
+    time_cols = ['Tippler Start Time', 'Wait (Tippler)']
+    try:
+        diff = False
+        for col in time_cols:
+            if not new_result[col].equals(edited_df[col]):
+                diff = True
+                break
         
+        if diff:
+            st.session_state.sim_result = new_result
+            st.rerun()
+    except:
+        pass # Safety
+
     st.markdown("### 📅 Daily Demurrage Summary")
     daily_data = [{'Date': k, 'Total Demurrage': format_duration_hhmm(timedelta(seconds=v))} for k,v in st.session_state.daily_stats.items()]
     if daily_data:
@@ -473,5 +489,5 @@ if 'raw_data' in st.session_state:
     else:
         st.info("No Demurrage Incurred.")
     
-    csv = st.session_state.sim_result.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins"]).to_csv(index=False).encode('utf-8')
+    csv = new_result.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins"]).to_csv(index=False).encode('utf-8')
     st.download_button("📥 Download Final Report", csv, "optimized_schedule.csv", "text/csv")
