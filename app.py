@@ -88,34 +88,36 @@ if uploaded_file is not None:
         st.error(f"Error: Missing columns {missing_cols}. Please check CSV headers.")
         st.write("Columns found:", df.columns.tolist())
     else:
+        # --- NEW REQUIREMENT: "Only show uldg" ---
+        # Filter strictly for Loaded trains (L/E == 'L')
+        if 'L/E' in df.columns:
+            initial_count = len(df)
+            df = df[df['L/E'].astype(str).str.strip().str.upper() == 'L']
+            filtered_count = len(df)
+            if initial_count != filtered_count:
+                st.warning(f"⚠️ Filtered out {initial_count - filtered_count} empty/non-loading trains. Processing {filtered_count} loaded trains.")
+        
         # 1. Parse Wagon Counts
         df['wagon_count'] = df['TOTL UNTS'].apply(parse_wagons)
         
         # 2. Parse Timestamp Columns
         df['exp_arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce')
         
-        # --- FIXED LOGIC: CHECK FOR 'STTS CODE' INSTEAD OF 'STTS' ---
+        # --- LOGIC: REVISED ARRIVAL TIME ---
         if 'STTS CODE' in df.columns and 'STTS TIME' in df.columns:
             df['stts_time_dt'] = pd.to_datetime(df['STTS TIME'], errors='coerce')
             
-            # --- NEW REQUIREMENT LOGIC START ---
             def calculate_effective_arrival(row):
-                # USE 'STTS CODE' HERE
                 status_val = str(row['STTS CODE']).strip()
-                
                 # IF Status is "PL" AND STTS TIME is valid -> Use STTS TIME
                 if status_val == 'PL' and pd.notnull(row['stts_time_dt']):
                     return row['stts_time_dt']
-                
                 # ELSE -> Use Expected Arrival Time
                 return row['exp_arrival_dt']
             
             df['arrival_dt'] = df.apply(calculate_effective_arrival, axis=1)
-            # --- NEW REQUIREMENT LOGIC END ---
         else:
-            # Fallback
             st.warning("Columns 'STTS CODE' or 'STTS TIME' not found. Defaulting to 'EXPD ARVLTIME'.")
-            st.write("Available columns:", df.columns.tolist()) 
             df['arrival_dt'] = df['exp_arrival_dt']
 
         # 3. Sort and Drop Invalid Rows
@@ -162,8 +164,6 @@ if uploaded_file is not None:
                 best_finish = finish_A
                 best_dur = dur_A
                 pair_state['Pair A (T1&T2)'] = finish_A
-                
-                reason = f"Finishes {int(finish_diff)}m earlier than Pair B (would finish {finish_B.strftime('%d-%H:%M')})"
             else:
                 best_pair = 'Pair B (T3&T4)'
                 best_grp = grp_B
@@ -172,40 +172,34 @@ if uploaded_file is not None:
                 best_dur = dur_B
                 pair_state['Pair B (T3&T4)'] = finish_B
                 
-                reason = f"Finishes {int(finish_diff)}m earlier than Pair A (would finish {finish_A.strftime('%d-%H:%M')})"
-                
             # Update Line Clearance
             clearance = line_groups[best_grp]['clearance_mins']
             line_groups[best_grp]['active_until'].append(best_start + timedelta(minutes=clearance))
             
-            # --- CAPTURE EXTRA COLUMNS ---
-            # 1. Placement Reason
-            placement_reason = rake['PLCT RESN'] if 'PLCT RESN' in df.columns else 'N/A'
-            # 2. Station From
-            station_from = rake['STTN FROM'] if 'STTN FROM' in df.columns else 'N/A'
-            # 3. Status - Updated to 'STTS CODE'
+            # --- CAPTURE DETAILS ---
             status_code = rake.get('STTS CODE', 'N/A')
-
+            
             # Log Result
             wait_mins = (best_start - rake['arrival_dt']).total_seconds() / 60
             assignments.append({
                 'Rake': rake['RAKE NAME'],
-                'Station From': station_from,
+                'Station From': rake.get('STTN FROM', 'N/A'),
                 'Status': status_code,
                 'Wagons': rake['wagon_count'],
-                'Arrival': rake['arrival_dt'].strftime('%d-%H:%M'),
+                'Original Arrival': rake['exp_arrival_dt'].strftime('%d-%H:%M'), # Ref Column
+                'Revised Arrival Time': rake['arrival_dt'].strftime('%d-%H:%M'), # NEW COLUMN
                 'Assigned': best_pair,
                 'Duration': f"{best_dur:.2f}h",
                 'Start': best_start.strftime('%d-%H:%M'),
                 'Finish': best_finish.strftime('%d-%H:%M'),
                 'Wait': f"{int(wait_mins)} m",
-                'Placement Reason': placement_reason
+                'Placement Reason': rake.get('PLCT RESN', 'N/A')
             })
 
         # --- OUTPUT RESULTS ---
         res_df = pd.DataFrame(assignments)
         
-        st.success(f"Optimization Complete! Processed {len(res_df)} trains.")
+        st.success(f"Optimization Complete! Processed {len(res_df)} loaded trains.")
         
         # Display Dataframe
         st.dataframe(res_df, use_container_width=True)
