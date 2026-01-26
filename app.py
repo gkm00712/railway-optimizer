@@ -74,12 +74,38 @@ if uploaded_file is not None:
     # Load Data
     df = pd.read_csv(uploaded_file)
     
-    # Data Parsing
-    if 'TOTL UNTS' not in df.columns or 'EXPD ARVLTIME' not in df.columns:
-        st.error("Error: CSV must contain 'TOTL UNTS' and 'EXPD ARVLTIME' columns.")
+    # --- DATA PARSING & CLEANING ---
+    # Required columns check
+    required_cols = ['TOTL UNTS', 'EXPD ARVLTIME']
+    if not all(col in df.columns for col in required_cols):
+        st.error(f"Error: CSV must contain {required_cols} columns.")
     else:
+        # 1. Parse Wagon Counts
         df['wagon_count'] = df['TOTL UNTS'].apply(parse_wagons)
-        df['arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce')
+        
+        # 2. Parse Timestamp Columns
+        df['exp_arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce')
+        
+        # Check if STTS columns exist for the new logic
+        if 'STTS' in df.columns and 'STTS TIME' in df.columns:
+            df['stts_time_dt'] = pd.to_datetime(df['STTS TIME'], errors='coerce')
+            
+            # --- NEW REQUIREMENT LOGIC START ---
+            def calculate_effective_arrival(row):
+                # If Status is PL (Placed) and STTS TIME is valid, use STTS TIME
+                if str(row['STTS']).strip().upper() == 'PL' and pd.notnull(row['stts_time_dt']):
+                    return row['stts_time_dt']
+                # Otherwise, default to Expected Arrival Time
+                return row['exp_arrival_dt']
+            
+            df['arrival_dt'] = df.apply(calculate_effective_arrival, axis=1)
+            # --- NEW REQUIREMENT LOGIC END ---
+        else:
+            # Fallback if STTS columns are missing in CSV
+            st.warning("Columns 'STTS' or 'STTS TIME' not found. Defaulting to 'EXPD ARVLTIME'.")
+            df['arrival_dt'] = df['exp_arrival_dt']
+
+        # 3. Sort and Drop Invalid Rows
         df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt').reset_index(drop=True)
 
         # Initialize State Variables
@@ -140,16 +166,19 @@ if uploaded_file is not None:
             line_groups[best_grp]['active_until'].append(best_start + timedelta(minutes=clearance))
             
             # --- CAPTURE EXTRA COLUMNS ---
-            # 1. Placement Reason (Previous)
+            # 1. Placement Reason
             placement_reason = rake['PLCT RESN'] if 'PLCT RESN' in df.columns else 'N/A'
-            # 2. Station From (New Addition)
+            # 2. Station From
             station_from = rake['STTN FROM'] if 'STTN FROM' in df.columns else 'N/A'
+            # 3. Status (Capture for debugging/viewing)
+            status_code = rake['STTS'] if 'STTS' in df.columns else 'N/A'
 
             # Log Result
             wait_mins = (best_start - rake['arrival_dt']).total_seconds() / 60
             assignments.append({
                 'Rake': rake['RAKE NAME'],
-                'Station From': station_from,   # <--- ADDED HERE
+                'Station From': station_from,
+                'Status': status_code, # Added to view status in table
                 'Wagons': rake['wagon_count'],
                 'Arrival': rake['arrival_dt'].strftime('%d-%H:%M'),
                 'Assigned': best_pair,
@@ -175,6 +204,4 @@ if uploaded_file is not None:
             data=csv,
             file_name="optimized_schedule.csv",
             mime="text/csv",
-
         )
-
