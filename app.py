@@ -123,6 +123,16 @@ if uploaded_file is not None:
         missing = [c for c in required_cols if c not in df.columns]
         st.error(f"Error: Missing columns {missing}")
     else:
+        # --- NEW FILTER: REMOVE 'LDNG' ---
+        if 'PLCT RESN' in df.columns:
+            initial_len = len(df)
+            # Remove rows where PLCT RESN contains "LDNG" (case insensitive)
+            df = df[~df['PLCT RESN'].astype(str).str.upper().str.contains('LDNG', na=False)]
+            
+            diff = initial_len - len(df)
+            if diff > 0:
+                st.warning(f"⚠️ Excluded {diff} trains with 'LDNG' Placement Reason.")
+
         df['wagon_count'] = df['TOTL UNTS'].apply(parse_wagons)
         df['exp_arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce')
         
@@ -254,7 +264,7 @@ if uploaded_file is not None:
                 'Tipplers Used': best_tipplers,
                 'Actual Start Unload': format_dt(best_start),
                 'Finish Unload': format_dt(best_finish),
-                # --- NEW COLUMNS ---
+                # --- INDIVIDUAL TIPPLER COLUMNS ---
                 'T1 Finish': format_dt(res_t1),
                 'T2 Finish': format_dt(res_t2),
                 'T3 Finish': format_dt(res_t3),
