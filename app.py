@@ -64,16 +64,14 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
     t_secondary = sorted_tipplers[1] # The one free later
     
     # 3. Calculate IDLE TIME (Gap between Machine Free and Train Ready)
-    # We track idle time for the PRIMARY tippler (since it starts the job)
     machine_free_at = tippler_state[t_primary]
     
-    # If machine was free at 10:00 and Train Ready at 10:30 -> Idle = 30 mins
-    # If machine was free at 10:30 and Train Ready at 10:00 -> Idle = 0 mins (Machine was busy)
-    idle_delta = max(timedelta(0), ready_time - machine_free_at)
-    
-    # Only count idle time if the machine has been used before (not Pd.Timestamp.min)
+    # --- CRITICAL FIX: Check for Timestamp.min BEFORE subtraction ---
     if machine_free_at == pd.Timestamp.min:
         idle_delta = timedelta(0)
+    else:
+        # Only calculate if valid. Max ensures we don't get negative idle.
+        idle_delta = max(timedelta(0), ready_time - machine_free_at)
 
     # 4. Split Wagons
     w_first = min(wagons, WAGONS_FIRST_BATCH)
@@ -159,6 +157,7 @@ if uploaded_file is not None:
         missing = [c for c in required_cols if c not in df.columns]
         st.error(f"Error: Missing columns {missing}")
     else:
+        # FILTER: Exclude 'LDNG'
         if 'PLCT RESN' in df.columns:
             df = df[~df['PLCT RESN'].astype(str).str.upper().str.contains('LDNG', na=False)]
 
@@ -285,7 +284,7 @@ if uploaded_file is not None:
                 'T3 Finish': format_dt(res_t3),
                 'T4 Finish': format_dt(res_t4),
                 'Wait (Tippler)': format_duration_hhmm(wait_delta),
-                'Tippler Idle Time': format_duration_hhmm(best_idle), # NEW COLUMN
+                'Tippler Idle Time': format_duration_hhmm(best_idle), 
                 'Formation Time': f"{int(best_formation_mins)} m",
                 'Total Duration': format_duration_hhmm(total_duration_delta),
                 'Placement Reason': rake.get('PLCT RESN', 'N/A')
