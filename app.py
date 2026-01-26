@@ -15,7 +15,7 @@ st.markdown("Upload your `INSIGHT DETAILS.csv` to run the simulation based on yo
 # ==========================================
 st.sidebar.header("⚙️ Infrastructure Settings")
 
-# Unloading Rates (Per Individual Tippler)
+# Unloading Rates
 st.sidebar.subheader("Individual Tippler Rates")
 RATE_T1 = st.sidebar.number_input("Tippler 1 Rate (Wagons/hr)", value=6.0, step=0.5)
 RATE_T2 = st.sidebar.number_input("Tippler 2 Rate (Wagons/hr)", value=6.0, step=0.5)
@@ -60,11 +60,11 @@ def calculate_split_finish(wagons, pair_name, start_time, tippler_state):
         
     # 3. Determine Start Times for Individual Tipplers
     
-    # Tippler A (First Batch)
+    # Check availability of Tippler A
     ready_a = max(start_time, tippler_state[t_a])
     finish_a = ready_a + timedelta(hours=(w_first / rate_a))
     
-    # Tippler B (Second Batch)
+    # Check availability of Tippler B
     start_time_b_theoretical = start_time + timedelta(minutes=INTER_TIPPLER_DELAY)
     ready_b = max(start_time_b_theoretical, tippler_state[t_b])
     
@@ -72,8 +72,7 @@ def calculate_split_finish(wagons, pair_name, start_time, tippler_state):
         finish_b = ready_b + timedelta(hours=(w_second / rate_b))
         return max(finish_a, finish_b), f"{t_a} & {t_b}", finish_a, finish_b
     else:
-        # Only used first tippler. Second tippler finish is irrelevant (set to Start for safety)
-        return finish_a, f"{t_a} Only", finish_a, start_time 
+        return finish_a, f"{t_a} Only", finish_a, ready_b 
 
 def get_line_entry_time(group_name, arrival_time, line_groups):
     group = line_groups[group_name]
@@ -107,6 +106,13 @@ def format_dt(dt):
     if pd.isnull(dt): return ""
     return dt.strftime('%d-%H:%M')
 
+def format_duration_hhmm(delta):
+    """Converts a timedelta to HH:MM string format."""
+    total_seconds = int(delta.total_seconds())
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    return f"{hours:02d}:{minutes:02d}"
+
 # ==========================================
 # 3. MAIN APP EXECUTION
 # ==========================================
@@ -123,12 +129,10 @@ if uploaded_file is not None:
         missing = [c for c in required_cols if c not in df.columns]
         st.error(f"Error: Missing columns {missing}")
     else:
-        # --- NEW FILTER: REMOVE 'LDNG' ---
+        # FILTER: Exclude 'LDNG' reasons
         if 'PLCT RESN' in df.columns:
             initial_len = len(df)
-            # Remove rows where PLCT RESN contains "LDNG" (case insensitive)
             df = df[~df['PLCT RESN'].astype(str).str.upper().str.contains('LDNG', na=False)]
-            
             diff = initial_len - len(df)
             if diff > 0:
                 st.warning(f"⚠️ Excluded {diff} trains with 'LDNG' Placement Reason.")
@@ -150,50 +154,42 @@ if uploaded_file is not None:
 
         # --- STATE VARIABLES ---
         tippler_state = {
-            'T1': pd.Timestamp.min,
-            'T2': pd.Timestamp.min,
-            'T3': pd.Timestamp.min,
-            'T4': pd.Timestamp.min
+            'T1': pd.Timestamp.min, 'T2': pd.Timestamp.min,
+            'T3': pd.Timestamp.min, 'T4': pd.Timestamp.min
         }
-        
         specific_line_status = {8: pd.Timestamp.min, 9: pd.Timestamp.min, 10: pd.Timestamp.min, 11: pd.Timestamp.min}
-        
         line_groups = {
             'Group_Lines_8_10': {'capacity': 2, 'clearance_mins': 50, 'line_free_times': []}, 
             'Group_Line_11': {'capacity': 1, 'clearance_mins': 100, 'line_free_times': []}    
         }
-        
         rr_tracker_A = -1 
         
         assignments = []
         
         for _, rake in df.iterrows():
             
-            # --- SCENARIO A: Pair A (Lines 8-10) ---
+            # --- SCENARIO A: Pair A ---
             shunt_offset_A = timedelta(minutes=SHUNT_MINS_A)
             grp_A = 'Group_Lines_8_10'
-            
-            # 1. Line Entry
             entry_time_A = get_line_entry_time(grp_A, rake['arrival_dt'], line_groups)
             ready_to_unload_A = entry_time_A + shunt_offset_A
             
-            # 2. Calculate Finish (Returns T1 and T2 finish times specifically)
             finish_A, used_A, fin_t1_calc, fin_t2_calc = calculate_split_finish(
                 rake['wagon_count'], 'Pair A (T1&T2)', ready_to_unload_A, tippler_state
             )
+            # Actual Start is defined by when the First Batch actually starts
+            start_A = max(ready_to_unload_A, tippler_state['T1'])
             
-            # --- SCENARIO B: Pair B (Line 11) ---
+            # --- SCENARIO B: Pair B ---
             shunt_offset_B = timedelta(minutes=SHUNT_MINS_B)
             grp_B = 'Group_Line_11'
-            
-            # 1. Line Entry
             entry_time_B = get_line_entry_time(grp_B, rake['arrival_dt'], line_groups)
             ready_to_unload_B = entry_time_B + shunt_offset_B
             
-            # 2. Calculate Finish (Returns T3 and T4 finish times specifically)
             finish_B, used_B, fin_t3_calc, fin_t4_calc = calculate_split_finish(
                 rake['wagon_count'], 'Pair B (T3&T4)', ready_to_unload_B, tippler_state
             )
+            start_B = max(ready_to_unload_B, tippler_state['T3'])
             
             # --- DECISION ---
             if finish_A <= finish_B:
@@ -201,15 +197,13 @@ if uploaded_file is not None:
                 best_grp = grp_A
                 best_entry = entry_time_A
                 best_ready = ready_to_unload_A
-                best_start = max(ready_to_unload_A, tippler_state['T1']) 
+                best_start = start_A
                 best_finish = finish_A
                 best_tipplers = used_A
                 
-                # Capture Individual Tippler Times for Output
-                res_t1 = fin_t1_calc
-                res_t2 = fin_t2_calc if 'T2' in used_A else pd.NaT
-                res_t3 = pd.NaT
-                res_t4 = pd.NaT
+                # Output Data
+                res_t1, res_t2 = fin_t1_calc, (fin_t2_calc if 'T2' in used_A else pd.NaT)
+                res_t3, res_t4 = pd.NaT, pd.NaT
                 
                 # Update State
                 if 'T1' in used_A: tippler_state['T1'] = fin_t1_calc
@@ -224,17 +218,13 @@ if uploaded_file is not None:
                 best_grp = grp_B
                 best_entry = entry_time_B
                 best_ready = ready_to_unload_B
-                best_start = max(ready_to_unload_B, tippler_state['T3'])
+                best_start = start_B
                 best_finish = finish_B
                 best_tipplers = used_B
                 
-                # Capture Individual Tippler Times for Output
-                res_t1 = pd.NaT
-                res_t2 = pd.NaT
-                res_t3 = fin_t3_calc
-                res_t4 = fin_t4_calc if 'T4' in used_B else pd.NaT
+                res_t1, res_t2 = pd.NaT, pd.NaT
+                res_t3, res_t4 = fin_t3_calc, (fin_t4_calc if 'T4' in used_B else pd.NaT)
                 
-                # Update State
                 if 'T3' in used_B: tippler_state['T3'] = fin_t3_calc
                 if 'T4' in used_B: tippler_state['T4'] = fin_t4_calc
                 
@@ -247,8 +237,12 @@ if uploaded_file is not None:
             line_groups[best_grp]['line_free_times'].append(line_free_at)
             specific_line_status[selected_line] = line_free_at
             
-            wait_mins = (best_start - rake['arrival_dt']).total_seconds() / 60
-            dur_mins = (best_finish - best_start).total_seconds() / 60.0
+            # --- CALCULATE DURATIONS ---
+            # Wait Time = Actual Start - Ready (Wait for Tippler)
+            wait_delta = best_start - best_ready
+            
+            # Total Duration = Finish - Arrival
+            total_duration_delta = best_finish - rake['arrival_dt']
             
             assignments.append({
                 'Rake': rake['RAKE NAME'],
@@ -264,14 +258,14 @@ if uploaded_file is not None:
                 'Tipplers Used': best_tipplers,
                 'Actual Start Unload': format_dt(best_start),
                 'Finish Unload': format_dt(best_finish),
-                # --- INDIVIDUAL TIPPLER COLUMNS ---
                 'T1 Finish': format_dt(res_t1),
                 'T2 Finish': format_dt(res_t2),
                 'T3 Finish': format_dt(res_t3),
                 'T4 Finish': format_dt(res_t4),
-                # -------------------
-                'Wait': f"{int(wait_mins)} m",
-                'Duration (Hrs)': f"{dur_mins/60.0:.2f}h",
+                # --- DURATION COLUMNS IN HH:MM ---
+                'Wait (Tippler)': format_duration_hhmm(wait_delta),
+                'Total Duration': format_duration_hhmm(total_duration_delta),
+                # ---------------------------------
                 'Placement Reason': rake.get('PLCT RESN', 'N/A')
             })
 
