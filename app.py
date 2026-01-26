@@ -11,7 +11,7 @@ st.title("🚂 BOXN Rake Demurrage Optimization Dashboard")
 st.markdown("Upload your `INSIGHT DETAILS.csv`. **Add Downtimes or Edit Finish Times to simulate scenarios.**")
 
 # ==========================================
-# 2. HELPER FUNCTIONS & LOGIC (DEFINED FIRST)
+# 2. HELPER FUNCTIONS & LOGIC
 # ==========================================
 
 def parse_wagons(val):
@@ -47,21 +47,17 @@ def format_duration_hhmm(delta):
     return f"{sign}{hours:02d}:{minutes:02d}"
 
 def check_downtime_impact(tippler_id, proposed_start, downtime_list):
-    # Filter for this tippler
     relevant_dts = [d for d in downtime_list if d['Tippler'] == tippler_id]
     relevant_dts.sort(key=lambda x: x['Start'])
     
     current_start = proposed_start
-    
-    # Loop to handle consecutive/overlapping downtimes
     changed = True
     while changed:
         changed = False
         for dt in relevant_dts:
-            # If the start time falls INSIDE a downtime block
             if dt['Start'] <= current_start < dt['End']:
                 current_start = dt['End']
-                changed = True # Restart check in case we pushed it into ANOTHER downtime
+                changed = True
     return current_start
 
 def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtime_list, 
@@ -83,19 +79,15 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtim
     w_first = min(wagons, wagons_first_batch)
     w_second = wagons - w_first
     
-    # Primary Batch Logic
     proposed_start_prim = max(ready_time, tippler_state[t_primary])
-    # Apply Downtime Check
     actual_start_prim = check_downtime_impact(t_primary, proposed_start_prim, downtime_list)
     finish_primary = actual_start_prim + timedelta(hours=(w_first / resources[t_primary]))
     
     updated_times = {t_primary: finish_primary}
     
-    # Secondary Batch Logic
     if w_second > 0:
         start_sec_theory = ready_time + timedelta(minutes=inter_tippler_delay)
         proposed_start_sec = max(start_sec_theory, tippler_state[t_secondary])
-        # Apply Downtime Check
         actual_start_sec = check_downtime_impact(t_secondary, proposed_start_sec, downtime_list)
         finish_secondary = actual_start_sec + timedelta(hours=(w_second / resources[t_secondary]))
         
@@ -126,10 +118,8 @@ def find_specific_line(group, entry, status, last_idx):
 
 def run_full_simulation(df, params):
     """
-    Main Logic Engine. 
-    Accepts DF and a dictionary of parameters (rates, delays, etc.)
+    Initial Simulation Logic.
     """
-    # Unpack params
     r_t1, r_t2, r_t3, r_t4 = params['rt1'], params['rt2'], params['rt3'], params['rt4']
     s_a, s_b = params['sa'], params['sb']
     f_a, f_b = params['fa'], params['fb']
@@ -137,7 +127,6 @@ def run_full_simulation(df, params):
     ft_hours = params['ft']
     downtimes = params['downtimes']
 
-    # Pre-process
     df = df.copy()
     df['wagon_count'] = df['TOTL UNTS'].apply(parse_wagons)
     df['exp_arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce')
@@ -150,7 +139,6 @@ def run_full_simulation(df, params):
 
     df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt').reset_index(drop=True)
     
-    # State Init
     tippler_state = {'T1': pd.Timestamp.min, 'T2': pd.Timestamp.min, 'T3': pd.Timestamp.min, 'T4': pd.Timestamp.min}
     spec_line_status = {8: pd.Timestamp.min, 9: pd.Timestamp.min, 10: pd.Timestamp.min, 11: pd.Timestamp.min}
     line_groups = {
@@ -161,7 +149,6 @@ def run_full_simulation(df, params):
     assignments = []
     
     for _, rake in df.iterrows():
-        # Option A
         shunt_A = timedelta(minutes=s_a)
         entry_A = get_line_entry_time('Group_Lines_8_10', rake['arrival_dt'], line_groups)
         ready_A = entry_A + shunt_A
@@ -170,7 +157,6 @@ def run_full_simulation(df, params):
             r_t1, r_t2, r_t3, r_t4, w_batch, w_delay
         )
         
-        # Option B
         shunt_B = timedelta(minutes=s_b)
         entry_B = get_line_entry_time('Group_Line_11', rake['arrival_dt'], line_groups)
         ready_B = entry_B + shunt_B
@@ -179,7 +165,6 @@ def run_full_simulation(df, params):
             r_t1, r_t2, r_t3, r_t4, w_batch, w_delay
         )
         
-        # Decision
         if fin_A <= fin_B:
             best_pair, best_grp, best_entry, best_ready, best_start, best_fin = 'Pair A (T1&T2)', 'Group_Lines_8_10', entry_A, ready_A, start_A, fin_A
             best_tips, best_idle, best_form_mins = used_A, idle_A, f_a
@@ -232,7 +217,10 @@ def run_full_simulation(df, params):
     return pd.DataFrame(assignments)
 
 def recalculate_cascade(edited_df, free_time_hours):
-    """Cascading Re-calculation based on user manual edits."""
+    """
+    Cascading Re-calculation based on user manual edits.
+    Updates daily_demurrage_tracker during iteration.
+    """
     recalc_rows = []
     tippler_state = {'T1': pd.Timestamp.min, 'T2': pd.Timestamp.min, 'T3': pd.Timestamp.min, 'T4': pd.Timestamp.min}
     daily_demurrage_tracker = {}
@@ -255,7 +243,6 @@ def recalculate_cascade(edited_df, free_time_hours):
         
         calculated_start = max(ready, resource_free_at)
         
-        # User Manual Overrides for Start
         try:
             old_start = restore_dt(row['Tippler Start Time'], ready)
             final_start = max(calculated_start, old_start)
@@ -265,13 +252,12 @@ def recalculate_cascade(edited_df, free_time_hours):
         tippler_finish_map = {}
         max_finish = final_start 
         
-        # User Manual Overrides for Finish (Individual)
         for t_id in ['T1', 'T2', 'T3', 'T4']:
             if t_id in current_tipplers:
                 col_name = f"{t_id} Finish"
                 t_edit = restore_dt(row[col_name], final_start)
                 if pd.isnull(t_edit): 
-                    t_edit = final_start + timedelta(hours=2) # Default assumption
+                    t_edit = final_start + timedelta(hours=2) 
                 
                 tippler_finish_map[t_id] = t_edit
                 tippler_state[t_id] = t_edit
@@ -282,6 +268,8 @@ def recalculate_cascade(edited_df, free_time_hours):
         wait_delta = final_start - ready
         form_delta = timedelta(minutes=form_mins)
         tot_dur = (final_finish - arrival) + form_delta
+        
+        # --- NEW DEMURRAGE CALCULATION ---
         demurrage = max(timedelta(0), tot_dur - timedelta(hours=free_time_hours))
         
         row['Tippler Start Time'] = format_dt(final_start)
@@ -296,6 +284,7 @@ def recalculate_cascade(edited_df, free_time_hours):
         row['Total Duration'] = format_duration_hhmm(tot_dur)
         row['Demurrage'] = format_duration_hhmm(demurrage)
         
+        # --- AGGREGATE DAILY ---
         date_str = arrival.strftime('%Y-%m-%d')
         daily_demurrage_tracker[date_str] = daily_demurrage_tracker.get(date_str, 0) + demurrage.total_seconds()
         
@@ -350,6 +339,8 @@ with st.sidebar.form("downtime_form"):
         if 'raw_data' in st.session_state:
             sim_params['downtimes'] = st.session_state.downtimes
             st.session_state.sim_result = run_full_simulation(st.session_state.raw_data, sim_params)
+            # FORCE RECALC STATS
+            _, st.session_state.daily_stats = recalculate_cascade(st.session_state.sim_result, sim_params['ft'])
             st.rerun()
 
 if st.session_state.downtimes:
@@ -363,6 +354,7 @@ if st.session_state.downtimes:
         if 'raw_data' in st.session_state:
             sim_params['downtimes'] = []
             st.session_state.sim_result = run_full_simulation(st.session_state.raw_data, sim_params)
+            _, st.session_state.daily_stats = recalculate_cascade(st.session_state.sim_result, sim_params['ft'])
         st.rerun()
 
 sim_params['downtimes'] = st.session_state.downtimes
@@ -375,7 +367,6 @@ uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
 
 # 1. LOAD DATA
 if uploaded_file is not None:
-    # Check if this is a new file upload
     if 'last_uploaded_file' not in st.session_state or st.session_state.last_uploaded_file != uploaded_file:
         df_raw = pd.read_csv(uploaded_file)
         df_raw.columns = df_raw.columns.str.strip().str.upper()
@@ -384,10 +375,11 @@ if uploaded_file is not None:
         
         st.session_state.raw_data = df_raw
         st.session_state.last_uploaded_file = uploaded_file
-        # Run Initial Simulation
         st.session_state.sim_result = run_full_simulation(df_raw, sim_params)
+        # INITIAL CALC OF DAILY STATS
+        _, st.session_state.daily_stats = recalculate_cascade(st.session_state.sim_result, sim_params['ft'])
 
-# 2. RENDER DASHBOARD (If data exists)
+# 2. RENDER DASHBOARD
 if 'raw_data' in st.session_state:
     
     st.markdown("### 📝 Schedule Editor")
@@ -413,14 +405,17 @@ if 'raw_data' in st.session_state:
         st.session_state.daily_stats = daily_stats
         st.rerun()
 
-    # Calc stats if missing
+    # RENDER SUMMARY FROM STATE
     if 'daily_stats' not in st.session_state:
         _, st.session_state.daily_stats = recalculate_cascade(st.session_state.sim_result, sim_params['ft'])
         
     st.markdown("### 📅 Daily Demurrage Summary")
     daily_data = [{'Date': k, 'Total Demurrage': format_duration_hhmm(timedelta(seconds=v))} for k,v in st.session_state.daily_stats.items()]
-    daily_df = pd.DataFrame(daily_data).sort_values('Date')
-    st.dataframe(daily_df, use_container_width=True)
+    if daily_data:
+        daily_df = pd.DataFrame(daily_data).sort_values('Date')
+        st.dataframe(daily_df, use_container_width=True)
+    else:
+        st.info("No Demurrage Incurred.")
     
     csv = st.session_state.sim_result.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins"]).to_csv(index=False).encode('utf-8')
     st.download_button("📥 Download Final Report", csv, "optimized_schedule.csv", "text/csv")
