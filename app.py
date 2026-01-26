@@ -39,40 +39,64 @@ st.sidebar.info(f"Line 8-10 Clearance: 50 mins (Parallel Processing)\nLine 11 Cl
 # 2. CALCULATION LOGIC
 # ==========================================
 
-def calculate_split_finish(wagons, pair_name, start_time, tippler_state):
+def calculate_split_finish(wagons, pair_name, ready_time, tippler_state):
     """
-    Calculates the finish time for a train split across two tipplers.
-    Returns: (Overall Finish, String of Tipplers Used, Finish T_Main, Finish T_Secondary)
+    Calculates finish time using DYNAMIC ASSIGNMENT.
+    The first batch goes to whichever tippler in the pair is free EARLIEST.
     """
-    if wagons == 0: return start_time, "None", start_time, start_time
+    if wagons == 0: 
+        # Return structure: (Finish, Used_Str, Start_Time, {T_ID: Finish_Time})
+        return ready_time, "None", ready_time, {}
     
-    # 1. Split Wagons
+    # 1. Define Resources based on Pair
+    if pair_name == 'Pair A (T1&T2)':
+        resources = {'T1': RATE_T1, 'T2': RATE_T2}
+    else:
+        resources = {'T3': RATE_T3, 'T4': RATE_T4}
+        
+    # 2. DYNAMIC SORT: Find which tippler is free earliest
+    # Sort keys (Tippler IDs) based on their current busy-until time
+    sorted_tipplers = sorted(resources.keys(), key=lambda x: tippler_state[x])
+    
+    t_primary = sorted_tipplers[0]   # The one free earliest (gets Batch 1)
+    t_secondary = sorted_tipplers[1] # The one free later (gets Batch 2)
+    
+    # 3. Split Wagons
     w_first = min(wagons, WAGONS_FIRST_BATCH)
     w_second = wagons - w_first
     
-    # 2. Identify Tipplers & Rates
-    if pair_name == 'Pair A (T1&T2)':
-        t_a, t_b = 'T1', 'T2'
-        rate_a, rate_b = RATE_T1, RATE_T2
-    else:
-        t_a, t_b = 'T3', 'T4'
-        rate_a, rate_b = RATE_T3, RATE_T4
-        
-    # 3. Determine Start Times for Individual Tipplers
+    # 4. Calculate Timings
     
-    # Check availability of Tippler A
-    ready_a = max(start_time, tippler_state[t_a])
-    finish_a = ready_a + timedelta(hours=(w_first / rate_a))
+    # --- Primary Batch (Goes to Earliest Free Tippler) ---
+    # Starts when Rake is Ready OR Tippler is Free (whichever is later)
+    start_primary = max(ready_time, tippler_state[t_primary])
+    finish_primary = start_primary + timedelta(hours=(w_first / resources[t_primary]))
     
-    # Check availability of Tippler B
-    start_time_b_theoretical = start_time + timedelta(minutes=INTER_TIPPLER_DELAY)
-    ready_b = max(start_time_b_theoretical, tippler_state[t_b])
+    updated_times = {}
+    updated_times[t_primary] = finish_primary
     
+    # --- Secondary Batch (Goes to Other Tippler) ---
     if w_second > 0:
-        finish_b = ready_b + timedelta(hours=(w_second / rate_b))
-        return max(finish_a, finish_b), f"{t_a} & {t_b}", finish_a, finish_b
+        # Constraint: Can start only after Ready + Stagger Delay
+        # AND when the secondary tippler is free
+        start_secondary_theoretical = ready_time + timedelta(minutes=INTER_TIPPLER_DELAY)
+        start_secondary = max(start_secondary_theoretical, tippler_state[t_secondary])
+        
+        finish_secondary = start_secondary + timedelta(hours=(w_second / resources[t_secondary]))
+        
+        updated_times[t_secondary] = finish_secondary
+        
+        overall_finish = max(finish_primary, finish_secondary)
+        used_str = f"{t_primary} & {t_secondary}"
     else:
-        return finish_a, f"{t_a} Only", finish_a, ready_b 
+        # Only one tippler needed
+        overall_finish = finish_primary
+        used_str = f"{t_primary} Only"
+        # We don't update the secondary tippler time, it remains as is
+        updated_times[t_secondary] = tippler_state[t_secondary]
+
+    # Return: Overall Finish, Description, Actual Start Time (of first batch), Dictionary of new finish times
+    return overall_finish, used_str, start_primary, updated_times
 
 def get_line_entry_time(group_name, arrival_time, line_groups):
     group = line_groups[group_name]
@@ -107,7 +131,6 @@ def format_dt(dt):
     return dt.strftime('%d-%H:%M')
 
 def format_duration_hhmm(delta):
-    """Converts a timedelta to HH:MM string format."""
     total_seconds = int(delta.total_seconds())
     hours = total_seconds // 3600
     minutes = (total_seconds % 3600) // 60
@@ -129,7 +152,6 @@ if uploaded_file is not None:
         missing = [c for c in required_cols if c not in df.columns]
         st.error(f"Error: Missing columns {missing}")
     else:
-        # FILTER: Exclude 'LDNG' reasons
         if 'PLCT RESN' in df.columns:
             initial_len = len(df)
             df = df[~df['PLCT RESN'].astype(str).str.upper().str.contains('LDNG', na=False)]
@@ -168,28 +190,27 @@ if uploaded_file is not None:
         
         for _, rake in df.iterrows():
             
-            # --- SCENARIO A: Pair A ---
+            # --- SCENARIO A: Pair A (Lines 8-10) ---
             shunt_offset_A = timedelta(minutes=SHUNT_MINS_A)
             grp_A = 'Group_Lines_8_10'
             entry_time_A = get_line_entry_time(grp_A, rake['arrival_dt'], line_groups)
             ready_to_unload_A = entry_time_A + shunt_offset_A
             
-            finish_A, used_A, fin_t1_calc, fin_t2_calc = calculate_split_finish(
+            # Calculate Finish using DYNAMIC assignment
+            finish_A, used_A, start_A, updated_times_A = calculate_split_finish(
                 rake['wagon_count'], 'Pair A (T1&T2)', ready_to_unload_A, tippler_state
             )
-            # Actual Start is defined by when the First Batch actually starts
-            start_A = max(ready_to_unload_A, tippler_state['T1'])
             
-            # --- SCENARIO B: Pair B ---
+            # --- SCENARIO B: Pair B (Line 11) ---
             shunt_offset_B = timedelta(minutes=SHUNT_MINS_B)
             grp_B = 'Group_Line_11'
             entry_time_B = get_line_entry_time(grp_B, rake['arrival_dt'], line_groups)
             ready_to_unload_B = entry_time_B + shunt_offset_B
             
-            finish_B, used_B, fin_t3_calc, fin_t4_calc = calculate_split_finish(
+            # Calculate Finish using DYNAMIC assignment
+            finish_B, used_B, start_B, updated_times_B = calculate_split_finish(
                 rake['wagon_count'], 'Pair B (T3&T4)', ready_to_unload_B, tippler_state
             )
-            start_B = max(ready_to_unload_B, tippler_state['T3'])
             
             # --- DECISION ---
             if finish_A <= finish_B:
@@ -201,13 +222,15 @@ if uploaded_file is not None:
                 best_finish = finish_A
                 best_tipplers = used_A
                 
-                # Output Data
-                res_t1, res_t2 = fin_t1_calc, (fin_t2_calc if 'T2' in used_A else pd.NaT)
-                res_t3, res_t4 = pd.NaT, pd.NaT
+                # Update State from the Dynamic Dictionary
+                for t_id, t_time in updated_times_A.items():
+                    tippler_state[t_id] = t_time
                 
-                # Update State
-                if 'T1' in used_A: tippler_state['T1'] = fin_t1_calc
-                if 'T2' in used_A: tippler_state['T2'] = fin_t2_calc
+                # Extract for Reporting
+                res_t1 = updated_times_A.get('T1', pd.NaT)
+                res_t2 = updated_times_A.get('T2', pd.NaT)
+                res_t3 = pd.NaT
+                res_t4 = pd.NaT
                 
                 selected_line = find_specific_line(grp_A, best_entry, specific_line_status, rr_tracker_A)
                 if selected_line in [8, 9, 10]:
@@ -222,11 +245,15 @@ if uploaded_file is not None:
                 best_finish = finish_B
                 best_tipplers = used_B
                 
-                res_t1, res_t2 = pd.NaT, pd.NaT
-                res_t3, res_t4 = fin_t3_calc, (fin_t4_calc if 'T4' in used_B else pd.NaT)
+                # Update State from the Dynamic Dictionary
+                for t_id, t_time in updated_times_B.items():
+                    tippler_state[t_id] = t_time
                 
-                if 'T3' in used_B: tippler_state['T3'] = fin_t3_calc
-                if 'T4' in used_B: tippler_state['T4'] = fin_t4_calc
+                # Extract for Reporting
+                res_t1 = pd.NaT
+                res_t2 = pd.NaT
+                res_t3 = updated_times_B.get('T3', pd.NaT)
+                res_t4 = updated_times_B.get('T4', pd.NaT)
                 
                 selected_line = 11
                 
@@ -238,10 +265,7 @@ if uploaded_file is not None:
             specific_line_status[selected_line] = line_free_at
             
             # --- CALCULATE DURATIONS ---
-            # Wait Time = Actual Start - Ready (Wait for Tippler)
             wait_delta = best_start - best_ready
-            
-            # Total Duration = Finish - Arrival
             total_duration_delta = best_finish - rake['arrival_dt']
             
             assignments.append({
@@ -262,10 +286,8 @@ if uploaded_file is not None:
                 'T2 Finish': format_dt(res_t2),
                 'T3 Finish': format_dt(res_t3),
                 'T4 Finish': format_dt(res_t4),
-                # --- DURATION COLUMNS IN HH:MM ---
                 'Wait (Tippler)': format_duration_hhmm(wait_delta),
                 'Total Duration': format_duration_hhmm(total_duration_delta),
-                # ---------------------------------
                 'Placement Reason': rake.get('PLCT RESN', 'N/A')
             })
 
