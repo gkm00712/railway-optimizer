@@ -41,7 +41,6 @@ def format_dt(dt):
 def restore_dt(dt_str, ref_dt):
     """
     Restores datetime from 'dd-HH:MM' string using reference year/month.
-    Returns an IST-aware datetime.
     """
     if not isinstance(dt_str, str) or dt_str.strip() == "": return pd.NaT
     try:
@@ -54,7 +53,6 @@ def restore_dt(dt_str, ref_dt):
         
         new_dt = ref_dt.replace(day=day, hour=hour, minute=minute, second=0)
         
-        # Handle month rollover (simple heuristic)
         if day < ref_dt.day - 15: 
             new_dt = new_dt + pd.DateOffset(months=1)
         elif day > ref_dt.day + 15:
@@ -64,7 +62,7 @@ def restore_dt(dt_str, ref_dt):
     except: return pd.NaT
 
 def format_duration_hhmm(delta):
-    if pd.isnull(delta): return "00:00"
+    if pd.isnull(delta): return ""
     total_seconds = int(delta.total_seconds())
     sign = "-" if total_seconds < 0 else ""
     total_seconds = abs(total_seconds)
@@ -113,25 +111,26 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtim
     sorted_tipplers = sorted(resources.keys(), key=lambda x: tippler_state[x])
     t_primary, t_secondary = sorted_tipplers[0], sorted_tipplers[1]
     
-    # --- Calculate Idle Cost (Gap) ---
-    machine_free_at = tippler_state[t_primary]
-    if machine_free_at.tzinfo is None: machine_free_at = IST.localize(machine_free_at)
-    
-    # Idle gap is time between machine becoming free and train becoming ready
-    idle_gap_primary = max(timedelta(0), ready_time - machine_free_at)
+    detailed_timings = {}
     
     # --- Process First Batch (Primary) ---
     w_first = min(wagons, wagons_first_batch)
     w_second = wagons - w_first
     
-    proposed_start_prim = max(ready_time, tippler_state[t_primary])
-    actual_start_prim = check_downtime_impact(t_primary, proposed_start_prim, downtime_list)
-    finish_primary = actual_start_prim + timedelta(hours=(w_first / resources[t_primary]))
+    # Idle Calc Primary
+    free_prim = tippler_state[t_primary]
+    if free_prim.tzinfo is None: free_prim = IST.localize(free_prim)
     
-    detailed_timings = {
-        f"{t_primary}_Start": actual_start_prim,
-        f"{t_primary}_End": finish_primary
-    }
+    proposed_start_prim = max(ready_time, free_prim)
+    actual_start_prim = check_downtime_impact(t_primary, proposed_start_prim, downtime_list)
+    
+    # Idle = Actual Start - Last Free
+    idle_gap_primary = max(timedelta(0), actual_start_prim - free_prim)
+    detailed_timings[f"{t_primary}_Idle"] = idle_gap_primary
+    
+    finish_primary = actual_start_prim + timedelta(hours=(w_first / resources[t_primary]))
+    detailed_timings[f"{t_primary}_Start"] = actual_start_prim
+    detailed_timings[f"{t_primary}_End"] = finish_primary
     
     overall_finish = finish_primary
     used_str = f"{t_primary} Only"
@@ -140,12 +139,15 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtim
     # --- Process Second Batch (Secondary) if needed ---
     if w_second > 0:
         start_sec_theory = ready_time + timedelta(minutes=inter_tippler_delay)
-        proposed_start_sec = max(start_sec_theory, tippler_state[t_secondary])
+        
+        free_sec = tippler_state[t_secondary]
+        if free_sec.tzinfo is None: free_sec = IST.localize(free_sec)
+        
+        proposed_start_sec = max(start_sec_theory, free_sec)
         actual_start_sec = check_downtime_impact(t_secondary, proposed_start_sec, downtime_list)
         
-        # Idle Gap Secondary
-        machine_free_at_sec = tippler_state[t_secondary]
-        idle_gap_secondary = max(timedelta(0), start_sec_theory - machine_free_at_sec)
+        idle_gap_secondary = max(timedelta(0), actual_start_sec - free_sec)
+        detailed_timings[f"{t_secondary}_Idle"] = idle_gap_secondary
         
         finish_secondary = actual_start_sec + timedelta(hours=(w_second / resources[t_secondary]))
         
@@ -300,12 +302,19 @@ def run_full_simulation_initial(df, params):
         # Extract specific timings for individual columns
         t1_s = best_timings.get('T1_Start', pd.NaT)
         t1_e = best_timings.get('T1_End', pd.NaT)
+        t1_i = best_timings.get('T1_Idle', pd.NaT)
+        
         t2_s = best_timings.get('T2_Start', pd.NaT)
         t2_e = best_timings.get('T2_End', pd.NaT)
+        t2_i = best_timings.get('T2_Idle', pd.NaT)
+        
         t3_s = best_timings.get('T3_Start', pd.NaT)
         t3_e = best_timings.get('T3_End', pd.NaT)
+        t3_i = best_timings.get('T3_Idle', pd.NaT)
+        
         t4_s = best_timings.get('T4_Start', pd.NaT)
         t4_e = best_timings.get('T4_End', pd.NaT)
+        t4_i = best_timings.get('T4_Idle', pd.NaT)
 
         assignments.append({
             'Rake': rake['RAKE NAME'],
@@ -323,10 +332,10 @@ def run_full_simulation_initial(df, params):
             'Finish Unload': format_dt(best_fin),
             'Tipplers Used': best_tips,
             # INDIVIDUAL COLUMNS
-            'T1 Start': format_dt(t1_s), 'T1 End': format_dt(t1_e),
-            'T2 Start': format_dt(t2_s), 'T2 End': format_dt(t2_e),
-            'T3 Start': format_dt(t3_s), 'T3 End': format_dt(t3_e),
-            'T4 Start': format_dt(t4_s), 'T4 End': format_dt(t4_e),
+            'T1 Start': format_dt(t1_s), 'T1 End': format_dt(t1_e), 'T1 Idle': format_duration_hhmm(t1_i),
+            'T2 Start': format_dt(t2_s), 'T2 End': format_dt(t2_e), 'T2 Idle': format_duration_hhmm(t2_i),
+            'T3 Start': format_dt(t3_s), 'T3 End': format_dt(t3_e), 'T3 Idle': format_duration_hhmm(t3_i),
+            'T4 Start': format_dt(t4_s), 'T4 End': format_dt(t4_e), 'T4 Idle': format_duration_hhmm(t4_i),
             'Wait (Tippler)': format_duration_hhmm(wait_delta),
             'Total Duration': format_duration_hhmm(tot_dur),
             'Demurrage': format_duration_hhmm(demurrage),
@@ -337,7 +346,7 @@ def run_full_simulation_initial(df, params):
 def recalculate_cascade_reactive(edited_df, free_time_hours):
     """
     Recalculates times based on user manual edits in the table.
-    Updates subsequent resource availability and demurrage.
+    Updates subsequent resource availability, demurrage, AND idle times.
     """
     recalc_rows = []
     
@@ -384,27 +393,43 @@ def recalculate_cascade_reactive(edited_df, free_time_hours):
         for t_id in ['T1', 'T2', 'T3', 'T4']:
             col_start = f"{t_id} Start"
             col_end = f"{t_id} End"
+            col_idle = f"{t_id} Idle"
             
             # If this tippler was used for this rake
             if t_id in current_tipplers:
-                # Retrieve original duration or user edited end time
+                # 1. Update Idle Time (Start - Previous Finish)
+                prev_finish = tippler_state[t_id]
+                # If prev_finish is dummy init (2000), idle might look huge, but standard logic is max(0, start - prev)
+                # If it's the very first run of day, prev_finish should be 00:00 (handled in initial sim)
+                # But here in Reactive, we reset state to 2000. 
+                # To fix this, we need the initial start time passed in, OR we assume the first idle is correct from original sim?
+                # Simpler: Just calculate gap. If gap > 10 years, it's first run -> Use 0.
+                gap = final_start - prev_finish
+                if gap.days > 365:
+                    # Likely first run, effectively 0 idle relative to simulation scope unless we know 00:00
+                    # For visual consistency, we might leave the existing idle value if we can't recalculate perfectly?
+                    # Or better: Assume tippler_state starts at 00:00 of current day?
+                    # Let's use the existing value in the cell if it's the first one, or recalculate if not.
+                    # But simpler is: Just update the timing. Updating Idle in Reactive is tricky without full context.
+                    # We will calculate relative to the tracking state.
+                    current_idle = timedelta(0) 
+                else:
+                    current_idle = max(timedelta(0), gap)
+                    row[col_idle] = format_duration_hhmm(current_idle)
+
+                # 2. Update Finish Time
                 t_end_val = restore_dt(row[col_end], final_start)
                 t_start_val_old = restore_dt(row[col_start], final_start)
                 
                 # Estimate Duration
                 if pd.notnull(t_end_val) and pd.notnull(t_start_val_old):
                      duration = t_end_val - t_start_val_old
-                     if duration < timedelta(0): duration = timedelta(hours=2) # Fallback
+                     if duration < timedelta(0): duration = timedelta(hours=2) 
                 else:
-                     duration = timedelta(hours=2) # Fallback default
-                
-                # New End Time = New Start + Duration
-                # (Unless user explicitly extended the End Time further than the shift implies)
-                # For simplicity in reactive mode: We shift the end time by the start delay
+                     duration = timedelta(hours=2) 
                 
                 new_t_end = final_start + duration
                 
-                # Check if user manually pushed the End Time even further
                 if pd.notnull(t_end_val) and t_end_val > new_t_end:
                     new_t_end = t_end_val
 
@@ -532,10 +557,10 @@ if 'raw_data_cached' in st.session_state:
             "_Arrival_DT": None, "_Shunt_Ready_DT": None, "_Form_Mins": None,
             "Tippler Start Time": st.column_config.TextColumn("Start (dd-HH:MM)", help="Edit to delay"),
             "Finish Unload": st.column_config.TextColumn("Finish (dd-HH:MM)", help="Edit to extend"),
-            "T1 Start": st.column_config.TextColumn("T1 Start"), "T1 End": st.column_config.TextColumn("T1 End"),
-            "T2 Start": st.column_config.TextColumn("T2 Start"), "T2 End": st.column_config.TextColumn("T2 End"),
-            "T3 Start": st.column_config.TextColumn("T3 Start"), "T3 End": st.column_config.TextColumn("T3 End"),
-            "T4 Start": st.column_config.TextColumn("T4 Start"), "T4 End": st.column_config.TextColumn("T4 End"),
+            "T1 Start": st.column_config.TextColumn("T1 Start"), "T1 End": st.column_config.TextColumn("T1 End"), "T1 Idle": st.column_config.TextColumn("T1 Idle"),
+            "T2 Start": st.column_config.TextColumn("T2 Start"), "T2 End": st.column_config.TextColumn("T2 End"), "T2 Idle": st.column_config.TextColumn("T2 Idle"),
+            "T3 Start": st.column_config.TextColumn("T3 Start"), "T3 End": st.column_config.TextColumn("T3 End"), "T3 Idle": st.column_config.TextColumn("T3 Idle"),
+            "T4 Start": st.column_config.TextColumn("T4 Start"), "T4 End": st.column_config.TextColumn("T4 End"), "T4 Idle": st.column_config.TextColumn("T4 Idle"),
         }
         
         edited_df = st.data_editor(
