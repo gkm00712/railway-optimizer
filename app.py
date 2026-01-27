@@ -8,7 +8,7 @@ import pytz
 # ==========================================
 st.set_page_config(page_title="Railway Logic Optimizer (IST)", layout="wide")
 st.title("🚂 BOXN Rake Demurrage Optimization Dashboard (IST)")
-st.markdown("Upload your `INSIGHT DETAILS.csv`. **Logic updated to minimize Tippler Idle Time.**")
+st.markdown("Upload your `INSIGHT DETAILS.csv`. **Optimized for Demurrage & Tippler Utilization.**")
 
 # Define IST Timezone
 IST = pytz.timezone('Asia/Kolkata')
@@ -41,6 +41,7 @@ def format_dt(dt):
 def restore_dt(dt_str, ref_dt):
     """
     Restores datetime from 'dd-HH:MM' string using reference year/month.
+    Returns an IST-aware datetime.
     """
     if not isinstance(dt_str, str) or dt_str.strip() == "": return pd.NaT
     try:
@@ -98,8 +99,7 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtim
                            rate_t1, rate_t2, rate_t3, rate_t4, 
                            wagons_first_batch, inter_tippler_delay):
     """
-    Calculates finish times and specific start/end times for the tipplers involved.
-    Returns: overall_finish, used_str, actual_start_prim, detailed_timings, idle_cost
+    Calculates finish times, idle gaps, and individual tippler usage.
     """
     if wagons == 0: 
         return ready_time, "None", ready_time, {}, timedelta(0)
@@ -113,14 +113,14 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtim
     sorted_tipplers = sorted(resources.keys(), key=lambda x: tippler_state[x])
     t_primary, t_secondary = sorted_tipplers[0], sorted_tipplers[1]
     
-    # Calculate Idle Gap (Cost)
-    # How long does the machine wait for this rake?
+    # --- Calculate Idle Cost (Gap) ---
     machine_free_at = tippler_state[t_primary]
     if machine_free_at.tzinfo is None: machine_free_at = IST.localize(machine_free_at)
     
+    # Idle gap is time between machine becoming free and train becoming ready
     idle_gap_primary = max(timedelta(0), ready_time - machine_free_at)
     
-    # Process First Batch (Primary)
+    # --- Process First Batch (Primary) ---
     w_first = min(wagons, wagons_first_batch)
     w_second = wagons - w_first
     
@@ -135,8 +135,9 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtim
     
     overall_finish = finish_primary
     used_str = f"{t_primary} Only"
+    total_idle_cost = idle_gap_primary
     
-    # Process Second Batch (Secondary) if needed
+    # --- Process Second Batch (Secondary) if needed ---
     if w_second > 0:
         start_sec_theory = ready_time + timedelta(minutes=inter_tippler_delay)
         proposed_start_sec = max(start_sec_theory, tippler_state[t_secondary])
@@ -153,9 +154,7 @@ def calculate_split_finish(wagons, pair_name, ready_time, tippler_state, downtim
         
         overall_finish = max(finish_primary, finish_secondary)
         used_str = f"{t_primary} & {t_secondary}"
-        total_idle_cost = idle_gap_primary + idle_gap_secondary
-    else:
-        total_idle_cost = idle_gap_primary
+        total_idle_cost += idle_gap_secondary
 
     return overall_finish, used_str, actual_start_prim, detailed_timings, total_idle_cost
 
@@ -184,13 +183,14 @@ def run_full_simulation_initial(df, params):
 
     df = df.copy()
     
-    # 1. FILTER BOXN ONLY
+    # 1. FILTER BOXN ONLY (Case Insensitive)
     if 'LOAD TYPE' in df.columns:
         df = df[df['LOAD TYPE'].astype(str).str.strip().str.upper().str.startswith('BOXN')]
     
     df['wagon_count'] = df['TOTL UNTS'].apply(parse_wagons)
     df['exp_arrival_dt'] = pd.to_datetime(df['EXPD ARVLTIME'], errors='coerce').apply(to_ist)
     
+    # Handling PL Status (Placement)
     if 'STTS CODE' in df.columns and 'STTS TIME' in df.columns:
         df['stts_time_dt'] = pd.to_datetime(df['STTS TIME'], errors='coerce').apply(to_ist)
         df['arrival_dt'] = df.apply(lambda r: r['stts_time_dt'] if str(r.get('STTS CODE')).strip()=='PL' and pd.notnull(r['stts_time_dt']) else r['exp_arrival_dt'], axis=1)
@@ -200,13 +200,14 @@ def run_full_simulation_initial(df, params):
     df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt').reset_index(drop=True)
     
     if df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), None
         
     # 2. INITIALIZE IDLE TIME START (00:00 of First Day)
     first_arrival = df['arrival_dt'].min()
     sim_start_time = first_arrival.replace(hour=0, minute=0, second=0, microsecond=0)
     if sim_start_time.tzinfo is None: sim_start_time = IST.localize(sim_start_time)
 
+    # All Tipplers start "Free" at 00:00
     tippler_state = {
         'T1': sim_start_time, 'T2': sim_start_time, 
         'T3': sim_start_time, 'T4': sim_start_time
@@ -221,7 +222,7 @@ def run_full_simulation_initial(df, params):
     assignments = []
     
     for _, rake in df.iterrows():
-        # Scenario A
+        # Scenario A (Lines 8-10, T1/T2)
         shunt_A = timedelta(minutes=s_a)
         entry_A = get_line_entry_time('Group_Lines_8_10', rake['arrival_dt'], line_groups)
         ready_A = entry_A + shunt_A
@@ -230,7 +231,7 @@ def run_full_simulation_initial(df, params):
             r_t1, r_t2, r_t3, r_t4, w_batch, w_delay
         )
         
-        # Scenario B
+        # Scenario B (Line 11, T3/T4)
         shunt_B = timedelta(minutes=s_b)
         entry_B = get_line_entry_time('Group_Line_11', rake['arrival_dt'], line_groups)
         ready_B = entry_B + shunt_B
@@ -239,11 +240,8 @@ def run_full_simulation_initial(df, params):
             r_t1, r_t2, r_t3, r_t4, w_batch, w_delay
         )
         
-        # OPTIMIZER LOGIC: 
-        # 1. Minimize Demurrage (Finish Time vs Free Time)
-        # 2. Minimize Finish Time
-        # 3. Minimize Idle Gap (Maximize Utilization)
-        
+        # --- OPTIMIZER LOGIC ---
+        # Priority 1: Minimize Demurrage
         dem_A = max(timedelta(0), (fin_A - rake['arrival_dt']) + timedelta(minutes=f_a) - timedelta(hours=ft_hours))
         dem_B = max(timedelta(0), (fin_B - rake['arrival_dt']) + timedelta(minutes=f_b) - timedelta(hours=ft_hours))
         
@@ -254,23 +252,24 @@ def run_full_simulation_initial(df, params):
         elif dem_B < dem_A:
             pick_A = False
         else:
-            # Demurrage is equal (likely 0 or both very late). Tie-break with Finish Time.
+            # Priority 2: Minimize Finish Time
             if fin_A < fin_B:
                 pick_A = True
             elif fin_B < fin_A:
                 pick_A = False
             else:
-                # Finish Time equal. Tie-break with Idle Gap (Minimize Idle Time)
+                # Priority 3: Minimize Idle Gap (Maximize Utilization)
                 if idle_gap_A <= idle_gap_B:
                     pick_A = True
                 else:
                     pick_A = False
 
+        # --- COMMIT CHOICE ---
         if pick_A:
             best_grp, best_entry, best_ready, best_start, best_fin = 'Group_Lines_8_10', entry_A, ready_A, start_A, fin_A
             best_tips, best_timings, best_form_mins = used_A, timings_A, f_a
             
-            # Commit State
+            # Commit State for A
             for k in ['T1', 'T2']:
                 if f"{k}_End" in best_timings:
                     tippler_state[k] = best_timings[f"{k}_End"]
@@ -281,7 +280,7 @@ def run_full_simulation_initial(df, params):
             best_grp, best_entry, best_ready, best_start, best_fin = 'Group_Line_11', entry_B, ready_B, start_B, fin_B
             best_tips, best_timings, best_form_mins = used_B, timings_B, f_b
             
-            # Commit State
+            # Commit State for B
             for k in ['T3', 'T4']:
                 if f"{k}_End" in best_timings:
                     tippler_state[k] = best_timings[f"{k}_End"]
@@ -298,7 +297,7 @@ def run_full_simulation_initial(df, params):
         tot_dur = (best_fin - rake['arrival_dt']) + form_delta
         demurrage = max(timedelta(0), tot_dur - timedelta(hours=ft_hours))
 
-        # Extract specific timings for columns
+        # Extract specific timings for individual columns
         t1_s = best_timings.get('T1_Start', pd.NaT)
         t1_e = best_timings.get('T1_End', pd.NaT)
         t2_s = best_timings.get('T2_Start', pd.NaT)
@@ -323,7 +322,7 @@ def run_full_simulation_initial(df, params):
             'Tippler Start Time': format_dt(best_start),
             'Finish Unload': format_dt(best_fin),
             'Tipplers Used': best_tips,
-            # 3. ADD INDIVIDUAL TIPPLER COLUMNS
+            # INDIVIDUAL COLUMNS
             'T1 Start': format_dt(t1_s), 'T1 End': format_dt(t1_e),
             'T2 Start': format_dt(t2_s), 'T2 End': format_dt(t2_e),
             'T3 Start': format_dt(t3_s), 'T3 End': format_dt(t3_e),
@@ -336,11 +335,14 @@ def run_full_simulation_initial(df, params):
     return pd.DataFrame(assignments), sim_start_time
 
 def recalculate_cascade_reactive(edited_df, free_time_hours):
+    """
+    Recalculates times based on user manual edits in the table.
+    Updates subsequent resource availability and demurrage.
+    """
     recalc_rows = []
     
-    # --- ERROR FIX: USE A SAFE START YEAR ---
+    # Safe init year
     min_time_ist = IST.localize(pd.Timestamp("2000-01-01"))
-    
     tippler_state = {'T1': min_time_ist, 'T2': min_time_ist, 'T3': min_time_ist, 'T4': min_time_ist}
     daily_demurrage_tracker = {}
     
@@ -360,12 +362,14 @@ def recalculate_cascade_reactive(edited_df, free_time_hours):
         if 'T3' in used_str: current_tipplers.append('T3')
         if 'T4' in used_str: current_tipplers.append('T4')
         
+        # When are resources free?
         resource_free_at = min_time_ist
         for t in current_tipplers:
             resource_free_at = max(resource_free_at, tippler_state[t])
         
         valid_start = max(ready, resource_free_at)
         
+        # Check for User Edit on "Tippler Start Time"
         user_start_input = restore_dt(row['Tippler Start Time'], ready)
         
         if pd.notnull(user_start_input):
@@ -376,48 +380,40 @@ def recalculate_cascade_reactive(edited_df, free_time_hours):
         tippler_finish_map = {}
         max_finish = final_start 
         
-        # We need to maintain the duration of each tippler from the original calculation or infer it
-        # Simplified: We shift the end time by the delay amount
-        # For simplicity in reactive mode, we just re-calculate end based on delay shift
-        
+        # Update individual tippler columns and state
         for t_id in ['T1', 'T2', 'T3', 'T4']:
             col_start = f"{t_id} Start"
             col_end = f"{t_id} End"
             
-            orig_end_str = row[col_end]
-            if not orig_end_str or orig_end_str == "":
-                continue
-                
-            # Restore original end to calculate duration
-            orig_end_dt = restore_dt(orig_end_str, final_start)
-            # Restore original start? Not strictly needed if we assume shift
-            # But let's check user edit on End Time too
-            
-            # If user manually edited the T_End column? 
-            # For now, let's assume the duration is fixed based on wagon count/rate logic
-            # And we just push it by the start delay.
-            
-            # Better approach: 
-            # If T1 was used, update T1 state.
+            # If this tippler was used for this rake
             if t_id in current_tipplers:
-                # If we have a stored finish time from user input, use it
-                # Otherwise, just push the availability
+                # Retrieve original duration or user edited end time
+                t_end_val = restore_dt(row[col_end], final_start)
+                t_start_val_old = restore_dt(row[col_start], final_start)
                 
-                # Check if user edited the specific Tippler Finish
-                t_val_in_cell = restore_dt(row[col_end], final_start)
-                
-                if pd.notnull(t_val_in_cell) and t_val_in_cell > final_start:
-                    t_final = t_val_in_cell
+                # Estimate Duration
+                if pd.notnull(t_end_val) and pd.notnull(t_start_val_old):
+                     duration = t_end_val - t_start_val_old
+                     if duration < timedelta(0): duration = timedelta(hours=2) # Fallback
                 else:
-                    # Fallback if logic breaks: +2 hours
-                     t_final = final_start + timedelta(hours=2) 
-
-                tippler_state[t_id] = t_final 
-                max_finish = max(max_finish, t_final)
+                     duration = timedelta(hours=2) # Fallback default
                 
-                # Update output columns
-                row[col_start] = format_dt(final_start) # Simplified: all start at rake start
-                row[col_end] = format_dt(t_final)
+                # New End Time = New Start + Duration
+                # (Unless user explicitly extended the End Time further than the shift implies)
+                # For simplicity in reactive mode: We shift the end time by the start delay
+                
+                new_t_end = final_start + duration
+                
+                # Check if user manually pushed the End Time even further
+                if pd.notnull(t_end_val) and t_end_val > new_t_end:
+                    new_t_end = t_end_val
+
+                tippler_state[t_id] = new_t_end
+                max_finish = max(max_finish, new_t_end)
+                
+                # Update the cell values
+                row[col_start] = format_dt(final_start)
+                row[col_end] = format_dt(new_t_end)
 
         final_finish = max_finish
             
@@ -429,7 +425,6 @@ def recalculate_cascade_reactive(edited_df, free_time_hours):
         
         row['Tippler Start Time'] = format_dt(final_start)
         row['Finish Unload'] = format_dt(final_finish)
-        
         row['Wait (Tippler)'] = format_duration_hhmm(wait_delta)
         row['Total Duration'] = format_duration_hhmm(tot_dur)
         row['Demurrage'] = format_duration_hhmm(demurrage)
@@ -458,7 +453,7 @@ sim_params['ft'] = st.sidebar.number_input("Free Time (Hours)", value=7.0, step=
 sim_params['wb'] = st.sidebar.number_input("Wagons 1st Batch", value=30, step=1)
 sim_params['wd'] = st.sidebar.number_input("Delay 2nd Tippler (Mins)", value=0.0, step=5.0)
 
-# DOWNTIME
+# DOWNTIME MANAGER
 st.sidebar.markdown("---")
 st.sidebar.subheader("🛠️ Tippler Downtime Manager")
 if 'downtimes' not in st.session_state: st.session_state.downtimes = []
@@ -494,29 +489,36 @@ sim_params['downtimes'] = st.session_state.downtimes
 
 uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
 
-# 4. AUTO-UPDATE ON PARAMETER CHANGE
-# By default, Streamlit re-runs the script on widget change. 
-# We just need to ensure the calculation functions are called every time.
-
+# --- CACHING LOGIC TO PREVENT VANISHING TABLE ---
 if uploaded_file is not None:
-    # Always reload dataframe on run to ensure clean state
-    # (In production with large files, we might cache this, but for <50MB it's fine)
-    uploaded_file.seek(0)
-    df_raw = pd.read_csv(uploaded_file)
-    df_raw.columns = df_raw.columns.str.strip().str.upper()
-    if 'PLCT RESN' in df_raw.columns:
-        df_raw = df_raw[~df_raw['PLCT RESN'].astype(str).str.upper().str.contains('LDNG', na=False)]
+    # Identify if file is new
+    file_changed = False
+    if 'last_uploaded_file_id' not in st.session_state or st.session_state.last_uploaded_file_id != uploaded_file.file_id:
+        file_changed = True
+        st.session_state.last_uploaded_file_id = uploaded_file.file_id
+
+    # Read and Cache Data
+    if file_changed or 'raw_data_cached' not in st.session_state:
+        try:
+            uploaded_file.seek(0) 
+            df_raw = pd.read_csv(uploaded_file)
+            df_raw.columns = df_raw.columns.str.strip().str.upper()
+            if 'PLCT RESN' in df_raw.columns:
+                df_raw = df_raw[~df_raw['PLCT RESN'].astype(str).str.upper().str.contains('LDNG', na=False)]
+            st.session_state.raw_data_cached = df_raw
+        except Exception as e:
+            st.error(f"Error reading file: {e}")
+            st.stop()
+
+# --- USE CACHED DATA FOR SIMULATION ---
+if 'raw_data_cached' in st.session_state:
+    df_raw = st.session_state.raw_data_cached
     
     # Run Simulation
     sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params)
     
-    # Store in session state for editing
+    # Store Result (Allow Overwrite by Logic)
     if 'sim_result' not in st.session_state or not st.session_state.sim_result.equals(sim_result):
-        # Only overwrite if logic produced a new result (params changed)
-        # However, we need to respect the User's manual edits from previous run if params didn't change.
-        # This is complex in Streamlit. 
-        # For this requirement "output should update automatically by changing the variable", 
-        # we will overwrite the table with the new logic-calculated values.
         st.session_state.sim_result = sim_result
         st.session_state.sim_start_dt = sim_start_dt
 
@@ -525,7 +527,7 @@ if uploaded_file is not None:
     if st.session_state.sim_result.empty:
         st.warning("No data found matching 'BOXN' load type.")
     else:
-        # Define Columns for Editor
+        # Define Columns
         column_config = {
             "_Arrival_DT": None, "_Shunt_Ready_DT": None, "_Form_Mins": None,
             "Tippler Start Time": st.column_config.TextColumn("Start (dd-HH:MM)", help="Edit to delay"),
@@ -545,13 +547,12 @@ if uploaded_file is not None:
             key="data_editor"
         )
 
-        # Reactive Recalculation (if user edited cells)
+        # Reactive Calculation
         final_result, daily_stats = recalculate_cascade_reactive(edited_df, sim_params['ft'])
         
-        # 4. SHOW DEMURRAGE SUMMARY (Next 3 Days)
+        # --- DEMURRAGE SUMMARY (Next 3 Days) ---
         st.markdown("### 📅 Demurrage Forecast (Next 3 Days)")
-        
-        if 'sim_start_dt' in st.session_state:
+        if 'sim_start_dt' in st.session_state and st.session_state.sim_start_dt is not None:
             start_date = st.session_state.sim_start_dt.date()
             days_to_show = [start_date + timedelta(days=i) for i in range(3)]
             
@@ -567,5 +568,6 @@ if uploaded_file is not None:
             
             st.dataframe(pd.DataFrame(summary_data), use_container_width=False)
 
+        # Download
         csv = final_result.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins"]).to_csv(index=False).encode('utf-8')
         st.download_button("📥 Download Final Report", csv, "optimized_schedule.csv", "text/csv")
