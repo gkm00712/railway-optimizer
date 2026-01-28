@@ -7,7 +7,7 @@ import math
 # ==========================================
 # 1. PAGE CONFIGURATION
 # ==========================================
-st.set_page_config(page_title="Railway Logic Optimizer (Advanced)", layout="wide")
+st.set_page_config(page_title="Railway Logic Optimizer (Final)", layout="wide")
 st.title("🚂 Advanced Rake Optimization: Dynamic Breakdown & Rerouting")
 st.markdown("""
 **System Status:** `IST Timezone Active` | **Logic:** `Recursive Breakdown Handling`
@@ -80,14 +80,20 @@ def solve_unloading_path(wagons, preferred_tippler, ready_time, tippler_state, d
     Recursive function to solve unloading. 
     If breakdown -> Recursively solves for remaining wagons on best available tippler.
     """
-    # Safety break for recursion
+    # --- FIX 1: Base Case returns State ---
     if wagons <= 0: 
-        return ready_time, [], {}, {}
+        return ready_time, [], tippler_state, {}
+        
     if depth > 3: # Avoid infinite loops
-        return ready_time + timedelta(hours=24), ["Max Depth Exceeded"], {}, {}
+        return ready_time + timedelta(hours=24), ["Max Depth Exceeded"], tippler_state, {}
 
     # 1. Determine Actual Start on Preferred Tippler
-    free_at = tippler_state[preferred_tippler]
+    # --- FIX 2: Safety Check for Key Existence ---
+    if preferred_tippler not in tippler_state:
+        free_at = IST.localize(datetime(2000, 1, 1))
+    else:
+        free_at = tippler_state[preferred_tippler]
+
     if free_at.tzinfo is None: free_at = IST.localize(free_at)
     
     # 10 min setup delay if this is a transfer (depth > 0)
@@ -97,7 +103,6 @@ def solve_unloading_path(wagons, preferred_tippler, ready_time, tippler_state, d
     start_time = max(effective_ready, free_at)
 
     # 2. Check if Start Time lands IN a downtime (Push forward logic)
-    # If the machine is already broken at start_time, wait for repair
     changed = True
     while changed:
         changed = False
@@ -114,50 +119,47 @@ def solve_unloading_path(wagons, preferred_tippler, ready_time, tippler_state, d
     # 4. Check for Mid-Operation Breakdown
     bk_start, bk_end = get_breakdown_event(preferred_tippler, start_time, finish_time, downtimes)
 
-    timings = {} # To store Start/End/Idle for this specific segment
+    timings = {} 
     
     # Calculate Idle for this specific segment
     idle_val = max(timedelta(0), start_time - free_at)
-    timings[f"{preferred_tippler}_Idle_{depth}"] = idle_val # Unique key for depth
+    timings[f"{preferred_tippler}_Idle_{depth}"] = idle_val 
 
     if not bk_start:
         # --- SUCCESS CASE ---
         # Update State
         timings[f"{preferred_tippler}_Start"] = start_time
         timings[f"{preferred_tippler}_End"] = finish_time
-        return finish_time, [preferred_tippler], {preferred_tippler: finish_time}, timings
+        
+        # Update the state object (IMPORTANT: Create a copy or update inplace? 
+        # Since we passed a copy in recursion, inplace update is fine for return)
+        tippler_state[preferred_tippler] = finish_time
+        return finish_time, [preferred_tippler], tippler_state, timings
 
     else:
         # --- BREAKDOWN CASE (The Split) ---
-        # A. Calculate Work Done
         worked_duration = bk_start - start_time
-        # Round down wagons completed
         wagons_done = math.floor((worked_duration.total_seconds() / 3600) * rate)
         wagons_rem = wagons - wagons_done
         
         # Log partial work
         timings[f"{preferred_tippler}_Start"] = start_time
-        timings[f"{preferred_tippler}_End"] = bk_start # Ends at breakdown
+        timings[f"{preferred_tippler}_End"] = bk_start 
         
-        # B. Define Recovery Candidates
         candidates = []
         
         # OPTION 1: Partner Transfer (Intra Shunt)
-        # T1<->T2, T3<->T4
         pairs = {'T1': 'T2', 'T2': 'T1', 'T3': 'T4', 'T4': 'T3'}
         partner = pairs[preferred_tippler]
         ready_partner = bk_start + timedelta(minutes=params['shunt_intra'])
         
-        # Simulate Partner
-        # We pass a copy of state to not pollute
         p_fin, p_used, p_state, p_tim = solve_unloading_path(
             wagons_rem, partner, ready_partner, tippler_state.copy(), downtimes, rates, params, depth+1
         )
         candidates.append({'type': 'Partner', 'fin': p_fin, 'used': [preferred_tippler] + p_used, 'state': p_state, 'tim': p_tim})
 
         # OPTION 2: Cross Transfer
-        # T1/2 <-> T3/4
-        cross_map = {'T1': 'T3', 'T2': 'T4', 'T3': 'T1', 'T4': 'T2'} # Simple mapping to one cross candidate
+        cross_map = {'T1': 'T3', 'T2': 'T4', 'T3': 'T1', 'T4': 'T2'}
         cross_tip = cross_map[preferred_tippler]
         ready_cross = bk_start + timedelta(minutes=params['shunt_cross'])
         
@@ -167,25 +169,22 @@ def solve_unloading_path(wagons, preferred_tippler, ready_time, tippler_state, d
         candidates.append({'type': 'Cross', 'fin': c_fin, 'used': [preferred_tippler] + c_used, 'state': c_state, 'tim': c_tim})
 
         # OPTION 3: Wait for Repair
-        # Ready after downtime ends
         ready_wait = bk_end
         w_fin, w_used, w_state, w_tim = solve_unloading_path(
             wagons_rem, preferred_tippler, ready_wait, tippler_state.copy(), downtimes, rates, params, depth+1
         )
         candidates.append({'type': 'Wait', 'fin': w_fin, 'used': [preferred_tippler], 'state': w_state, 'tim': w_tim})
 
-        # C. Select Winner (Earliest Finish)
+        # Select Winner
         best = sorted(candidates, key=lambda x: x['fin'])[0]
         
         # Merge Timings
         timings.update(best['tim'])
         
-        # Update current tippler state to breakdown time (it became free/broken then)
-        # But actually, the 'best['state']' contains the recursive updates.
-        # We just need to ensure the *current* tippler state is updated to bk_start + repair? 
-        # For scheduling subsequent rakes, this tippler is blocked until bk_end.
         final_state = best['state']
-        final_state[preferred_tippler] = max(final_state.get(preferred_tippler, IST.localize(datetime(2000,1,1))), bk_end)
+        # Ensure the broken tippler's state reflects the repair completion if it wasn't the chosen path
+        current_finish_estimate = final_state.get(preferred_tippler, IST.localize(datetime(2000,1,1)))
+        final_state[preferred_tippler] = max(current_finish_estimate, bk_end)
         
         return best['fin'], best['used'], final_state, timings
 
@@ -263,9 +262,6 @@ def run_simulation(df, params):
         line_queues[best['grp']]['free'].append(clr_time)
         
         # Flatten timings for DataFrame
-        # We need to extract T1 Start, T1 End etc. from the recursive dict
-        # Since a tippler might be used twice (start -> break -> wait -> resume), 
-        # we take Min Start and Max End for the summary columns.
         flat_timings = {}
         for t in ['T1', 'T2', 'T3', 'T4']:
             starts = [v for k,v in best['tim'].items() if k.startswith(f"{t}_Start")]
@@ -305,9 +301,6 @@ def run_simulation(df, params):
 def recalculate_reactive(edited_df, params, start_time):
     # This is a simplified reactive calc that re-runs the demurrage math 
     # but relies on the complexities already solved in the simulation or user manual edits.
-    # Fully re-running the recursive solver on edit is possible but heavy.
-    # Here we just update totals based on user time edits.
-    
     rows = []
     daily_stats = {}
     
