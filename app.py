@@ -80,7 +80,7 @@ def solve_unloading_path(wagons, preferred_tippler, ready_time, tippler_state, d
     Recursive function to solve unloading. 
     If breakdown -> Recursively solves for remaining wagons on best available tippler.
     """
-    # --- FIX 1: Base Case returns State ---
+    # BASE CASE: Work Finished
     if wagons <= 0: 
         return ready_time, [], tippler_state, {}
         
@@ -88,7 +88,7 @@ def solve_unloading_path(wagons, preferred_tippler, ready_time, tippler_state, d
         return ready_time + timedelta(hours=24), ["Max Depth Exceeded"], tippler_state, {}
 
     # 1. Determine Actual Start on Preferred Tippler
-    # --- FIX 2: Safety Check for Key Existence ---
+    # Safety Check for Key Existence
     if preferred_tippler not in tippler_state:
         free_at = IST.localize(datetime(2000, 1, 1))
     else:
@@ -131,8 +131,7 @@ def solve_unloading_path(wagons, preferred_tippler, ready_time, tippler_state, d
         timings[f"{preferred_tippler}_Start"] = start_time
         timings[f"{preferred_tippler}_End"] = finish_time
         
-        # Update the state object (IMPORTANT: Create a copy or update inplace? 
-        # Since we passed a copy in recursion, inplace update is fine for return)
+        # Update the state object (copy passed in recursion, so we update purely for return)
         tippler_state[preferred_tippler] = finish_time
         return finish_time, [preferred_tippler], tippler_state, timings
 
@@ -211,17 +210,13 @@ def run_simulation(df, params):
         wagons = row['wagon_count']
 
         # --- EVALUATE STRATEGIES ---
-        # We simulate 2 main strategies for every rake and pick the best.
         strategies = []
 
         # Strategy 1: Natural Route A (Line 8-10 -> T1/T2)
-        # Check Line A Availability
         q_a = sorted([t for t in line_queues['A']['free'] if t > arrival])
         entry_a = arrival if len(q_a) < line_queues['A']['cap'] else q_a[-line_queues['A']['cap']]
         ready_a = entry_a + timedelta(minutes=params['sa'])
         
-        # Sub-strategy: Try starting on T1 vs T2, pick best
-        # (Assuming T1/T2 are interchangeable entry points for Group A)
         for start_node in ['T1', 'T2']:
             fin, used, state, tim = solve_unloading_path(
                 wagons, start_node, ready_a, tippler_state.copy(), params['downtimes'], rates, params
@@ -254,7 +249,6 @@ def run_simulation(df, params):
         best = sorted(strategies, key=lambda x: (x['dem'], x['fin']))[0]
 
         # --- COMMIT ---
-        # Update Tippler State
         tippler_state = best['state']
         
         # Update Line State
@@ -299,8 +293,7 @@ def run_simulation(df, params):
     return pd.DataFrame(results), tippler_state
 
 def recalculate_reactive(edited_df, params, start_time):
-    # This is a simplified reactive calc that re-runs the demurrage math 
-    # but relies on the complexities already solved in the simulation or user manual edits.
+    # Reactive calculation based on user manual edits in the DataFrame
     rows = []
     daily_stats = {}
     
@@ -309,8 +302,9 @@ def recalculate_reactive(edited_df, params, start_time):
         arr = pd.to_datetime(row['_Arrival_DT'])
         if arr.tzinfo is None: arr = IST.localize(arr)
         
-        # User might have edited Finish Unload
-        fin_str = row['Finish Unload']
+        # Use 'Finish' key consistently
+        # Handle cases where column might not exist safely, though logic guarantees 'Finish'
+        fin_str = row.get('Finish', '') 
         fin_dt = restore_dt(fin_str, arr)
         
         # Form Mins
