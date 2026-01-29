@@ -109,18 +109,18 @@ def find_column(df, candidates):
         # Exact match check first
         if cand_upper in cols_upper:
             return df.columns[cols_upper.index(cand_upper)]
-        # Partial match check (risky but helpful for "STTN FROM")
+        # Partial match check
         for c in cols_upper:
             if cand_upper == c: 
                  return df.columns[cols_upper.index(c)]
     return None
 
 # ==========================================
-# 3. ROBUST GOOGLE SHEET PARSER (Cached)
+# 3. STRICT GOOGLE SHEET PARSER (Cached)
 # ==========================================
 
 def safe_parse_date(val):
-    if pd.isnull(val) or str(val).strip() == "": return pd.NaT
+    if pd.isnull(val) or str(val).strip() == "" or str(val).strip().upper() == "U/P": return pd.NaT
     try:
         dt = pd.to_datetime(val, dayfirst=True, errors='coerce') 
         if pd.isnull(dt): return pd.NaT 
@@ -131,59 +131,66 @@ def safe_parse_date(val):
 @st.cache_data(ttl=60)
 def fetch_google_sheet_actuals(url, free_time_hours):
     try:
-        df_gs = pd.read_csv(url)
-        if len(df_gs.columns) < 10:
+        # Load without header initially to access by index safely
+        df_gs = pd.read_csv(url, header=None)
+        
+        # Assume Row 0 is header, data starts Row 1
+        # If the sheet has weird headers, we just skip row 0
+        df_data = df_gs.iloc[1:].copy()
+        
+        if len(df_data.columns) < 18:
             return pd.DataFrame(), {}
 
-        # 1. Identify Rake Column
-        rake_col_idx = 1
-        for i, col in enumerate(df_gs.columns):
-            if "RAKE" in str(col).upper():
-                rake_col_idx = i
-                break
+        # STRICT COLUMN MAPPING based on user description:
+        # Col B (Idx 1) = Rake Name (Common standard)
+        # Col D (Idx 3) = Source / Mine (Inferred)
+        # Col E (Idx 4) = Receipt/Arrival
+        # Col F (Idx 5) = Placement/Start
+        # Col G (Idx 6) = Unload End
+        # Col H (Idx 7) = Release
+        # Col I (Idx 8) = Total Duration (User said "take from col I")
+        # Col O, P, Q, R (Idx 14, 15, 16, 17) = Tipplers
         
-        # 2. Identify Source Column (Smart Search)
-        # PRIORITIZE 'STTN FROM', 'STTS FROM' as per user request
-        source_col_idx = -1
-        cols_upper = [str(c).upper().strip() for c in df_gs.columns]
-        possible_src = ['STTS FROM', 'STTN FROM', 'FROM_STN', 'SRC', 'SOURCE', 'MINE', 'FROM']
-        
-        for p in possible_src:
-            if p in cols_upper:
-                source_col_idx = cols_upper.index(p)
-                break
-            
         actuals = []
         today_date = datetime.now(IST).date()
 
-        for _, row in df_gs.iterrows():
+        for _, row in df_data.iterrows():
             arrival_dt = safe_parse_date(row.iloc[4]) # Col E
             if pd.isnull(arrival_dt): continue
 
             # Filter: ONLY TODAY'S DATA
             if arrival_dt.date() != today_date: continue
 
-            rake_name = str(row.iloc[rake_col_idx])
-            
-            # Source Extraction
-            if source_col_idx != -1:
-                source_val = str(row.iloc[source_col_idx])
-            else:
-                source_val = ""
+            rake_name = str(row.iloc[1]) # Col B
+            source_val = str(row.iloc[3]) # Col D - Strictly picking Col D for Source
             if source_val.lower() == 'nan': source_val = ""
 
             # Times
             start_dt = safe_parse_date(row.iloc[5])   # Col F
             end_dt = safe_parse_date(row.iloc[6])     # Col G
-            release_dt = safe_parse_date(row.iloc[7]) # Col H
             
-            if pd.isnull(start_dt): start_dt = arrival_dt 
+            # Duration - USER RULE: Take strictly from Column I (Index 8)
+            # Format in sheet might be "HH:MM" or a number.
+            raw_dur = row.iloc[8]
+            total_dur = timedelta(0)
+            
+            if pd.notnull(raw_dur):
+                try:
+                    # Try parsing "HH:MM" string
+                    if ":" in str(raw_dur):
+                        parts = str(raw_dur).split(":")
+                        total_dur = timedelta(hours=int(parts[0]), minutes=int(parts[1]))
+                    else:
+                        # Maybe it's a float of days? (Excel standard)
+                        days = float(raw_dur)
+                        total_dur = timedelta(days=days)
+                except:
+                    # Fallback: Calc from H - E if I is bad
+                    release_dt = safe_parse_date(row.iloc[7])
+                    if pd.notnull(release_dt):
+                        total_dur = release_dt - arrival_dt
 
-            # Duration
-            if pd.notnull(release_dt) and pd.notnull(arrival_dt):
-                total_dur = release_dt - arrival_dt
-            else:
-                total_dur = timedelta(0)
+            if pd.isnull(start_dt): start_dt = arrival_dt 
 
             # Demurrage (Rounded)
             dem_str, _ = calculate_rounded_demurrage(total_dur, free_time_hours)
@@ -618,7 +625,6 @@ if gs_url and 'actuals_df_disp' not in st.session_state:
     
 if gs_url:
     try:
-        # Check if we have data cached in session state, if not fetch
         if 'actuals_df' not in st.session_state or st.session_state.actuals_df.empty:
              df_disp, _ = fetch_google_sheet_actuals(gs_url, sim_params['ft'])
              st.session_state.actuals_df_disp = df_disp
@@ -644,7 +650,6 @@ if gs_url and ('last_gs_url' not in st.session_state or st.session_state.last_gs
     input_changed = True
     st.session_state.last_gs_url = gs_url
 
-# This block ensures we only re-run heavy simulation if input changed or data missing
 if input_changed or 'raw_data_cached' not in st.session_state:
     actuals_df, actuals_state = pd.DataFrame(), {}
     if gs_url:
@@ -667,20 +672,16 @@ if input_changed or 'raw_data_cached' not in st.session_state:
             st.stop()
     else: st.session_state.raw_data_cached = pd.DataFrame()
 
-# Main Logic Block
 if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_raw = st.session_state.get('raw_data_cached', pd.DataFrame())
     df_act = st.session_state.get('actuals_df', pd.DataFrame())
     st_act = st.session_state.get('actuals_state', {})
     
-    # We only re-calculate the base simulation if inputs changed.
-    # If it's just a refresh, we rely on session state unless logic forces it.
-    if input_changed or 'sim_result' not in st.session_state:
-        sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, st_act)
-        st.session_state.sim_result = sim_result
-        st.session_state.sim_start_dt = sim_start_dt
+    sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, st_act)
+    st.session_state.sim_result = sim_result
+    st.session_state.sim_start_dt = sim_start_dt
 
-    if 'sim_result' in st.session_state and not st.session_state.sim_result.empty:
+    if not st.session_state.sim_result.empty:
         col_cfg = {
             "Rake": st.column_config.TextColumn("Rake Name", disabled=True),
             "Coal Source": st.column_config.TextColumn("Source/Mine", disabled=True),
@@ -693,7 +694,8 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
         
         st.markdown("### 📝 Master Schedule (Actuals + Forecast)")
         
-        # Data Editor - Key is crucial for stability on refresh/rerun
+        
+
         edited_df = st.data_editor(
             st.session_state.sim_result, 
             use_container_width=True, 
@@ -703,7 +705,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             key="schedule_editor" 
         )
         
-        # Recalculate based on edits (Reactive)
         final_result, daily_stats = recalculate_cascade_reactive(edited_df, sim_params['ft'], st.session_state.sim_start_dt)
         
         st.markdown("### 📅 Demurrage Forecast (Rounded to Next Hour)")
