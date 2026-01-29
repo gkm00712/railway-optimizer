@@ -629,7 +629,7 @@ sim_params['extra_shunt'] = st.sidebar.number_input("Cross-Pair Penalty (Mins)",
 st.sidebar.markdown("---")
 sim_params['fa'] = st.sidebar.number_input("Pair A Formation (Mins)", value=20.0, step=5.0)
 sim_params['fb'] = st.sidebar.number_input("Pair B Formation (Mins)", value=50.0, step=5.0)
-sim_params['ft'] = st.sidebar.number_input("Free Time (Hours)", value=9.0, step=0.5)
+sim_params['ft'] = st.sidebar.number_input("Free Time (Hours)", value=7.0, step=0.5)
 sim_params['wb'] = st.sidebar.number_input("Wagons 1st Batch", value=30, step=1)
 sim_params['wd'] = st.sidebar.number_input("Delay 2nd Tippler (Mins)", value=0.0, step=5.0)
 
@@ -748,3 +748,4 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
         st.dataframe(pd.DataFrame(list(daily_stats.items()), columns=['Date', 'Total Hours']).assign(Demurrage=lambda x: x['Total Hours'].apply(lambda h: f"{int(h)} Hours"))[['Date', 'Demurrage']], hide_index=True)
         
         st.download_button("📥 Download Final Report", final_result.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
+
