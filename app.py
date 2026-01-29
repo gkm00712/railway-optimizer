@@ -123,12 +123,12 @@ def safe_parse_date(val):
     if pd.isnull(val) or str(val).strip() == "": return pd.NaT
     try:
         dt = pd.to_datetime(val, dayfirst=True, errors='coerce') 
-        if pd.isnull(dt): return pd.NaT # Handle 'U/P' or garbage
+        if pd.isnull(dt): return pd.NaT 
         return to_ist(dt)
     except:
         return pd.NaT
 
-@st.cache_data(ttl=60) # Cache data for 60 seconds to prevent constant re-fetching on refresh
+@st.cache_data(ttl=60)
 def fetch_google_sheet_actuals(url, free_time_hours):
     try:
         df_gs = pd.read_csv(url)
@@ -143,10 +143,10 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 break
         
         # 2. Identify Source Column (Smart Search)
-        # Look for headers like 'STTN FROM', 'SRC', 'MINE'
+        # PRIORITIZE 'STTN FROM', 'STTS FROM' as per user request
         source_col_idx = -1
         cols_upper = [str(c).upper().strip() for c in df_gs.columns]
-        possible_src = ['STTN FROM', 'FROM_STN', 'SRC', 'SOURCE', 'MINE', 'FROM']
+        possible_src = ['STTS FROM', 'STTN FROM', 'FROM_STN', 'SRC', 'SOURCE', 'MINE', 'FROM']
         
         for p in possible_src:
             if p in cols_upper:
@@ -240,7 +240,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         return df_actuals, tippler_init_state
 
     except Exception as e:
-        # print(f"Detailed G-Sheet Error: {e}") # Suppressed to avoid log spam
         return pd.DataFrame(), {}
 
 # ==========================================
@@ -345,8 +344,8 @@ def run_full_simulation_initial(df, params, actuals_df, actuals_state):
     rake_col = find_column(df, ['RAKE NAME', 'RAKE', 'TRAIN NAME'])
     if not rake_col: return pd.DataFrame(), None 
     
-    # 4. Source Column (CSV) - Prioritize STTN FROM
-    src_col = find_column(df, ['STTN FROM', 'FROM_STN', 'SRC', 'SOURCE', 'FROM'])
+    # 4. Source Column (CSV) - Prioritize STTS FROM
+    src_col = find_column(df, ['STTS FROM', 'STTN FROM', 'FROM_STN', 'SRC', 'SOURCE', 'FROM'])
         
     # 5. Arrival Time
     arvl_col = find_column(df, ['EXPD ARVLTIME', 'ARRIVAL TIME', 'EXPECTED ARRIVAL'])
@@ -694,8 +693,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
         
         st.markdown("### 📝 Master Schedule (Actuals + Forecast)")
         
-        
-
         # Data Editor - Key is crucial for stability on refresh/rerun
         edited_df = st.data_editor(
             st.session_state.sim_result, 
