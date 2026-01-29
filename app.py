@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import timedelta, datetime
 import pytz
+import numpy as np
 
 # ==========================================
 # 1. PAGE CONFIGURATION
@@ -9,10 +10,10 @@ import pytz
 st.set_page_config(page_title="Railway Logic Optimizer (IST)", layout="wide")
 st.title("🚂 BOXN Rake Demurrage Optimization Dashboard (IST)")
 st.markdown("""
-**New Features:**
-- 🔀 **Cross-Pair Logic:** Automatically calculates if moving a rake to the *other* tippler pair (with extra shunting time) saves demurrage.
-- 🛠️ **Individual Tippler Tracking:** Shows exactly which machines (e.g., T1, T3) are used.
-- ⏱️ **Editable Shunting:** Adjust 'Extra Shunt' time in the table to test scenarios.
+**New Integration:**
+- 📊 **Google Sheet Sync:** Automatically fetching 'Actual' unloading data for today.
+- 🔄 **Hybrid Simulation:** Uses Google Sheet data to set Tippler availability, then schedules uploaded CSV rakes.
+- 🎯 **Deduplication:** Automatically ignores rakes in the CSV if they are already in the Google Sheet.
 """)
 
 # Define IST Timezone
@@ -94,42 +95,160 @@ def check_downtime_impact(tippler_id, proposed_start, downtime_list):
     return current_start
 
 # ==========================================
-# 3. CORE SIMULATION LOGIC
+# 3. GOOGLE SHEET ACTUALS LOGIC
+# ==========================================
+
+def fetch_google_sheet_actuals(url):
+    """
+    Reads published Google Sheet CSV.
+    Mappings:
+    Col E (idx 4): Receipt (Arrival)
+    Col F (idx 5): Placement (Start)
+    Col G (idx 6): Unload End
+    Col H (idx 7): Release
+    Col I (idx 8): Unload Duration
+    Col O, P, Q, R (idx 14, 15, 16, 17): Tipplers Used (WT1, WT2, WT3, WT4)
+    """
+    try:
+        df_gs = pd.read_csv(url)
+        
+        # Basic Validation: Ensure enough columns exist
+        if len(df_gs.columns) < 18:
+            st.error("Google Sheet does not have enough columns (Needs at least up to Column R).")
+            return pd.DataFrame(), {}
+
+        # 1. Parse Dates and Filter for TODAY
+        # Assuming Rake Name is in Column B (Index 1) or C (Index 2). 
+        # Let's try to find a column with "RAKE" or default to index 1.
+        rake_col_idx = 1
+        for i, col in enumerate(df_gs.columns):
+            if "RAKE" in str(col).upper():
+                rake_col_idx = i
+                break
+        
+        actuals = []
+        today_date = datetime.now(IST).date()
+
+        # Iterate rows
+        for _, row in df_gs.iterrows():
+            # Parse Arrival (Col E / Index 4)
+            arrival_raw = row.iloc[4]
+            if pd.isnull(arrival_raw): continue
+            
+            try:
+                arrival_dt = pd.to_datetime(arrival_raw, dayfirst=True) # Assuming DD/MM/YYYY
+                if pd.isnull(arrival_dt): continue
+                arrival_dt = to_ist(arrival_dt)
+            except: continue
+
+            # Filter: ONLY TODAY'S DATA
+            if arrival_dt.date() != today_date:
+                continue
+
+            rake_name = str(row.iloc[rake_col_idx])
+            
+            # Times
+            start_dt = to_ist(pd.to_datetime(row.iloc[5], dayfirst=True)) # Col F
+            end_dt = to_ist(pd.to_datetime(row.iloc[6], dayfirst=True))   # Col G
+            release_dt = to_ist(pd.to_datetime(row.iloc[7], dayfirst=True)) # Col H
+            
+            # Durations
+            # User Rule: Total Duration = Release (H) - Receipt (E)
+            if pd.notnull(release_dt) and pd.notnull(arrival_dt):
+                total_dur = release_dt - arrival_dt
+            else:
+                total_dur = timedelta(0)
+
+            # Tipplers Used (O, P, Q, R -> Indices 14, 15, 16, 17)
+            # Check if cell is not empty/null
+            used = []
+            if pd.notnull(row.iloc[14]) and str(row.iloc[14]).strip() != "": used.append("T1")
+            if pd.notnull(row.iloc[15]) and str(row.iloc[15]).strip() != "": used.append("T2")
+            if pd.notnull(row.iloc[16]) and str(row.iloc[16]).strip() != "": used.append("T3")
+            if pd.notnull(row.iloc[17]) and str(row.iloc[17]).strip() != "": used.append("T4")
+            
+            used_str = ", ".join(used)
+            
+            entry = {
+                'Rake': rake_name,
+                'Load Type': 'BOXN (Actual)', # Placeholder
+                'Wagons': 58, # Default placeholder
+                'Status': 'ACTUAL',
+                '_Arrival_DT': arrival_dt,
+                '_Shunt_Ready_DT': start_dt, # Approx
+                '_Form_Mins': 0,
+                'Optimization Type': 'Actual (G-Sheet)',
+                'Extra Shunt (Mins)': 0,
+                'Line Allotted': 'N/A',
+                'Line Entry Time': format_dt(arrival_dt),
+                'Shunting Complete': format_dt(start_dt),
+                'Tippler Start Time': format_dt(start_dt),
+                'Finish Unload': format_dt(end_dt),
+                'Tipplers Used': used_str,
+                'Wait (Tippler)': format_duration_hhmm(start_dt - arrival_dt) if pd.notnull(start_dt) else "",
+                'Total Duration': format_duration_hhmm(total_dur),
+                'Demurrage': format_duration_hhmm(max(timedelta(0), total_dur - timedelta(hours=7))), # Assuming 7h free time
+                # Internal use for state tracking
+                '_raw_end_dt': end_dt,
+                '_raw_tipplers': used
+            }
+            
+            # Add T1-T4 specific columns for visualization consistency
+            for t in ['T1', 'T2', 'T3', 'T4']:
+                entry[f"{t} Start"] = format_dt(start_dt) if t in used else ""
+                entry[f"{t} End"] = format_dt(end_dt) if t in used else ""
+                entry[f"{t} Idle"] = "" # Actuals don't calc idle
+            
+            actuals.append(entry)
+
+        df_actuals = pd.DataFrame(actuals)
+        
+        # Calculate Initial State for Simulation based on Actuals
+        tippler_init_state = {}
+        for t in ['T1', 'T2', 'T3', 'T4']:
+            # Find max end time for this tippler in actuals
+            t_max = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
+            if not df_actuals.empty:
+                for _, row in df_actuals.iterrows():
+                    if t in row['_raw_tipplers'] and pd.notnull(row['_raw_end_dt']):
+                        if row['_raw_end_dt'] > t_max:
+                            t_max = row['_raw_end_dt']
+            tippler_init_state[t] = t_max
+
+        return df_actuals, tippler_init_state
+
+    except Exception as e:
+        st.error(f"Error parsing Google Sheet: {e}")
+        return pd.DataFrame(), {}
+
+# ==========================================
+# 4. CORE SIMULATION LOGIC
 # ==========================================
 
 def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state, downtime_list, 
                            rates, wagons_first_batch, inter_tippler_delay):
-    """
-    Generic function to calculate finish time for ANY set of tipplers (e.g., ['T1', 'T2'] or ['T1', 'T3']).
-    """
     if wagons == 0: 
         return ready_time, "", ready_time, {}, timedelta(0)
     
-    # Build resources dictionary dynamically
     resources = {t: rates[t] for t in target_tipplers}
-    
-    # Sort resources by availability (Who is free earliest?)
     sorted_tipplers = sorted(resources.keys(), key=lambda x: tippler_state[x])
     
-    # Identify Primary and (Optional) Secondary
     t_primary = sorted_tipplers[0]
     t_secondary = sorted_tipplers[1] if len(sorted_tipplers) > 1 else None
     
     detailed_timings = {}
     used_tipplers_list = []
     
-    # --- Process First Batch (Primary) ---
     w_first = min(wagons, wagons_first_batch)
     w_second = wagons - w_first
     
-    # Idle Calc Primary
+    # Primary Logic
     free_prim = tippler_state[t_primary]
     if free_prim.tzinfo is None: free_prim = IST.localize(free_prim)
     
     proposed_start_prim = max(ready_time, free_prim)
     actual_start_prim = check_downtime_impact(t_primary, proposed_start_prim, downtime_list)
     
-    # Idle = Actual Start - Last Free
     idle_gap_primary = max(timedelta(0), actual_start_prim - free_prim)
     detailed_timings[f"{t_primary}_Idle"] = idle_gap_primary
     
@@ -141,12 +260,10 @@ def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state,
     used_tipplers_list.append(t_primary)
     total_idle_cost = idle_gap_primary
     
-    # --- Process Second Batch (Secondary) if needed ---
+    # Secondary Logic
     if w_second > 0:
         if t_secondary:
-            # We have a second tippler available
             start_sec_theory = ready_time + timedelta(minutes=inter_tippler_delay)
-            
             free_sec = tippler_state[t_secondary]
             if free_sec.tzinfo is None: free_sec = IST.localize(free_sec)
             
@@ -165,9 +282,6 @@ def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state,
             used_tipplers_list.append(t_secondary)
             total_idle_cost += idle_gap_secondary
         else:
-            # No secondary tippler (e.g., only T1 passed), process remaining wagons on Primary
-            # Calculate finish of first batch, then start second batch immediately
-            # NOTE: Simplified logic - just add time for remaining wagons to Primary
             finish_extended = finish_primary + timedelta(hours=(w_second / resources[t_primary]))
             detailed_timings[f"{t_primary}_End"] = finish_extended
             overall_finish = finish_extended
@@ -190,14 +304,14 @@ def find_specific_line(group, entry, status, last_idx):
         if status[l] <= entry: return l
     return cands[0]
 
-def run_full_simulation_initial(df, params):
+def run_full_simulation_initial(df, params, actuals_df, actuals_state):
     # Unpack params
     rates = {'T1': params['rt1'], 'T2': params['rt2'], 'T3': params['rt3'], 'T4': params['rt4']}
     s_a, s_b = params['sa'], params['sb']
     f_a, f_b = params['fa'], params['fb']
     w_batch, w_delay = params['wb'], params['wd']
     ft_hours = params['ft']
-    extra_shunt_cross = params['extra_shunt'] # New Parameter
+    extra_shunt_cross = params['extra_shunt']
     downtimes = params['downtimes']
 
     df = df.copy()
@@ -216,16 +330,22 @@ def run_full_simulation_initial(df, params):
         df['arrival_dt'] = df['exp_arrival_dt']
 
     df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt').reset_index(drop=True)
-    
-    if df.empty:
-        return pd.DataFrame(), None, None
-        
-    # 2. INITIALIZE
-    first_arrival = df['arrival_dt'].min()
+
+    # 2. DEDUPLICATE: Remove rakes already in Actuals
+    if not actuals_df.empty:
+        actual_rakes = actuals_df['Rake'].astype(str).tolist()
+        df = df[~df['RAKE NAME'].astype(str).isin(actual_rakes)]
+
+    if df.empty and actuals_df.empty:
+        return pd.DataFrame(), None
+
+    # 3. INITIALIZE STATE
+    first_arrival = df['arrival_dt'].min() if not df.empty else datetime.now(IST)
     sim_start_time = first_arrival.replace(hour=0, minute=0, second=0, microsecond=0)
     if sim_start_time.tzinfo is None: sim_start_time = IST.localize(sim_start_time)
 
-    tippler_state = {k: sim_start_time for k in ['T1', 'T2', 'T3', 'T4']}
+    # Use state from Google Sheet Actuals if available, else default to start of day
+    tippler_state = actuals_state if actuals_state else {k: sim_start_time for k in ['T1', 'T2', 'T3', 'T4']}
     
     spec_line_status = {8: sim_start_time, 9: sim_start_time, 10: sim_start_time, 11: sim_start_time}
     line_groups = {
@@ -235,8 +355,8 @@ def run_full_simulation_initial(df, params):
     rr_tracker_A = -1 
     assignments = []
     
+    # 4. RUN SIMULATION ON REMAINING RAKES
     for _, rake in df.iterrows():
-        # Define Options structure
         options = []
 
         # --- OPTION 1: NATURAL A (Lines 8-10 -> T1/T2) ---
@@ -266,7 +386,6 @@ def run_full_simulation_initial(df, params):
         })
 
         # --- OPTION 3: CROSS A (Lines 8-10 -> T3/T4) ---
-        # Moving from Group A lines to Group B tipplers
         ready_A_Cross = ready_A + timedelta(minutes=extra_shunt_cross)
         fin_AX, used_AX, start_AX, tim_AX, idle_AX = calculate_generic_finish(
             rake['wagon_count'], ['T3', 'T4'], ready_A_Cross, tippler_state, downtimes, rates, w_batch, w_delay
@@ -279,7 +398,6 @@ def run_full_simulation_initial(df, params):
         })
 
         # --- OPTION 4: CROSS B (Line 11 -> T1/T2) ---
-        # Moving from Group B lines to Group A tipplers
         ready_B_Cross = ready_B + timedelta(minutes=extra_shunt_cross)
         fin_BX, used_BX, start_BX, tim_BX, idle_BX = calculate_generic_finish(
             rake['wagon_count'], ['T1', 'T2'], ready_B_Cross, tippler_state, downtimes, rates, w_batch, w_delay
@@ -291,17 +409,13 @@ def run_full_simulation_initial(df, params):
             'extra_shunt': float(extra_shunt_cross), 'form_mins': f_b, 'type': 'Cross-Transfer'
         })
 
-        # --- SELECT BEST OPTION ---
-        # Sort by: Demurrage (asc), Finish Time (asc), Idle (asc)
         best_opt = sorted(options, key=lambda x: (x['dem'], x['fin'], x['idle']))[0]
 
-        # --- COMMIT CHOICE ---
         for k, v in best_opt['timings'].items():
             if 'End' in k:
                 tippler_key = k.split('_')[0]
                 tippler_state[tippler_key] = v
         
-        # Line Logic
         if best_opt['grp'] == 'Group_Lines_8_10':
             sel_line = find_specific_line(best_opt['grp'], best_opt['entry'], spec_line_status, rr_tracker_A)
             if sel_line in [8,9,10]: rr_tracker_A = {8:0,9:1,10:2}[sel_line]
@@ -317,14 +431,13 @@ def run_full_simulation_initial(df, params):
         form_delta = timedelta(minutes=best_opt['form_mins'])
         tot_dur = (best_opt['fin'] - rake['arrival_dt']) + form_delta
 
-        # Extract Individual Timings
         row_data = {
             'Rake': rake['RAKE NAME'],
             'Load Type': rake['LOAD TYPE'],
             'Wagons': rake['wagon_count'],
             'Status': rake.get('STTS CODE', 'N/A'),
             '_Arrival_DT': rake['arrival_dt'],
-            '_Shunt_Ready_DT': best_opt['ready'], # Includes extra shunt if any
+            '_Shunt_Ready_DT': best_opt['ready'],
             '_Form_Mins': best_opt['form_mins'],
             'Optimization Type': best_opt['type'],
             'Extra Shunt (Mins)': best_opt['extra_shunt'],
@@ -339,7 +452,6 @@ def run_full_simulation_initial(df, params):
             'Demurrage': format_duration_hhmm(best_opt['dem'])
         }
 
-        # Add T1-T4 individual columns
         for t in ['T1', 'T2', 'T3', 'T4']:
              row_data[f"{t} Start"] = format_dt(best_opt['timings'].get(f"{t}_Start", pd.NaT))
              row_data[f"{t} End"] = format_dt(best_opt['timings'].get(f"{t}_End", pd.NaT))
@@ -347,13 +459,22 @@ def run_full_simulation_initial(df, params):
         
         assignments.append(row_data)
 
-    return pd.DataFrame(assignments), sim_start_time
+    df_simulated = pd.DataFrame(assignments)
+    
+    # 5. MERGE ACTUALS + SIMULATED
+    if not actuals_df.empty:
+        # Drop internal columns from actuals before merge
+        actuals_clean = actuals_df.drop(columns=['_raw_end_dt', '_raw_tipplers'], errors='ignore')
+        if df_simulated.empty:
+            final_df = actuals_clean
+        else:
+            final_df = pd.concat([actuals_clean, df_simulated], ignore_index=True)
+    else:
+        final_df = df_simulated
+
+    return final_df, sim_start_time
 
 def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
-    """
-    Recalculates based on table edits.
-    Uses 'Extra Shunt (Mins)' column and handles individual tipplers.
-    """
     recalc_rows = []
     
     if sim_start_dt.tzinfo is None:
@@ -363,47 +484,53 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
     daily_demurrage_tracker = {}
     
     for _, row in edited_df.iterrows():
+        # IF ACTUAL, SKIP RECALC but UPDATE STATE
+        if row.get('Status') == 'ACTUAL':
+            # Update state so subsequent rows know when tipplers are free
+            for t in ['T1', 'T2', 'T3', 'T4']:
+                end_str = row.get(f"{t} End")
+                if pd.notnull(end_str) and end_str != "":
+                    end_dt = restore_dt(end_str, sim_start_dt)
+                    if pd.notnull(end_dt) and end_dt > tippler_state[t]:
+                        tippler_state[t] = end_dt
+            
+            # Recalculate Demurrage for Actuals just in case params changed
+            arrival = pd.to_datetime(row['_Arrival_DT'])
+            if arrival.tzinfo is None: arrival = IST.localize(arrival)
+            
+            # Parse Duration
+            dur_str = row['Total Duration']
+            # Reconstruct duration from string hh:mm
+            try:
+                sign = -1 if dur_str.startswith('-') else 1
+                parts = dur_str.replace('-','').split(':')
+                dur_td = timedelta(hours=int(parts[0]), minutes=int(parts[1])) * sign
+                demurrage = max(timedelta(0), dur_td - timedelta(hours=free_time_hours))
+                row['Demurrage'] = format_duration_hhmm(demurrage)
+            except: pass
+            
+            recalc_rows.append(row)
+            continue
+            
+        # --- SIMULATED ROW LOGIC ---
         arrival = pd.to_datetime(row['_Arrival_DT'])
         if arrival.tzinfo is None: arrival = IST.localize(arrival)
-        
-        # Base Ready Time (from original calculation which included base shunt)
-        # But we need to update it if user changed 'Extra Shunt (Mins)'
-        # This is tricky because _Shunt_Ready_DT already has the *original* extra shunt baked in.
-        # We need to reverse engineer or assume the user wants to ADD more?
-        # Better: _Shunt_Ready_DT represents the Base Shunt arrival.
-        # Let's trust the logic: The row has 'Extra Shunt (Mins)'.
-        # We need the BASE ready time.
-        # Heuristic: We will use the existing _Shunt_Ready_DT but adjust by difference in Extra Shunt if needed?
-        # SIMPLER: _Shunt_Ready_DT in the dataframe *includes* the optimization choice. 
-        # If user edits 'Extra Shunt', we add/subtract from the CURRENT ready time?
-        # Risk: Repeated edits drift the time.
-        # SAFE APPROACH: Use _Shunt_Ready_DT as the anchor. If user edits "Extra Shunt (Mins)",
-        # we assume _Shunt_Ready_DT needs to be updated.
-        # HOWEVER, preserving the original base ready time is hard without a hidden column.
-        # Let's assume _Shunt_Ready_DT is the FINAL ready time.
         
         ready = pd.to_datetime(row['_Shunt_Ready_DT'])
         if ready.tzinfo is None: ready = IST.localize(ready)
         
-        # We will NOT dynamically change ready time based on the column edit in this version 
-        # unless we store 'Base Ready'. For now, we use the Ready time as calculated.
-        
         form_mins = float(row['_Form_Mins'])
         
-        # Parse Used Tipplers from the string (e.g. "T1, T3")
         used_str = str(row['Tipplers Used'])
         current_tipplers = []
         for t in ['T1', 'T2', 'T3', 'T4']:
             if t in used_str: current_tipplers.append(t)
         
-        # When are resources free?
         resource_free_at = sim_start_dt
         for t in current_tipplers:
             resource_free_at = max(resource_free_at, tippler_state[t])
         
         valid_start = max(ready, resource_free_at)
-        
-        # Check for User Edit on "Tippler Start Time"
         user_start_input = restore_dt(row['Tippler Start Time'], ready)
         
         if pd.notnull(user_start_input):
@@ -413,24 +540,20 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
             
         max_finish = final_start 
         
-        # Update individual tippler columns and state
         for t_id in ['T1', 'T2', 'T3', 'T4']:
             col_start = f"{t_id} Start"
             col_end = f"{t_id} End"
             col_idle = f"{t_id} Idle"
             
             if t_id in current_tipplers:
-                # 1. Update Idle Time
                 prev_finish = tippler_state[t_id]
                 gap = final_start - prev_finish
                 current_idle = max(timedelta(0), gap)
                 row[col_idle] = format_duration_hhmm(current_idle)
 
-                # 2. Update Finish Time
                 t_end_val = restore_dt(row[col_end], final_start)
                 t_start_val_old = restore_dt(row[col_start], final_start)
                 
-                # Estimate Duration
                 if pd.notnull(t_end_val) and pd.notnull(t_start_val_old):
                       duration = t_end_val - t_start_val_old
                       if duration < timedelta(0): duration = timedelta(hours=2) 
@@ -469,9 +592,19 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
     return pd.DataFrame(recalc_rows), daily_demurrage_tracker
 
 # ==========================================
-# 4. SIDEBAR PARAMS
+# 5. SIDEBAR PARAMS
 # ==========================================
-st.sidebar.header("⚙️ Infrastructure Settings")
+st.sidebar.header("⚙️ Settings")
+
+# GOOGLE SHEET INPUT - HARDCODED DEFAULT
+st.sidebar.subheader("🌍 Data Source")
+gs_url = st.sidebar.text_input(
+    "Google Sheet CSV Link", 
+    value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv"
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Infrastructure")
 sim_params = {}
 sim_params['rt1'] = st.sidebar.number_input("Tippler 1 Rate", value=6.0, step=0.5)
 sim_params['rt2'] = st.sidebar.number_input("Tippler 2 Rate", value=6.0, step=0.5)
@@ -480,17 +613,17 @@ sim_params['rt4'] = st.sidebar.number_input("Tippler 4 Rate", value=9.0, step=0.
 st.sidebar.markdown("---")
 sim_params['sa'] = st.sidebar.number_input("Pair A Shunt (Mins)", value=25.0, step=5.0)
 sim_params['sb'] = st.sidebar.number_input("Pair B Shunt (Mins)", value=50.0, step=5.0)
-sim_params['extra_shunt'] = st.sidebar.number_input("Cross-Pair Extra Shunt (Mins)", value=45.0, step=5.0, help="Penalty for moving Line 8 rakes to T3/T4")
+sim_params['extra_shunt'] = st.sidebar.number_input("Cross-Pair Penalty (Mins)", value=45.0, step=5.0)
 st.sidebar.markdown("---")
 sim_params['fa'] = st.sidebar.number_input("Pair A Formation (Mins)", value=20.0, step=5.0)
 sim_params['fb'] = st.sidebar.number_input("Pair B Formation (Mins)", value=50.0, step=5.0)
-sim_params['ft'] = st.sidebar.number_input("Free Time (Hours)", value=7.0, step=0.5)
+sim_params['ft'] = st.sidebar.number_input("Free Time (Hours)", value=9.0, step=0.5)
 sim_params['wb'] = st.sidebar.number_input("Wagons 1st Batch", value=30, step=1)
 sim_params['wd'] = st.sidebar.number_input("Delay 2nd Tippler (Mins)", value=0.0, step=5.0)
 
 # DOWNTIME MANAGER
 st.sidebar.markdown("---")
-st.sidebar.subheader("🛠️ Tippler Downtime Manager")
+st.sidebar.subheader("🛠️ Tippler Downtime")
 if 'downtimes' not in st.session_state: st.session_state.downtimes = []
 with st.sidebar.form("downtime_form"):
     dt_tippler = st.selectbox("Select Tippler", ["T1", "T2", "T3", "T4"])
@@ -519,18 +652,37 @@ if st.session_state.downtimes:
 sim_params['downtimes'] = st.session_state.downtimes
 
 # ==========================================
-# 5. MAIN EXECUTION
+# 6. MAIN EXECUTION
 # ==========================================
 
-uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
+uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
 
+# Trigger logic if either Source changes
+input_changed = False
 if uploaded_file is not None:
-    file_changed = False
-    if 'last_uploaded_file_id' not in st.session_state or st.session_state.last_uploaded_file_id != uploaded_file.file_id:
-        file_changed = True
-        st.session_state.last_uploaded_file_id = uploaded_file.file_id
+    if 'last_file_id' not in st.session_state or st.session_state.last_file_id != uploaded_file.file_id:
+        input_changed = True
+        st.session_state.last_file_id = uploaded_file.file_id
 
-    if file_changed or 'raw_data_cached' not in st.session_state:
+if gs_url and ('last_gs_url' not in st.session_state or st.session_state.last_gs_url != gs_url):
+    input_changed = True
+    st.session_state.last_gs_url = gs_url
+
+if input_changed or 'raw_data_cached' not in st.session_state:
+    # 1. Load Google Sheet Actuals
+    actuals_df = pd.DataFrame()
+    actuals_state = {}
+    if gs_url:
+        with st.spinner("Fetching Google Sheet Actuals..."):
+            actuals_df, actuals_state = fetch_google_sheet_actuals(gs_url)
+            if not actuals_df.empty:
+                st.success(f"✅ Loaded {len(actuals_df)} actual rakes from Google Sheet (Today).")
+    
+    st.session_state.actuals_df = actuals_df
+    st.session_state.actuals_state = actuals_state
+
+    # 2. Load CSV Plan
+    if uploaded_file:
         try:
             uploaded_file.seek(0) 
             df_raw = pd.read_csv(uploaded_file)
@@ -541,28 +693,33 @@ if uploaded_file is not None:
         except Exception as e:
             st.error(f"Error reading file: {e}")
             st.stop()
+    else:
+        st.session_state.raw_data_cached = pd.DataFrame()
 
-if 'raw_data_cached' in st.session_state:
-    df_raw = st.session_state.raw_data_cached
+# Run Simulation if we have data
+if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
+    df_raw = st.session_state.get('raw_data_cached', pd.DataFrame())
+    df_act = st.session_state.get('actuals_df', pd.DataFrame())
+    st_act = st.session_state.get('actuals_state', {})
     
-    # Run Simulation
-    sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params)
+    sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, st_act)
     
-    if 'sim_result' not in st.session_state or not st.session_state.sim_result.equals(sim_result):
-        st.session_state.sim_result = sim_result
-        st.session_state.sim_start_dt = sim_start_dt
+    st.session_state.sim_result = sim_result
+    st.session_state.sim_start_dt = sim_start_dt
 
-    st.markdown("### 📝 Schedule Editor (IST)")
+    st.markdown("### 📝 Master Schedule (Actuals + Forecast)")
     
     if st.session_state.sim_result.empty:
-        st.warning("No data found matching 'BOXN' load type.")
+        st.warning("No data found (Upload CSV or check Google Sheet link).")
     else:
         # Define Columns
         column_config = {
             "_Arrival_DT": None, "_Shunt_Ready_DT": None, "_Form_Mins": None,
+            "Rake": st.column_config.TextColumn("Rake Name", disabled=True),
+            "Status": st.column_config.TextColumn("Status", help="ACTUAL = From G-Sheet"),
             "Tippler Start Time": st.column_config.TextColumn("Start (dd-HH:MM)", help="Edit to delay"),
             "Finish Unload": st.column_config.TextColumn("Finish (dd-HH:MM)", help="Edit to extend"),
-            "Extra Shunt (Mins)": st.column_config.NumberColumn("Ext. Shunt", help="Edit shunting penalty", step=5),
+            "Extra Shunt (Mins)": st.column_config.NumberColumn("Ext. Shunt", step=5),
             "Optimization Type": st.column_config.TextColumn("Strategy", width="small"),
             "T1 Start": st.column_config.TextColumn("T1 Start"), "T1 End": st.column_config.TextColumn("T1 End"), "T1 Idle": st.column_config.TextColumn("T1 Idle"),
             "T2 Start": st.column_config.TextColumn("T2 Start"), "T2 End": st.column_config.TextColumn("T2 End"), "T2 Idle": st.column_config.TextColumn("T2 Idle"),
@@ -570,35 +727,29 @@ if 'raw_data_cached' in st.session_state:
             "T4 Start": st.column_config.TextColumn("T4 Start"), "T4 End": st.column_config.TextColumn("T4 End"), "T4 Idle": st.column_config.TextColumn("T4 Idle"),
         }
         
+        # Color highlighting for Actuals vs Simulated? 
+        # Streamlit data_editor doesn't support row styling easily, but 'Status' column helps.
+        
         edited_df = st.data_editor(
             st.session_state.sim_result,
             use_container_width=True,
             num_rows="fixed",
             column_config=column_config,
-            disabled=["Rake", "Load Type", "Wagons", "Line Allotted", "Wait (Tippler)", "Total Duration", "Demurrage", "Tipplers Used"],
+            disabled=["Rake", "Load Type", "Wagons", "Line Allotted", "Wait (Tippler)", "Total Duration", "Demurrage", "Tipplers Used", "Status"],
             key="data_editor"
         )
 
         # Reactive Calculation
         final_result, daily_stats = recalculate_cascade_reactive(edited_df, sim_params['ft'], st.session_state.sim_start_dt)
         
-        # --- DEMURRAGE SUMMARY (Next 3 Days) ---
-        st.markdown("### 📅 Demurrage Forecast (Next 3 Days)")
-        if 'sim_start_dt' in st.session_state and st.session_state.sim_start_dt is not None:
-            start_date = st.session_state.sim_start_dt.date()
-            days_to_show = [start_date + timedelta(days=i) for i in range(3)]
-            
-            summary_data = []
-            for d in days_to_show:
-                d_str = d.strftime('%Y-%m-%d')
-                secs = daily_stats.get(d_str, 0)
-                summary_data.append({
-                    'Date': d_str,
-                    'Day': d.strftime('%A'),
-                    'Projected Demurrage': format_duration_hhmm(timedelta(seconds=secs))
-                })
-            
-            st.dataframe(pd.DataFrame(summary_data), use_container_width=False)
+        # --- DEMURRAGE SUMMARY ---
+        st.markdown("### 📅 Demurrage Forecast")
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+             st.dataframe(pd.DataFrame(list(daily_stats.items()), columns=['Date', 'Seconds']).assign(
+                 Demurrage=lambda x: x['Seconds'].apply(lambda s: format_duration_hhmm(timedelta(seconds=s)))
+             )[['Date', 'Demurrage']], hide_index=True)
 
         # Download
         csv = final_result.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins"]).to_csv(index=False).encode('utf-8')
