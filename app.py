@@ -4,6 +4,7 @@ from datetime import timedelta, datetime
 import pytz
 import math
 import numpy as np
+import re
 
 # ==========================================
 # 1. PAGE CONFIGURATION
@@ -113,6 +114,24 @@ def find_column(df, candidates):
                  return df.columns[cols_upper.index(c)]
     return None
 
+def is_valid_demurrage_string(val):
+    """
+    Checks if the value is a valid number or time format.
+    Returns True if valid (e.g. "2", "2.5", "02:00"), False if text/garbage.
+    """
+    s = str(val).strip()
+    if not s or s.lower() == 'nan': return False
+    
+    # Check for HH:MM format
+    if re.match(r'^\d{1,2}:\d{2}$', s): return True
+    
+    # Check for pure number (int or float)
+    try:
+        float(s)
+        return True
+    except:
+        return False
+
 # ==========================================
 # 3. GOOGLE SHEET PARSER (Cached & Strict)
 # ==========================================
@@ -191,14 +210,24 @@ def fetch_google_sheet_actuals(url, free_time_hours):
 
             if pd.isnull(start_dt): start_dt = arrival_dt 
 
-            # Demurrage: Copy from Sheet if col exists, else Calc
-            if dem_col_idx != -1 and pd.notnull(row.iloc[dem_col_idx]):
-                dem_str = str(row.iloc[dem_col_idx])
-                # Try to clean it up nicely if it's a number
-                try: 
-                    if isinstance(dem_str, (int, float)): dem_str = f"{int(float(dem_str)):02d}:00"
-                except: pass
-            else:
+            # Demurrage Logic:
+            # 1. Check if column exists AND value is valid number/time
+            use_sheet_demurrage = False
+            dem_str = "00:00"
+            
+            if dem_col_idx != -1:
+                raw_dem_val = row.iloc[dem_col_idx]
+                if is_valid_demurrage_string(raw_dem_val):
+                    use_sheet_demurrage = True
+                    dem_str = str(raw_dem_val).strip()
+                    # Standardize "2" -> "02:00" if possible
+                    try:
+                        if ":" not in dem_str:
+                            dem_str = f"{int(float(dem_str)):02d}:00"
+                    except: pass
+            
+            # 2. If invalid or missing, Calculate it
+            if not use_sheet_demurrage:
                 dem_str, _ = calculate_rounded_demurrage(total_dur, free_time_hours)
 
             # Tipplers
@@ -504,24 +533,24 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
                     end_dt = restore_dt(end_str, sim_start_dt)
                     if pd.notnull(end_dt) and end_dt > tippler_state[t]: tippler_state[t] = end_dt
             
-            # Recalc Demurrage (Rounded) for Actuals
-            # If Demurrage is already set (from sheet), use it. Else calculate.
-            # But here we need to SUM it for the forecast.
+            # Use existing Demurrage column for aggregation if valid
             try:
                 dem_val = row['Demurrage']
                 dem_hrs = 0
                 if ":" in str(dem_val):
                     dem_hrs = int(dem_val.split(":")[0])
                 elif pd.notnull(dem_val):
-                    # Fallback calc if not in "HH:MM"
-                    dur_str = row['Total Duration']
-                    sign = -1 if dur_str.startswith('-') else 1
-                    parts = dur_str.replace('-','').split(':')
-                    dur_td = timedelta(hours=int(parts[0]), minutes=int(parts[1])) * sign
-                    _, dem_hrs = calculate_rounded_demurrage(dur_td, free_time_hours)
+                    # Try converting if it's just a number
+                    try: dem_hrs = int(float(dem_val))
+                    except: 
+                        # Fallback calc if not a direct number/time
+                        dur_str = row['Total Duration']
+                        sign = -1 if dur_str.startswith('-') else 1
+                        parts = dur_str.replace('-','').split(':')
+                        dur_td = timedelta(hours=int(parts[0]), minutes=int(parts[1])) * sign
+                        _, dem_hrs = calculate_rounded_demurrage(dur_td, free_time_hours)
             except: dem_hrs = 0
             
-            # Add to Daily Stats (use Arrival Date)
             try:
                 arr_dt = pd.to_datetime(row['_Arrival_DT'])
                 if arr_dt.tzinfo is None: arr_dt = IST.localize(arr_dt)
@@ -567,8 +596,6 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
                 row[f"{t_id} End"] = format_dt(new_t_end)
 
         tot_dur = (max_finish - arrival) + timedelta(minutes=float(row['_Form_Mins']))
-        
-        # Rounded Demurrage Calculation
         dem_str, dem_hrs = calculate_rounded_demurrage(tot_dur, free_time_hours)
         
         row['Tippler Start Time'] = format_dt(final_start)
@@ -638,7 +665,6 @@ if gs_url and 'actuals_df_disp' not in st.session_state:
     
 if gs_url:
     try:
-        # Check if we have data cached in session state, if not fetch
         if 'actuals_df' not in st.session_state or st.session_state.actuals_df.empty:
              df_disp, _ = fetch_google_sheet_actuals(gs_url, sim_params['ft'])
              st.session_state.actuals_df_disp = df_disp
@@ -664,7 +690,6 @@ if gs_url and ('last_gs_url' not in st.session_state or st.session_state.last_gs
     input_changed = True
     st.session_state.last_gs_url = gs_url
 
-# This block ensures we only re-run heavy simulation if input changed or data missing
 if input_changed or 'raw_data_cached' not in st.session_state:
     actuals_df, actuals_state = pd.DataFrame(), {}
     if gs_url:
@@ -687,20 +712,16 @@ if input_changed or 'raw_data_cached' not in st.session_state:
             st.stop()
     else: st.session_state.raw_data_cached = pd.DataFrame()
 
-# Main Logic Block
 if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_raw = st.session_state.get('raw_data_cached', pd.DataFrame())
     df_act = st.session_state.get('actuals_df', pd.DataFrame())
     st_act = st.session_state.get('actuals_state', {})
     
-    # We only re-calculate the base simulation if inputs changed.
-    # If it's just a refresh, we rely on session state unless logic forces it.
-    if input_changed or 'sim_result' not in st.session_state:
-        sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, st_act)
-        st.session_state.sim_result = sim_result
-        st.session_state.sim_start_dt = sim_start_dt
+    sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, st_act)
+    st.session_state.sim_result = sim_result
+    st.session_state.sim_start_dt = sim_start_dt
 
-    if 'sim_result' in st.session_state and not st.session_state.sim_result.empty:
+    if not st.session_state.sim_result.empty:
         col_cfg = {
             "Rake": st.column_config.TextColumn("Rake Name", disabled=True),
             "Coal Source": st.column_config.TextColumn("Source/Mine", disabled=True),
@@ -712,8 +733,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
         }
         
         st.markdown("### 📝 Master Schedule (Actuals + Forecast)")
-        
-        # Data Editor - Key is crucial for stability on refresh/rerun
         edited_df = st.data_editor(
             st.session_state.sim_result, 
             use_container_width=True, 
@@ -723,7 +742,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             key="schedule_editor" 
         )
         
-        # Recalculate based on edits (Reactive)
         final_result, daily_stats = recalculate_cascade_reactive(edited_df, sim_params['ft'], st.session_state.sim_start_dt)
         
         st.markdown("### 📅 Demurrage Forecast (Rounded to Next Hour)")
