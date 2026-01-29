@@ -64,24 +64,25 @@ def format_duration_hhmm(delta):
     minutes = (total_seconds % 3600) // 60
     return f"{sign}{hours:02d}:{minutes:02d}"
 
-def calculate_rounded_demurrage(duration, free_time_hours):
+def calculate_rounded_demurrage(duration_delta, free_time_hours):
     """
-    Rounds UP demurrage to the nearest hour.
-    Example: 30 mins -> 1 hr, 90 mins -> 2 hrs.
-    Returns formatted string "HH:00" and the rounded hours as int.
+    1. Subtract Free Time from Total Duration.
+    2. If result <= 0, Demurrage = 0.
+    3. If result > 0, Round UP to nearest whole hour (Ceiling).
     """
-    if pd.isnull(duration): return "00:00", 0
+    if pd.isnull(duration_delta): return "00:00", 0
     
-    # Calculate raw demurrage time
-    free_time_delta = timedelta(hours=free_time_hours)
-    demurrage_delta = duration - free_time_delta
+    # Total minutes taken
+    total_minutes = duration_delta.total_seconds() / 60
+    free_minutes = free_time_hours * 60
     
-    if demurrage_delta.total_seconds() <= 0:
+    demurrage_minutes = total_minutes - free_minutes
+    
+    if demurrage_minutes <= 0:
         return "00:00", 0
-        
-    # Ceiling Logic
-    total_minutes = demurrage_delta.total_seconds() / 60
-    rounded_hours = math.ceil(total_minutes / 60)
+    
+    # Ceiling logic: 1 min -> 1 hr, 61 mins -> 2 hrs
+    rounded_hours = math.ceil(demurrage_minutes / 60)
     
     return f"{int(rounded_hours):02d}:00", rounded_hours
 
@@ -104,8 +105,14 @@ def find_column(df, candidates):
     """Smartly looks for a column matching one of the candidates."""
     cols_upper = [str(c).upper().strip() for c in df.columns]
     for cand in candidates:
-        if cand in cols_upper:
-            return df.columns[cols_upper.index(cand)]
+        cand_upper = cand.upper().strip()
+        # Exact match check first
+        if cand_upper in cols_upper:
+            return df.columns[cols_upper.index(cand_upper)]
+        # Partial match check (risky but helpful for "STTN FROM")
+        for c in cols_upper:
+            if cand_upper == c: # Strict equality for candidates to avoid false positives
+                 return df.columns[cols_upper.index(c)]
     return None
 
 # ==========================================
@@ -123,7 +130,7 @@ def safe_parse_date(val):
 def fetch_google_sheet_actuals(url, free_time_hours):
     try:
         df_gs = pd.read_csv(url)
-        if len(df_gs.columns) < 10: # Reduced check to be safer
+        if len(df_gs.columns) < 10:
             st.error("Google Sheet error: Not enough columns found.")
             return pd.DataFrame(), {}
 
@@ -138,25 +145,18 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         # Look for headers like 'FROM', 'SRC', 'MINE', 'SOURCE'
         source_col_idx = -1
         cols_upper = [str(c).upper().strip() for c in df_gs.columns]
-        possible_src = ['FROM', 'SRC', 'SOURCE', 'MINE', 'FROM_STN']
+        possible_src = ['STTN FROM', 'FROM_STN', 'SRC', 'SOURCE', 'MINE', 'FROM']
         
         for p in possible_src:
-            for i, c in enumerate(cols_upper):
-                if p in c:
-                    source_col_idx = i
-                    break
-            if source_col_idx != -1: break
+            if p in cols_upper:
+                source_col_idx = cols_upper.index(p)
+                break
             
-        # Fallback: if not found, assume it's NOT the wagon col (idx 3) but maybe idx 2?
-        # If user says idx 3 was BOXN, let's try to look at data.
-        # Safe fallback: If no header match, we leave it blank to avoid wrong data.
-
         actuals = []
         today_date = datetime.now(IST).date()
 
         for _, row in df_gs.iterrows():
-            # Arrival is usually Column E (Index 4)
-            arrival_dt = safe_parse_date(row.iloc[4])
+            arrival_dt = safe_parse_date(row.iloc[4]) # Col E
             if pd.isnull(arrival_dt): continue
 
             # Filter: ONLY TODAY'S DATA
@@ -168,7 +168,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             if source_col_idx != -1:
                 source_val = str(row.iloc[source_col_idx])
             else:
-                source_val = "" # Better empty than wrong
+                source_val = ""
             if source_val.lower() == 'nan': source_val = ""
 
             # Times
@@ -345,7 +345,7 @@ def run_full_simulation_initial(df, params, actuals_df, actuals_state):
     if not rake_col: return pd.DataFrame(), None 
     
     # 4. Source Column (CSV)
-    src_col = find_column(df, ['FROM_STN', 'SRC', 'SOURCE', 'FROM'])
+    src_col = find_column(df, ['STTN FROM', 'FROM_STN', 'SRC', 'SOURCE', 'FROM'])
         
     # 5. Arrival Time
     arvl_col = find_column(df, ['EXPD ARVLTIME', 'ARRIVAL TIME', 'EXPECTED ARRIVAL'])
@@ -385,13 +385,13 @@ def run_full_simulation_initial(df, params, actuals_df, actuals_state):
     
     for _, rake in df.iterrows():
         options = []
-        # Create 4 options logic (Standard as before)
+        # Create 4 options logic
         entry_A = get_line_entry_time('Group_Lines_8_10', rake['arrival_dt'], line_groups)
         ready_A = entry_A + timedelta(minutes=s_a)
         fin_A, used_A, start_A, tim_A, idle_A = calculate_generic_finish(
             rake['wagon_count'], ['T1', 'T2'], ready_A, tippler_state, downtimes, rates, w_batch, w_delay)
         
-        # Demurrage Calculation for Selection (Using Raw Float for sorting)
+        # Demurrage Calculation for Selection (Sort by Raw Seconds to be precise)
         dur_A = (fin_A - rake['arrival_dt']) + timedelta(minutes=f_a)
         dem_A_raw = max(0, (dur_A - timedelta(hours=ft_hours)).total_seconds())
 
