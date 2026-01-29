@@ -94,7 +94,6 @@ def safe_parse_date(val):
     """Parses date, returns NaT if text like 'U/P' is found."""
     if pd.isnull(val) or str(val).strip() == "": return pd.NaT
     try:
-        # If it's just a string like 'U/P', this will fail naturally
         dt = pd.to_datetime(val, dayfirst=True, errors='raise') 
         return to_ist(dt)
     except:
@@ -127,6 +126,11 @@ def fetch_google_sheet_actuals(url):
 
             rake_name = str(row.iloc[rake_col_idx])
             
+            # --- NEW: Parse Source / Stts (Col D / Index 3) ---
+            # Assuming Col D is Source if E is Arrival
+            source_val = str(row.iloc[3]).strip() if len(row) > 3 else "N/A"
+            if source_val == "nan": source_val = ""
+
             # Times (Safe Parse)
             start_dt = safe_parse_date(row.iloc[5])   # Col F
             end_dt = safe_parse_date(row.iloc[6])     # Col G
@@ -135,7 +139,7 @@ def fetch_google_sheet_actuals(url):
             # If start_dt is NaT (e.g. "U/P"), assume it hasn't started or use Arrival
             if pd.isnull(start_dt): start_dt = arrival_dt 
 
-            # Calculate Duration
+            # Calculate Duration: Release (H) - Receipt (E)
             if pd.notnull(release_dt) and pd.notnull(arrival_dt):
                 total_dur = release_dt - arrival_dt
             else:
@@ -150,6 +154,7 @@ def fetch_google_sheet_actuals(url):
             
             entry = {
                 'Rake': rake_name,
+                'Coal Source': source_val,
                 'Load Type': 'BOXN (Actual)',
                 'Wagons': 58,
                 'Status': 'ACTUAL',
@@ -301,8 +306,11 @@ def run_full_simulation_initial(df, params, actuals_df, actuals_state):
     rake_col = find_column(df, ['RAKE NAME', 'RAKE', 'TRAIN NAME'])
     if not rake_col:
         return pd.DataFrame(), None # Critical failure
+    
+    # 4. Source Column (CSV)
+    src_col = find_column(df, ['FROM_STN', 'SRC', 'SOURCE', 'FROM'])
         
-    # 4. Arrival Time
+    # 5. Arrival Time
     arvl_col = find_column(df, ['EXPD ARVLTIME', 'ARRIVAL TIME', 'EXPECTED ARRIVAL'])
     stts_time_col = find_column(df, ['STTS TIME'])
     stts_code_col = find_column(df, ['STTS CODE', 'STATUS'])
@@ -385,6 +393,7 @@ def run_full_simulation_initial(df, params, actuals_df, actuals_state):
 
         row_data = {
             'Rake': rake[rake_col],
+            'Coal Source': rake.get(src_col, '') if src_col else '',
             'Load Type': rake.get(load_col, 'BOXN'),
             'Wagons': rake['wagon_count'],
             'Status': rake.get(stts_code_col, 'N/A') if stts_code_col else 'N/A',
@@ -540,6 +549,32 @@ sim_params['downtimes'] = st.session_state.downtimes
 # ==========================================
 # 6. MAIN EXECUTION
 # ==========================================
+
+# 1. LIVE GOOGLE SHEET DISPLAY (BEFORE UPLOAD)
+if gs_url and 'actuals_df_disp' not in st.session_state:
+    st.session_state.actuals_df_disp = pd.DataFrame()
+    
+# Always try to fetch if we have a URL and haven't fetched yet or if reloading
+if gs_url:
+    # Use a lightweight fetch just for display if we haven't loaded main data
+    try:
+        if 'actuals_df' not in st.session_state or st.session_state.actuals_df.empty:
+             df_disp, _ = fetch_google_sheet_actuals(gs_url)
+             st.session_state.actuals_df_disp = df_disp
+        else:
+             st.session_state.actuals_df_disp = st.session_state.actuals_df
+    except: pass
+
+st.subheader("📊 Live Unloading Status (Today)")
+if 'actuals_df_disp' in st.session_state and not st.session_state.actuals_df_disp.empty:
+    # Simple display of key columns
+    disp_cols = ['Rake', 'Coal Source', 'Status', 'Tippler Start Time', 'Finish Unload', 'Total Duration']
+    st.dataframe(st.session_state.actuals_df_disp[disp_cols], use_container_width=True)
+else:
+    st.info("Loading Google Sheet data or no data found for today...")
+
+
+# 2. FILE UPLOAD & PROCESSING
 uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
 
 input_changed = False
@@ -554,7 +589,7 @@ if input_changed or 'raw_data_cached' not in st.session_state:
     actuals_df, actuals_state = pd.DataFrame(), {}
     if gs_url:
         actuals_df, actuals_state = fetch_google_sheet_actuals(gs_url)
-        if not actuals_df.empty: st.success(f"✅ Loaded {len(actuals_df)} actual rakes from Google Sheet (Today).")
+        st.session_state.actuals_df_disp = actuals_df # Update display df
     
     st.session_state.actuals_df = actuals_df
     st.session_state.actuals_state = actuals_state
@@ -584,6 +619,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     if not st.session_state.sim_result.empty:
         col_cfg = {
             "Rake": st.column_config.TextColumn("Rake Name", disabled=True),
+            "Coal Source": st.column_config.TextColumn("Source/Mine", disabled=True),
             "Status": st.column_config.TextColumn("Status", help="ACTUAL = From G-Sheet"),
             "Tippler Start Time": st.column_config.TextColumn("Start (dd-HH:MM)"),
             "Finish Unload": st.column_config.TextColumn("Finish (dd-HH:MM)"),
@@ -591,7 +627,8 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             "_Arrival_DT": None, "_Shunt_Ready_DT": None, "_Form_Mins": None
         }
         
-        edited_df = st.data_editor(st.session_state.sim_result, use_container_width=True, num_rows="fixed", column_config=col_cfg, disabled=["Rake", "Load Type", "Wagons", "Line Allotted", "Wait (Tippler)", "Total Duration", "Demurrage", "Tipplers Used", "Status"])
+        st.markdown("### 📝 Master Schedule (Actuals + Forecast)")
+        edited_df = st.data_editor(st.session_state.sim_result, use_container_width=True, num_rows="fixed", column_config=col_cfg, disabled=["Rake", "Coal Source", "Load Type", "Wagons", "Line Allotted", "Wait (Tippler)", "Total Duration", "Demurrage", "Tipplers Used", "Status"])
         
         final_result, daily_stats = recalculate_cascade_reactive(edited_df, sim_params['ft'], st.session_state.sim_start_dt)
         
@@ -599,5 +636,3 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
         st.dataframe(pd.DataFrame(list(daily_stats.items()), columns=['Date', 'Seconds']).assign(Demurrage=lambda x: x['Seconds'].apply(lambda s: format_duration_hhmm(timedelta(seconds=s))))[['Date', 'Demurrage']], hide_index=True)
         
         st.download_button("📥 Download Final Report", final_result.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
-    else:
-        st.warning("No data found (Upload CSV or check Google Sheet link).")
