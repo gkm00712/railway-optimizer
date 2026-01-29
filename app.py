@@ -111,27 +111,28 @@ def find_column(df, candidates):
             return df.columns[cols_upper.index(cand_upper)]
         # Partial match check (risky but helpful for "STTN FROM")
         for c in cols_upper:
-            if cand_upper == c: # Strict equality for candidates to avoid false positives
+            if cand_upper == c: 
                  return df.columns[cols_upper.index(c)]
     return None
 
 # ==========================================
-# 3. ROBUST GOOGLE SHEET PARSER
+# 3. ROBUST GOOGLE SHEET PARSER (Cached)
 # ==========================================
 
 def safe_parse_date(val):
     if pd.isnull(val) or str(val).strip() == "": return pd.NaT
     try:
-        dt = pd.to_datetime(val, dayfirst=True, errors='raise') 
+        dt = pd.to_datetime(val, dayfirst=True, errors='coerce') 
+        if pd.isnull(dt): return pd.NaT # Handle 'U/P' or garbage
         return to_ist(dt)
     except:
         return pd.NaT
 
+@st.cache_data(ttl=60) # Cache data for 60 seconds to prevent constant re-fetching on refresh
 def fetch_google_sheet_actuals(url, free_time_hours):
     try:
         df_gs = pd.read_csv(url)
         if len(df_gs.columns) < 10:
-            st.error("Google Sheet error: Not enough columns found.")
             return pd.DataFrame(), {}
 
         # 1. Identify Rake Column
@@ -142,7 +143,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 break
         
         # 2. Identify Source Column (Smart Search)
-        # Look for headers like 'FROM', 'SRC', 'MINE', 'SOURCE'
+        # Look for headers like 'STTN FROM', 'SRC', 'MINE'
         source_col_idx = -1
         cols_upper = [str(c).upper().strip() for c in df_gs.columns]
         possible_src = ['STTN FROM', 'FROM_STN', 'SRC', 'SOURCE', 'MINE', 'FROM']
@@ -239,7 +240,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         return df_actuals, tippler_init_state
 
     except Exception as e:
-        print(f"Detailed G-Sheet Error: {e}") 
+        # print(f"Detailed G-Sheet Error: {e}") # Suppressed to avoid log spam
         return pd.DataFrame(), {}
 
 # ==========================================
@@ -344,7 +345,7 @@ def run_full_simulation_initial(df, params, actuals_df, actuals_state):
     rake_col = find_column(df, ['RAKE NAME', 'RAKE', 'TRAIN NAME'])
     if not rake_col: return pd.DataFrame(), None 
     
-    # 4. Source Column (CSV)
+    # 4. Source Column (CSV) - Prioritize STTN FROM
     src_col = find_column(df, ['STTN FROM', 'FROM_STN', 'SRC', 'SOURCE', 'FROM'])
         
     # 5. Arrival Time
@@ -391,7 +392,6 @@ def run_full_simulation_initial(df, params, actuals_df, actuals_state):
         fin_A, used_A, start_A, tim_A, idle_A = calculate_generic_finish(
             rake['wagon_count'], ['T1', 'T2'], ready_A, tippler_state, downtimes, rates, w_batch, w_delay)
         
-        # Demurrage Calculation for Selection (Sort by Raw Seconds to be precise)
         dur_A = (fin_A - rake['arrival_dt']) + timedelta(minutes=f_a)
         dem_A_raw = max(0, (dur_A - timedelta(hours=ft_hours)).total_seconds())
 
@@ -619,6 +619,7 @@ if gs_url and 'actuals_df_disp' not in st.session_state:
     
 if gs_url:
     try:
+        # Check if we have data cached in session state, if not fetch
         if 'actuals_df' not in st.session_state or st.session_state.actuals_df.empty:
              df_disp, _ = fetch_google_sheet_actuals(gs_url, sim_params['ft'])
              st.session_state.actuals_df_disp = df_disp
@@ -644,6 +645,7 @@ if gs_url and ('last_gs_url' not in st.session_state or st.session_state.last_gs
     input_changed = True
     st.session_state.last_gs_url = gs_url
 
+# This block ensures we only re-run heavy simulation if input changed or data missing
 if input_changed or 'raw_data_cached' not in st.session_state:
     actuals_df, actuals_state = pd.DataFrame(), {}
     if gs_url:
@@ -666,16 +668,20 @@ if input_changed or 'raw_data_cached' not in st.session_state:
             st.stop()
     else: st.session_state.raw_data_cached = pd.DataFrame()
 
+# Main Logic Block
 if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_raw = st.session_state.get('raw_data_cached', pd.DataFrame())
     df_act = st.session_state.get('actuals_df', pd.DataFrame())
     st_act = st.session_state.get('actuals_state', {})
     
-    sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, st_act)
-    st.session_state.sim_result = sim_result
-    st.session_state.sim_start_dt = sim_start_dt
+    # We only re-calculate the base simulation if inputs changed.
+    # If it's just a refresh, we rely on session state unless logic forces it.
+    if input_changed or 'sim_result' not in st.session_state:
+        sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, st_act)
+        st.session_state.sim_result = sim_result
+        st.session_state.sim_start_dt = sim_start_dt
 
-    if not st.session_state.sim_result.empty:
+    if 'sim_result' in st.session_state and not st.session_state.sim_result.empty:
         col_cfg = {
             "Rake": st.column_config.TextColumn("Rake Name", disabled=True),
             "Coal Source": st.column_config.TextColumn("Source/Mine", disabled=True),
@@ -687,8 +693,20 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
         }
         
         st.markdown("### 📝 Master Schedule (Actuals + Forecast)")
-        edited_df = st.data_editor(st.session_state.sim_result, use_container_width=True, num_rows="fixed", column_config=col_cfg, disabled=["Rake", "Coal Source", "Load Type", "Wagons", "Line Allotted", "Wait (Tippler)", "Total Duration", "Demurrage", "Tipplers Used", "Status"])
         
+        
+
+        # Data Editor - Key is crucial for stability on refresh/rerun
+        edited_df = st.data_editor(
+            st.session_state.sim_result, 
+            use_container_width=True, 
+            num_rows="fixed", 
+            column_config=col_cfg, 
+            disabled=["Rake", "Coal Source", "Load Type", "Wagons", "Line Allotted", "Wait (Tippler)", "Total Duration", "Demurrage", "Tipplers Used", "Status"],
+            key="schedule_editor" 
+        )
+        
+        # Recalculate based on edits (Reactive)
         final_result, daily_stats = recalculate_cascade_reactive(edited_df, sim_params['ft'], st.session_state.sim_start_dt)
         
         st.markdown("### 📅 Demurrage Forecast (Rounded to Next Hour)")
