@@ -1,11 +1,3 @@
-This is a two-part error. I have fixed both issues in the code below.
-
-1. **The "U/P" Error:** Your Google Sheet contains text like "U/P" (likely "Under Process") in the date columns. I updated the code to gracefully ignore text in date columns instead of crashing.
-2. **The `KeyError: 'TOTL UNTS'`:** The CSV file you uploaded has slightly different column names than the script expected. I added a **"Smart Column Detector"** that automatically looks for common variations (like "Wagons", "Units", "Total Units") if it can't find "TOTL UNTS".
-
-Here is the fixed, robust script:
-
-```python
 import streamlit as st
 import pandas as pd
 from datetime import timedelta, datetime
@@ -609,5 +601,3 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
         st.download_button("📥 Download Final Report", final_result.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
     else:
         st.warning("No data found (Upload CSV or check Google Sheet link).")
-
-```
