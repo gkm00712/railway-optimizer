@@ -67,13 +67,11 @@ def format_duration_hhmm(delta):
 
 def calculate_rounded_demurrage(duration_delta, free_time_hours):
     """
-    1. Subtract Free Time from Total Duration.
-    2. If result <= 0, Demurrage = 0.
-    3. If result > 0, Round UP to nearest whole hour (Ceiling).
+    Formula: Total Duration - Free Time (7h).
+    If result > 0, Round UP to nearest whole hour.
     """
     if pd.isnull(duration_delta): return "00:00", 0
     
-    # Total minutes taken
     total_minutes = duration_delta.total_seconds() / 60
     free_minutes = free_time_hours * 60
     
@@ -82,9 +80,8 @@ def calculate_rounded_demurrage(duration_delta, free_time_hours):
     if demurrage_minutes <= 0:
         return "00:00", 0
     
-    # Ceiling logic: 1 min -> 1 hr, 61 mins -> 2 hrs
+    # Ceiling logic: 1 min -> 1 hr
     rounded_hours = math.ceil(demurrage_minutes / 60)
-    
     return f"{int(rounded_hours):02d}:00", rounded_hours
 
 def check_downtime_impact(tippler_id, proposed_start, downtime_list):
@@ -103,7 +100,6 @@ def check_downtime_impact(tippler_id, proposed_start, downtime_list):
     return current_start
 
 def find_column(df, candidates):
-    """Smartly looks for a column matching one of the candidates."""
     cols_upper = [str(c).upper().strip() for c in df.columns]
     for cand in candidates:
         cand_upper = cand.upper().strip()
@@ -115,22 +111,13 @@ def find_column(df, candidates):
     return None
 
 def is_valid_demurrage_string(val):
-    """
-    Checks if the value is a valid number or time format.
-    Returns True if valid (e.g. "2", "2.5", "02:00"), False if text/garbage.
-    """
     s = str(val).strip()
     if not s or s.lower() == 'nan': return False
-    
-    # Check for HH:MM format
     if re.match(r'^\d{1,2}:\d{2}$', s): return True
-    
-    # Check for pure number (int or float)
     try:
         float(s)
         return True
-    except:
-        return False
+    except: return False
 
 # ==========================================
 # 3. GOOGLE SHEET PARSER (Cached & Strict)
@@ -148,11 +135,9 @@ def safe_parse_date(val):
 @st.cache_data(ttl=60)
 def fetch_google_sheet_actuals(url, free_time_hours):
     try:
-        # Read twice: once to get headers, once to get data by index
         df_headers = pd.read_csv(url, nrows=0) 
-        df_gs = pd.read_csv(url, header=None, skiprows=1) # Data only
+        df_gs = pd.read_csv(url, header=None, skiprows=1)
         
-        # Identify Demurrage Column by Name if it exists
         dem_col_idx = -1
         cols_upper = [str(c).upper().strip() for c in df_headers.columns]
         for i, c in enumerate(cols_upper):
@@ -163,34 +148,22 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         if len(df_gs.columns) < 18:
             return pd.DataFrame(), {}
 
-        # STRICT COLUMN MAPPING (User Rules):
-        # Col B (Idx 1) = Rake Name
-        # Col C (Idx 2) = Source/Mine (Strictly requested)
-        # Col E (Idx 4) = Receipt
-        # Col F (Idx 5) = Placement
-        # Col G (Idx 6) = Unload End
-        # Col H (Idx 7) = Release
-        # Col I (Idx 8) = Total Duration
-        # Col O-R (Idx 14-17) = Tipplers
-        
         actuals = []
         today_date = datetime.now(IST).date()
 
         for _, row in df_gs.iterrows():
             arrival_dt = safe_parse_date(row.iloc[4]) # Col E
             if pd.isnull(arrival_dt): continue
-
-            # Filter: ONLY TODAY'S DATA
             if arrival_dt.date() != today_date: continue
 
             rake_name = str(row.iloc[1]) # Col B
-            source_val = str(row.iloc[2]) # Col C (Fixed as per request)
+            source_val = str(row.iloc[2]) # Col C (Source/Mine)
             if source_val.lower() == 'nan': source_val = ""
 
             start_dt = safe_parse_date(row.iloc[5])   # Col F
             end_dt = safe_parse_date(row.iloc[6])     # Col G
             
-            # Duration - Try Column I (Index 8)
+            # Duration logic for Actuals (Col I or Calc)
             raw_dur = row.iloc[8]
             total_dur = timedelta(0)
             
@@ -203,34 +176,27 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                         days = float(raw_dur)
                         total_dur = timedelta(days=days)
                 except:
-                    # Fallback to Calc
                     release_dt = safe_parse_date(row.iloc[7])
                     if pd.notnull(release_dt):
                         total_dur = release_dt - arrival_dt
 
             if pd.isnull(start_dt): start_dt = arrival_dt 
 
-            # Demurrage Logic:
-            # 1. Check if column exists AND value is valid number/time
+            # Demurrage
             use_sheet_demurrage = False
             dem_str = "00:00"
-            
             if dem_col_idx != -1:
                 raw_dem_val = row.iloc[dem_col_idx]
                 if is_valid_demurrage_string(raw_dem_val):
                     use_sheet_demurrage = True
                     dem_str = str(raw_dem_val).strip()
-                    # Standardize "2" -> "02:00" if possible
                     try:
-                        if ":" not in dem_str:
-                            dem_str = f"{int(float(dem_str)):02d}:00"
+                        if ":" not in dem_str: dem_str = f"{int(float(dem_str)):02d}:00"
                     except: pass
             
-            # 2. If invalid or missing, Calculate it
             if not use_sheet_demurrage:
                 dem_str, _ = calculate_rounded_demurrage(total_dur, free_time_hours)
 
-            # Tipplers
             used = []
             if pd.notnull(row.iloc[14]) and str(row.iloc[14]).strip() not in ["", "nan"]: used.append("T1")
             if pd.notnull(row.iloc[15]) and str(row.iloc[15]).strip() not in ["", "nan"]: used.append("T2")
@@ -260,29 +226,14 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 '_raw_end_dt': end_dt,
                 '_raw_tipplers': used
             }
-            
             for t in ['T1', 'T2', 'T3', 'T4']:
                 entry[f"{t} Start"] = format_dt(start_dt) if t in used else ""
                 entry[f"{t} End"] = format_dt(end_dt) if t in used else ""
                 entry[f"{t} Idle"] = ""
-            
             actuals.append(entry)
 
-        df_actuals = pd.DataFrame(actuals)
-        
-        tippler_init_state = {}
-        for t in ['T1', 'T2', 'T3', 'T4']:
-            t_max = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
-            if not df_actuals.empty:
-                for _, row in df_actuals.iterrows():
-                    if t in row['_raw_tipplers'] and pd.notnull(row['_raw_end_dt']):
-                        if row['_raw_end_dt'] > t_max: t_max = row['_raw_end_dt']
-            tippler_init_state[t] = t_max
-
-        return df_actuals, tippler_init_state
-
-    except Exception as e:
-        return pd.DataFrame(), {}
+        return pd.DataFrame(actuals), {} # State calc handled elsewhere if needed or just return empty state
+    except: return pd.DataFrame(), {}
 
 # ==========================================
 # 4. CORE SIMULATION LOGIC
@@ -292,58 +243,66 @@ def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state,
                            rates, wagons_first_batch, inter_tippler_delay):
     if wagons == 0: return ready_time, "", ready_time, {}, timedelta(0)
     
-    resources = {t: rates[t] for t in target_tipplers}
-    sorted_tipplers = sorted(resources.keys(), key=lambda x: tippler_state[x])
+    candidates = []
+    for t in target_tipplers:
+        free_at = tippler_state[t]
+        if free_at.tzinfo is None: free_at = IST.localize(free_at)
+        prop_start = max(ready_time, free_at)
+        effective_start = check_downtime_impact(t, prop_start, downtime_list)
+        candidates.append({'id': t, 'rate': rates[t], 'eff_start': effective_start, 'free_at': free_at})
     
-    t_primary = sorted_tipplers[0]
-    t_secondary = sorted_tipplers[1] if len(sorted_tipplers) > 1 else None
+    sorted_tipplers = sorted(candidates, key=lambda x: x['eff_start'])
+    prim = sorted_tipplers[0]
+    t_primary = prim['id']
     
     detailed_timings = {}
-    used_tipplers_list = []
+    used_tipplers_list = [t_primary]
     
-    w_first = min(wagons, wagons_first_batch)
-    w_second = wagons - w_first
+    # Scenario A: Solo
+    finish_A = prim['eff_start'] + timedelta(hours=wagons / prim['rate'])
     
-    free_prim = tippler_state[t_primary]
-    if free_prim.tzinfo is None: free_prim = IST.localize(free_prim)
+    # Scenario B: Split
+    finish_B = pd.NaT
+    sec = None
+    if len(sorted_tipplers) > 1 and wagons > wagons_first_batch:
+        sec = sorted_tipplers[1]
+        w_first = wagons_first_batch
+        w_second = wagons - w_first
+        fin_prim_split = prim['eff_start'] + timedelta(hours=w_first / prim['rate'])
+        start_sec_theory = ready_time + timedelta(minutes=inter_tippler_delay)
+        prop_start_sec = max(start_sec_theory, sec['eff_start'])
+        real_start_sec = check_downtime_impact(sec['id'], prop_start_sec, downtime_list)
+        fin_sec_split = real_start_sec + timedelta(hours=w_second / sec['rate'])
+        finish_B = max(fin_prim_split, fin_sec_split)
     
-    proposed_start_prim = max(ready_time, free_prim)
-    actual_start_prim = check_downtime_impact(t_primary, proposed_start_prim, downtime_list)
+    final_mode = "Solo"
+    if pd.notnull(finish_B) and finish_B <= finish_A: final_mode = "Split"
     
-    idle_gap_primary = max(timedelta(0), actual_start_prim - free_prim)
-    detailed_timings[f"{t_primary}_Idle"] = idle_gap_primary
-    
-    finish_primary = actual_start_prim + timedelta(hours=(w_first / resources[t_primary]))
-    detailed_timings[f"{t_primary}_Start"] = actual_start_prim
-    detailed_timings[f"{t_primary}_End"] = finish_primary
-    
-    overall_finish = finish_primary
-    used_tipplers_list.append(t_primary)
-    total_idle_cost = idle_gap_primary
-    
-    if w_second > 0:
-        if t_secondary:
-            start_sec_theory = ready_time + timedelta(minutes=inter_tippler_delay)
-            free_sec = tippler_state[t_secondary]
-            if free_sec.tzinfo is None: free_sec = IST.localize(free_sec)
-            
-            proposed_start_sec = max(start_sec_theory, free_sec)
-            actual_start_sec = check_downtime_impact(t_secondary, proposed_start_sec, downtime_list)
-            
-            idle_gap_secondary = max(timedelta(0), actual_start_sec - free_sec)
-            detailed_timings[f"{t_secondary}_Idle"] = idle_gap_secondary
-            
-            finish_secondary = actual_start_sec + timedelta(hours=(w_second / resources[t_secondary]))
-            detailed_timings[f"{t_secondary}_Start"] = actual_start_sec
-            detailed_timings[f"{t_secondary}_End"] = finish_secondary
-            
-            overall_finish = max(finish_primary, finish_secondary)
-            used_tipplers_list.append(t_secondary)
-            total_idle_cost += idle_gap_secondary
-        else:
-            finish_extended = finish_primary + timedelta(hours=(w_second / resources[t_primary]))
-            detailed_timings[f"{t_primary}_End"] = finish_extended
-            overall_finish = finish_extended
+    total_idle_cost = timedelta(0)
+    if final_mode == "Split":
+        used_tipplers_list.append(sec['id'])
+        idle_prim = max(timedelta(0), prim['eff_start'] - prim['free_at'])
+        detailed_timings[f"{t_primary}_Idle"] = idle_prim
+        detailed_timings[f"{t_primary}_Start"] = prim['eff_start']
+        detailed_timings[f"{t_primary}_End"] = fin_prim_split
+        total_idle_cost += idle_prim
+        
+        idle_sec = max(timedelta(0), real_start_sec - sec['free_at'])
+        detailed_timings[f"{sec['id']}_Idle"] = idle_sec
+        detailed_timings[f"{sec['id']}_Start"] = real_start_sec
+        detailed_timings[f"{sec['id']}_End"] = fin_sec_split
+        total_idle_cost += idle_sec
+        
+        actual_start_prim = prim['eff_start']
+        overall_finish = finish_B
+    else:
+        idle_prim = max(timedelta(0), prim['eff_start'] - prim['free_at'])
+        detailed_timings[f"{t_primary}_Idle"] = idle_prim
+        detailed_timings[f"{t_primary}_Start"] = prim['eff_start']
+        detailed_timings[f"{t_primary}_End"] = finish_A
+        total_idle_cost += idle_prim
+        actual_start_prim = prim['eff_start']
+        overall_finish = finish_A
 
     return overall_finish, ", ".join(sorted(used_tipplers_list)), actual_start_prim, detailed_timings, total_idle_cost
 
@@ -362,7 +321,7 @@ def find_specific_line(group, entry, status, last_idx):
         if status[l] <= entry: return l
     return cands[0]
 
-def run_full_simulation_initial(df, params, actuals_df, actuals_state):
+def run_full_simulation_initial(df, params, actuals_df):
     rates = {'T1': params['rt1'], 'T2': params['rt2'], 'T3': params['rt3'], 'T4': params['rt4']}
     s_a, s_b, extra_shunt_cross = params['sa'], params['sb'], params['extra_shunt']
     f_a, f_b, ft_hours = params['fa'], params['fb'], params['ft']
@@ -372,21 +331,18 @@ def run_full_simulation_initial(df, params, actuals_df, actuals_state):
     
     # 1. Load Type
     load_col = find_column(df, ['LOAD TYPE', 'CMDT', 'COMMODITY'])
-    if load_col:
-        df = df[df[load_col].astype(str).str.strip().str.upper().str.startswith('BOXN')]
+    if load_col: df = df[df[load_col].astype(str).str.strip().str.upper().str.startswith('BOXN')]
     
     # 2. Wagon Count
     wagon_col = find_column(df, ['TOTL UNTS', 'WAGONS', 'UNITS', 'TOTAL UNITS', 'NO OF WAGONS'])
-    if wagon_col:
-        df['wagon_count'] = df[wagon_col].apply(parse_wagons)
-    else:
-        df['wagon_count'] = 58 
+    if wagon_col: df['wagon_count'] = df[wagon_col].apply(parse_wagons)
+    else: df['wagon_count'] = 58 
 
     # 3. Rake Name
     rake_col = find_column(df, ['RAKE NAME', 'RAKE', 'TRAIN NAME'])
     if not rake_col: return pd.DataFrame(), None 
     
-    # 4. Source Column (CSV) - Prioritize STTS FROM
+    # 4. Source (CSV)
     src_col = find_column(df, ['STTS FROM', 'STTN FROM', 'FROM_STN', 'SRC', 'SOURCE', 'FROM'])
         
     # 5. Arrival Time
@@ -395,7 +351,6 @@ def run_full_simulation_initial(df, params, actuals_df, actuals_state):
     stts_code_col = find_column(df, ['STTS CODE', 'STATUS'])
 
     df['exp_arrival_dt'] = pd.to_datetime(df[arvl_col], errors='coerce').apply(to_ist) if arvl_col else pd.NaT
-    
     if stts_time_col and stts_code_col:
         df['stts_time_dt'] = pd.to_datetime(df[stts_time_col], errors='coerce').apply(to_ist)
         df['arrival_dt'] = df.apply(lambda r: r['stts_time_dt'] if str(r.get(stts_code_col)).strip()=='PL' and pd.notnull(r['stts_time_dt']) else r['exp_arrival_dt'], axis=1)
@@ -404,19 +359,29 @@ def run_full_simulation_initial(df, params, actuals_df, actuals_state):
 
     df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt').reset_index(drop=True)
 
-    # DEDUPLICATE against Actuals
+    # DEDUPLICATE
     if not actuals_df.empty:
         actual_rakes = actuals_df['Rake'].astype(str).tolist()
         df = df[~df[rake_col].astype(str).isin(actual_rakes)]
 
     if df.empty and actuals_df.empty: return pd.DataFrame(), None
 
-    # INITIALIZE STATE
+    # INIT STATE
     first_arrival = df['arrival_dt'].min() if not df.empty else datetime.now(IST)
     sim_start_time = first_arrival.replace(hour=0, minute=0, second=0, microsecond=0)
     if sim_start_time.tzinfo is None: sim_start_time = IST.localize(sim_start_time)
 
-    tippler_state = actuals_state if actuals_state else {k: sim_start_time for k in ['T1', 'T2', 'T3', 'T4']}
+    # Rebuild state from Actuals
+    tippler_state = {k: sim_start_time for k in ['T1', 'T2', 'T3', 'T4']}
+    if not actuals_df.empty:
+        for _, row in actuals_df.iterrows():
+            used_str = str(row['_raw_tipplers'])
+            end_val = row['_raw_end_dt']
+            if pd.notnull(end_val):
+                for t in ['T1', 'T2', 'T3', 'T4']:
+                    if t in used_str and end_val > tippler_state[t]:
+                        tippler_state[t] = end_val
+
     spec_line_status = {8: sim_start_time, 9: sim_start_time, 10: sim_start_time, 11: sim_start_time}
     line_groups = {
         'Group_Lines_8_10': {'capacity': 2, 'clearance_mins': 50, 'line_free_times': []}, 
@@ -427,13 +392,15 @@ def run_full_simulation_initial(df, params, actuals_df, actuals_state):
     
     for _, rake in df.iterrows():
         options = []
-        # Create 4 options logic
         entry_A = get_line_entry_time('Group_Lines_8_10', rake['arrival_dt'], line_groups)
         ready_A = entry_A + timedelta(minutes=s_a)
         fin_A, used_A, start_A, tim_A, idle_A = calculate_generic_finish(
             rake['wagon_count'], ['T1', 'T2'], ready_A, tippler_state, downtimes, rates, w_batch, w_delay)
         
-        dur_A = (fin_A - rake['arrival_dt']) + timedelta(minutes=f_a)
+        # Demurrage Selection Metric (Raw seconds)
+        # Release = Finish + Form; Duration = Release - Arrival; Dem = Dur - Free
+        rel_A = fin_A + timedelta(minutes=f_a)
+        dur_A = rel_A - rake['arrival_dt']
         dem_A_raw = max(0, (dur_A - timedelta(hours=ft_hours)).total_seconds())
 
         options.append({'id': 'Nat_A', 'grp': 'Group_Lines_8_10', 'entry': entry_A, 'ready': ready_A, 'start': start_A, 'fin': fin_A, 'used': used_A, 'timings': tim_A, 'idle': idle_A, 'dem_raw': dem_A_raw, 'extra_shunt': 0.0, 'form_mins': f_a, 'type': 'Standard'})
@@ -442,28 +409,27 @@ def run_full_simulation_initial(df, params, actuals_df, actuals_state):
         ready_B = entry_B + timedelta(minutes=s_b)
         fin_B, used_B, start_B, tim_B, idle_B = calculate_generic_finish(
             rake['wagon_count'], ['T3', 'T4'], ready_B, tippler_state, downtimes, rates, w_batch, w_delay)
-        dur_B = (fin_B - rake['arrival_dt']) + timedelta(minutes=f_b)
+        rel_B = fin_B + timedelta(minutes=f_b)
+        dur_B = rel_B - rake['arrival_dt']
         dem_B_raw = max(0, (dur_B - timedelta(hours=ft_hours)).total_seconds())
-        
         options.append({'id': 'Nat_B', 'grp': 'Group_Line_11', 'entry': entry_B, 'ready': ready_B, 'start': start_B, 'fin': fin_B, 'used': used_B, 'timings': tim_B, 'idle': idle_B, 'dem_raw': dem_B_raw, 'extra_shunt': 0.0, 'form_mins': f_b, 'type': 'Standard'})
 
         ready_A_Cross = ready_A + timedelta(minutes=extra_shunt_cross)
         fin_AX, used_AX, start_AX, tim_AX, idle_AX = calculate_generic_finish(
             rake['wagon_count'], ['T3', 'T4'], ready_A_Cross, tippler_state, downtimes, rates, w_batch, w_delay)
-        dur_AX = (fin_AX - rake['arrival_dt']) + timedelta(minutes=f_a)
+        rel_AX = fin_AX + timedelta(minutes=f_a)
+        dur_AX = rel_AX - rake['arrival_dt']
         dem_AX_raw = max(0, (dur_AX - timedelta(hours=ft_hours)).total_seconds())
-        
         options.append({'id': 'Cross_A', 'grp': 'Group_Lines_8_10', 'entry': entry_A, 'ready': ready_A_Cross, 'start': start_AX, 'fin': fin_AX, 'used': used_AX, 'timings': tim_AX, 'idle': idle_AX, 'dem_raw': dem_AX_raw, 'extra_shunt': float(extra_shunt_cross), 'form_mins': f_a, 'type': 'Cross-Transfer'})
 
         ready_B_Cross = ready_B + timedelta(minutes=extra_shunt_cross)
         fin_BX, used_BX, start_BX, tim_BX, idle_BX = calculate_generic_finish(
             rake['wagon_count'], ['T1', 'T2'], ready_B_Cross, tippler_state, downtimes, rates, w_batch, w_delay)
-        dur_BX = (fin_BX - rake['arrival_dt']) + timedelta(minutes=f_b)
+        rel_BX = fin_BX + timedelta(minutes=f_b)
+        dur_BX = rel_BX - rake['arrival_dt']
         dem_BX_raw = max(0, (dur_BX - timedelta(hours=ft_hours)).total_seconds())
-        
         options.append({'id': 'Cross_B', 'grp': 'Group_Line_11', 'entry': entry_B, 'ready': ready_B_Cross, 'start': start_BX, 'fin': fin_BX, 'used': used_BX, 'timings': tim_BX, 'idle': idle_BX, 'dem_raw': dem_BX_raw, 'extra_shunt': float(extra_shunt_cross), 'form_mins': f_b, 'type': 'Cross-Transfer'})
 
-        # Sort by Demurrage Cost -> Finish Time -> Idle
         best_opt = sorted(options, key=lambda x: (x['dem_raw'], x['fin'], x['idle']))[0]
 
         for k, v in best_opt['timings'].items():
@@ -477,8 +443,9 @@ def run_full_simulation_initial(df, params, actuals_df, actuals_state):
         line_groups[best_opt['grp']]['line_free_times'].append(best_opt['entry'] + timedelta(minutes=line_groups[best_opt['grp']]['clearance_mins']))
         spec_line_status[sel_line] = line_groups[best_opt['grp']]['line_free_times'][-1]
 
-        # Final Rounded Calculation for Display
-        tot_dur_final = (best_opt['fin'] - rake['arrival_dt']) + timedelta(minutes=best_opt['form_mins'])
+        # Calculate Final Stats
+        release_time = best_opt['fin'] + timedelta(minutes=best_opt['form_mins'])
+        tot_dur_final = release_time - rake['arrival_dt']
         dem_str, _ = calculate_rounded_demurrage(tot_dur_final, ft_hours)
 
         row_data = {
@@ -524,33 +491,43 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
     tippler_state = {k: sim_start_dt for k in ['T1', 'T2', 'T3', 'T4']}
     daily_demurrage_hours = {}
     
+    # 1. First Pass: Rebuild Tippler State from Actuals
+    # We must respect actual completion times before simulating delays
     for _, row in edited_df.iterrows():
-        # Handle Actuals
         if row.get('Status') == 'ACTUAL':
             for t in ['T1', 'T2', 'T3', 'T4']:
                 end_str = row.get(f"{t} End")
                 if pd.notnull(end_str) and end_str != "":
                     end_dt = restore_dt(end_str, sim_start_dt)
                     if pd.notnull(end_dt) and end_dt > tippler_state[t]: tippler_state[t] = end_dt
+
+    # 2. Second Pass: Process Rows
+    for _, row in edited_df.iterrows():
+        # --- ACTUALS ---
+        if row.get('Status') == 'ACTUAL':
+            # Demurrage logic: Trust sheet if present, else calc from duration
+            dem_hrs = 0
+            dem_val = str(row['Demurrage']).strip()
             
-            # Use existing Demurrage column for aggregation if valid
-            try:
-                dem_val = row['Demurrage']
-                dem_hrs = 0
-                if ":" in str(dem_val):
-                    dem_hrs = int(dem_val.split(":")[0])
-                elif pd.notnull(dem_val):
-                    # Try converting if it's just a number
-                    try: dem_hrs = int(float(dem_val))
-                    except: 
-                        # Fallback calc if not a direct number/time
-                        dur_str = row['Total Duration']
-                        sign = -1 if dur_str.startswith('-') else 1
-                        parts = dur_str.replace('-','').split(':')
-                        dur_td = timedelta(hours=int(parts[0]), minutes=int(parts[1])) * sign
-                        _, dem_hrs = calculate_rounded_demurrage(dur_td, free_time_hours)
-            except: dem_hrs = 0
-            
+            # If standard "HH:MM", extract hours
+            if ":" in dem_val:
+                try: dem_hrs = int(dem_val.split(":")[0])
+                except: pass
+            # If just a number "2"
+            elif dem_val.isdigit():
+                dem_hrs = int(dem_val)
+            # If 00:00 or empty, recalc
+            elif dem_val in ["00:00", "", "nan"]:
+                # Recalc
+                try:
+                    dur_str = row['Total Duration']
+                    sign = -1 if dur_str.startswith('-') else 1
+                    parts = dur_str.replace('-','').split(':')
+                    dur_td = timedelta(hours=int(parts[0]), minutes=int(parts[1])) * sign
+                    _, dem_hrs = calculate_rounded_demurrage(dur_td, free_time_hours)
+                except: pass
+                
+            # Aggregate stats
             try:
                 arr_dt = pd.to_datetime(row['_Arrival_DT'])
                 if arr_dt.tzinfo is None: arr_dt = IST.localize(arr_dt)
@@ -561,7 +538,7 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
             recalc_rows.append(row)
             continue
             
-        # Handle Simulated
+        # --- SIMULATED ---
         arrival = pd.to_datetime(row['_Arrival_DT'])
         if arrival.tzinfo is None: arrival = IST.localize(arrival)
         ready = pd.to_datetime(row['_Shunt_Ready_DT'])
@@ -595,7 +572,9 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
                 row[f"{t_id} Start"] = format_dt(final_start)
                 row[f"{t_id} End"] = format_dt(new_t_end)
 
-        tot_dur = (max_finish - arrival) + timedelta(minutes=float(row['_Form_Mins']))
+        # UPDATE: Total Duration = (Finish + Form) - Arrival
+        release_time = max_finish + timedelta(minutes=float(row['_Form_Mins']))
+        tot_dur = release_time - arrival
         dem_str, dem_hrs = calculate_rounded_demurrage(tot_dur, free_time_hours)
         
         row['Tippler Start Time'] = format_dt(final_start)
@@ -659,7 +638,6 @@ sim_params['downtimes'] = st.session_state.downtimes
 # 6. MAIN EXECUTION
 # ==========================================
 
-# 1. LIVE GOOGLE SHEET DISPLAY (BEFORE UPLOAD)
 if gs_url and 'actuals_df_disp' not in st.session_state:
     st.session_state.actuals_df_disp = pd.DataFrame()
     
@@ -679,7 +657,6 @@ if 'actuals_df_disp' in st.session_state and not st.session_state.actuals_df_dis
 else:
     st.info("Loading Google Sheet data or no data found for today...")
 
-# 2. FILE UPLOAD & PROCESSING
 uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
 
 input_changed = False
@@ -717,11 +694,12 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_act = st.session_state.get('actuals_df', pd.DataFrame())
     st_act = st.session_state.get('actuals_state', {})
     
-    sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, st_act)
-    st.session_state.sim_result = sim_result
-    st.session_state.sim_start_dt = sim_start_dt
+    if input_changed or 'sim_result' not in st.session_state:
+        sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act) # Fixed func sig
+        st.session_state.sim_result = sim_result
+        st.session_state.sim_start_dt = sim_start_dt
 
-    if not st.session_state.sim_result.empty:
+    if 'sim_result' in st.session_state and not st.session_state.sim_result.empty:
         col_cfg = {
             "Rake": st.column_config.TextColumn("Rake Name", disabled=True),
             "Coal Source": st.column_config.TextColumn("Source/Mine", disabled=True),
@@ -733,6 +711,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
         }
         
         st.markdown("### 📝 Master Schedule (Actuals + Forecast)")
+        
         edited_df = st.data_editor(
             st.session_state.sim_result, 
             use_container_width=True, 
@@ -748,4 +727,3 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
         st.dataframe(pd.DataFrame(list(daily_stats.items()), columns=['Date', 'Total Hours']).assign(Demurrage=lambda x: x['Total Hours'].apply(lambda h: f"{int(h)} Hours"))[['Date', 'Demurrage']], hide_index=True)
         
         st.download_button("📥 Download Final Report", final_result.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
-
