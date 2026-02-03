@@ -121,23 +121,21 @@ def is_valid_demurrage_string(val):
 def parse_last_sequence(rake_name):
     """
     Parses '18/1498' to return (18, 1498).
-    If just '1498', returns (0, 1498).
     """
     try:
         s = str(rake_name).strip()
-        # Pattern: Number / Number
-        match_slash = re.search(r'(\d+)\s*[/-]\s*(\d+)', s)
-        if match_slash:
-            return int(match_slash.group(1)), int(match_slash.group(2))
+        # Look for "Number / Number" or "Number - Number"
+        match_complex = re.search(r'(\d+)\D+(\d+)', s)
+        if match_complex:
+            return int(match_complex.group(1)), int(match_complex.group(2))
         
-        # Fallback: Just one number
-        match_single = re.search(r'(\d+)', s)
+        # Fallback: Just one number found?
+        match_single = re.search(r'^(\d+)', s)
         if match_single:
-            # Assume it's the second part ID if it's large, else seq
-            num = int(match_single.group(1))
-            if num > 1000: return 0, num
-            return num, 0
-            
+            val = int(match_single.group(1))
+            # Heuristic: If number > 1000, assumes it's the second part (ID)
+            if val > 1000: return 0, val
+            return val, 0
     except: pass
     return 0, 0
 
@@ -160,25 +158,35 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         df_headers = pd.read_csv(url, nrows=0) 
         df_gs = pd.read_csv(url, header=None, skiprows=1) # Data only
         
-        dem_col_idx = -1 # Column K is index 10 (0-based)
-        if len(df_gs.columns) >= 11:
-             dem_col_idx = 10 # Force K
-
-        if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), (0,0)
+        # STRICT MAPPING
+        # Col B (1): Rake Name
+        # Col C (2): Source
+        # Col E (4): Receipt
+        # Col F (5): Placement
+        # Col G (6): Unload End
+        # Col H (7): Release
+        # Col I (8): Duration
+        # Col K (10): Demurrage (STRICTLY)
+        # Col O-R (14-17): Tipplers
 
         actuals = []
         today_date = datetime.now(IST).date()
         last_seq_tuple = (0, 0)
 
+        if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), (0,0)
+
         for _, row in df_gs.iterrows():
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
-            # --- Sequence Tracking ---
+            # --- Sequence Tracking (Crucial for renaming Forecast) ---
             rake_name = str(row.iloc[1])
             seq, rid = parse_last_sequence(rake_name)
-            # Update max found
-            if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
+            
+            # Keep the highest sequence found
+            if seq > last_seq_tuple[0]:
+                last_seq_tuple = (seq, rid)
+            elif seq == last_seq_tuple[0] and rid > last_seq_tuple[1]:
                 last_seq_tuple = (seq, rid)
 
             if arrival_dt.date() != today_date: continue
@@ -189,7 +197,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             start_dt = safe_parse_date(row.iloc[5])
             end_dt = safe_parse_date(row.iloc[6])
             
-            # Duration (Col I - Index 8)
+            # Duration (Col I)
             raw_dur = row.iloc[8]
             total_dur = timedelta(0)
             if pd.notnull(raw_dur):
@@ -254,6 +262,9 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 entry[f"{t} Idle"] = ""
             
             actuals.append(entry)
+
+        # Force valid tuple if none found
+        if last_seq_tuple == (0, 0): last_seq_tuple = (0, 0)
 
         return pd.DataFrame(actuals), pd.DataFrame(), last_seq_tuple
 
@@ -433,7 +444,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
     curr_id = last_seq_tuple[1]
 
     for _, rake in plan_df.iterrows():
-        # GENERATE NEW RAKE NAME (Sequential)
+        # GENERATE NEW RAKE NAME (Purely Sequential)
         curr_seq += 1
         curr_id += 1
         display_name = f"{curr_seq}/{curr_id}"
@@ -661,6 +672,15 @@ sim_params['downtimes'] = st.session_state.downtimes
 # 6. MAIN EXECUTION
 # ==========================================
 
+# 1. SILENT LOADING (No Table Display)
+if gs_url:
+    try:
+        # Load data to state if missing
+        if 'actuals_df' not in st.session_state or st.session_state.actuals_df.empty:
+             df_disp, _, _ = fetch_google_sheet_actuals(gs_url, sim_params['ft'])
+    except: pass
+
+# 2. FILE UPLOAD & PROCESSING
 uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
 
 input_changed = False
