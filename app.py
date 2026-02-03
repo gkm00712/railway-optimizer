@@ -94,30 +94,15 @@ def find_column(df, candidates):
         if cand_upper in cols_upper:
             return df.columns[cols_upper.index(cand_upper)]
         for c in cols_upper:
-            if cand_upper == c: 
-                 return df.columns[cols_upper.index(c)]
+            if cand_upper == c: return df.columns[cols_upper.index(c)]
     return None
 
-def is_valid_demurrage_string(val):
-    s = str(val).strip()
-    if not s or s.lower() == 'nan': return False
-    if re.match(r'^\d{1,2}:\d{2}$', s): return True
-    try:
-        float(s)
-        return True
-    except:
-        return False
-
 def parse_last_sequence(rake_name):
-    """
-    Parses '18/1498' to return (18, 1498).
-    """
     try:
         s = str(rake_name).strip()
         match_complex = re.search(r'(\d+)\D+(\d+)', s)
         if match_complex:
             return int(match_complex.group(1)), int(match_complex.group(2))
-        
         match_single = re.search(r'^(\d+)', s)
         if match_single:
             val = int(match_single.group(1))
@@ -132,8 +117,6 @@ def parse_tippler_cell(cell_value, ref_date):
     """
     if pd.isnull(cell_value): return pd.NaT, pd.NaT
     s = str(cell_value).strip()
-    
-    # Regex: Look for HH:MM-HH:MM inside parens
     match = re.search(r'\((\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\)', s)
     if match:
         start_str, end_str = match.group(1), match.group(2)
@@ -146,13 +129,16 @@ def parse_tippler_cell(cell_value, ref_date):
             start_dt = ref_date.replace(hour=s_h, minute=s_m, second=0, microsecond=0)
             end_dt = ref_date.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
             
-            # Handle day rollover (e.g. 23:00 to 01:00)
             if end_dt < start_dt:
                 end_dt += timedelta(days=1)
-                
+            
+            # Robustness: If start time is way earlier than ref date (e.g. prev day), adjust
+            if (start_dt - ref_date).total_seconds() < -43200: # 12 hours ago
+                 start_dt += timedelta(days=1)
+                 end_dt += timedelta(days=1)
+
             return start_dt, end_dt
         except: pass
-        
     return pd.NaT, pd.NaT
 
 # ==========================================
@@ -171,10 +157,6 @@ def safe_parse_date(val):
 def fetch_google_sheet_actuals(url, free_time_hours):
     try:
         df_gs = pd.read_csv(url, header=None, skiprows=1) 
-        
-        # Determine Demurrage Column Index (Usually K / 10)
-        dem_col_idx = 10 
-
         if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), (0,0)
 
         actuals = []
@@ -185,7 +167,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
-            # Sequence Tracking
             rake_name = str(row.iloc[1])
             seq, rid = parse_last_sequence(rake_name)
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
@@ -193,17 +174,17 @@ def fetch_google_sheet_actuals(url, free_time_hours):
 
             if arrival_dt.date() != today_date: continue
 
-            source_val = str(row.iloc[2]) # Col C
+            source_val = str(row.iloc[2]) 
             if source_val.lower() == 'nan': source_val = ""
             
-            # Load Type Inference
+            # Load Type Logic: Check for BOBR in name if column is missing, or trust logic later
+            # Usually Load Type is not in G-Sheet explicit columns, assume BOXN unless name says otherwise
             load_type = 'BOXN'
             if 'BOBR' in str(row.iloc[1]).upper(): load_type = 'BOBR'
 
             start_dt = safe_parse_date(row.iloc[5])
             end_dt = safe_parse_date(row.iloc[6])
             
-            # Duration (Col I)
             raw_dur = row.iloc[8]
             total_dur = timedelta(0)
             if pd.notnull(raw_dur):
@@ -218,7 +199,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
 
             if pd.isnull(start_dt): start_dt = arrival_dt 
 
-            # Demurrage (Col K)
             dem_str = "00:00"
             raw_dem = row.iloc[10] 
             if pd.notnull(raw_dem) and str(raw_dem).strip() != "":
@@ -226,11 +206,10 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 if ":" in clean: dem_str = clean
                 elif clean.replace('.','',1).isdigit(): dem_str = f"{int(float(clean)):02d}:00"
             
-            # Parse Tipplers (O-R)
             tippler_timings = {}
             used_tipplers = []
             
-            # Mapping: T1->14, T2->15, T3->16, T4->17
+            # Parse O, P, Q, R
             for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
                 cell_val = row.iloc[idx]
                 if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
@@ -239,7 +218,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                         used_tipplers.append(t_name)
                         tippler_timings[f"{t_name} Start"] = format_dt(ts)
                         tippler_timings[f"{t_name} End"] = format_dt(te)
-                        tippler_timings[f"{t_name}_Obj_End"] = te # Internal state use
+                        tippler_timings[f"{t_name}_Obj_End"] = te
 
             entry = {
                 'Rake': rake_name,
@@ -353,15 +332,6 @@ def get_line_entry_time(group, arrival, line_groups):
     if len(active) < grp['capacity']: return arrival
     return active[len(active) - grp['capacity']]
 
-def find_specific_line(group, entry, status, last_idx):
-    cands = [8, 9, 10] if group == 'Group_Lines_8_10' else [11]
-    if group == 'Group_Lines_8_10':
-        start = (last_idx + 1) % 3
-        cands = cands[start:] + cands[:start]
-    for l in cands:
-        if status[l] <= entry: return l
-    return cands[0]
-
 def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
     rates = {'T1': params['rt1'], 'T2': params['rt2'], 'T3': params['rt3'], 'T4': params['rt4']}
     s_a, s_b, extra_shunt_cross = params['sa'], params['sb'], params['extra_shunt']
@@ -370,14 +340,13 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
 
     to_plan = []
     
-    # Process Forecast (CSV)
     if not df_csv.empty:
         df = df_csv.copy()
         
-        # 1. ALLOW BOXN & BOBR
+        # 1. ALLOW BOXN & BOBR (RELAXED MATCH)
         load_col = find_column(df, ['LOAD TYPE', 'CMDT', 'COMMODITY'])
         if load_col:
-            # Filter for BOTH types
+            # Filter: Check if string contains BOXN OR BOBR (case insensitive)
             df = df[df[load_col].astype(str).str.upper().str.contains('BOXN|BOBR', regex=True, na=False)]
         
         wagon_col = find_column(df, ['TOTL UNTS', 'WAGONS', 'UNITS', 'TOTAL UNITS'])
@@ -399,7 +368,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
             
             df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt')
 
-            # DEDUPLICATION
             existing_times = set()
             if not df_locked.empty:
                 existing_times.update(df_locked['_Arrival_DT'].dt.floor('min'))
@@ -407,7 +375,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
             for _, row in df.iterrows():
                 if row['arrival_dt'].floor('min') in existing_times: continue 
                 
-                # Check Load Type for specific logic
                 l_type = row.get(load_col, 'BOXN') if load_col else 'BOXN'
 
                 to_plan.append({
@@ -434,20 +401,17 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
     sim_start_time = first_arrival.replace(hour=0, minute=0, second=0, microsecond=0)
     if sim_start_time.tzinfo is None: sim_start_time = IST.localize(sim_start_time)
 
-    # REBUILD STATE from Locked Actuals (Using Parsed timings)
     tippler_state = {k: sim_start_time for k in ['T1', 'T2', 'T3', 'T4']}
     if not df_locked.empty:
         for _, row in df_locked.iterrows():
-            # Try to get specific parsed times first
-            raw_data = row.get('_raw_tipplers_data', {})
+            raw_t_data = row.get('_raw_tipplers_data', {})
             parsed_found = False
             for t in ['T1', 'T2', 'T3', 'T4']:
-                t_end_obj = raw_data.get(f"{t}_Obj_End")
+                t_end_obj = raw_t_data.get(f"{t}_Obj_End")
                 if pd.notnull(t_end_obj):
                     if t_end_obj > tippler_state[t]: tippler_state[t] = t_end_obj
                     parsed_found = True
             
-            # Fallback to general end time if parsing failed
             if not parsed_found:
                 used_str = str(row['_raw_tipplers'])
                 end_val = row['_raw_end_dt']
@@ -456,26 +420,18 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
                         if t in used_str and end_val > tippler_state[t]:
                             tippler_state[t] = end_val
 
-    spec_line_status = {8: sim_start_time, 9: sim_start_time, 10: sim_start_time, 11: sim_start_time}
-    line_groups = {
-        'Group_Lines_8_10': {'capacity': 2, 'clearance_mins': 50, 'line_free_times': []}, 
-        'Group_Line_11': {'capacity': 1, 'clearance_mins': 100, 'line_free_times': []}
-    }
-    rr_tracker_A = -1 
-    assignments = []
-    
+    line_groups = {'Group_Lines_8_10': {'capacity': 2, 'clearance_mins': 50, 'line_free_times': []}}
     curr_seq = last_seq_tuple[0]
     curr_id = last_seq_tuple[1]
+    assignments = []
 
     for _, rake in plan_df.iterrows():
-        # GENERATE NEW RAKE NAME
         curr_seq += 1
         curr_id += 1
         display_name = f"{curr_seq}/{curr_id}"
         
         is_bobr = 'BOBR' in str(rake['Load Type']).upper()
 
-        # BOBR: No Tippler Assignment
         if is_bobr:
             row_data = {
                 'Rake': display_name,
@@ -503,23 +459,11 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
             assignments.append(row_data)
             continue
 
-        # BOXN: Standard Logic
-        options = []
         entry_A = get_line_entry_time('Group_Lines_8_10', rake['_Arrival_DT'], line_groups)
         ready_A = entry_A + timedelta(minutes=s_a)
         fin_A, used_A, start_A, tim_A, idle_A = calculate_generic_finish(
             rake['Wagons'], ['T1', 'T2'], ready_A, tippler_state, downtimes, rates, w_batch, w_delay)
         
-        rel_A = fin_A + timedelta(minutes=f_a)
-        dur_A = rel_A - rake['_Arrival_DT']
-        dem_A_raw = max(0, (dur_A - timedelta(hours=ft_hours)).total_seconds())
-
-        options.append({'id': 'Nat_A', 'grp': 'Group_Lines_8_10', 'entry': entry_A, 'ready': ready_A, 'start': start_A, 'fin': fin_A, 'used': used_A, 'timings': tim_A, 'idle': idle_A, 'dem_raw': dem_A_raw, 'extra_shunt': 0.0, 'form_mins': f_a, 'type': 'Standard'})
-
-        # ... (Other options B, Cross A, Cross B - Simplified for brevity but logic stands)
-        # Using Option A logic mainly for stability here
-        
-        # Commit State
         for k, v in tim_A.items():
             if 'End' in k: tippler_state[k.split('_')[0]] = v
         
@@ -559,7 +503,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
     df_sim = pd.DataFrame(assignments)
     
     if not df_locked.empty:
-        # Clean internal cols before merge
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers']
         actuals_clean = df_locked.drop(columns=[c for c in cols_to_drop if c in df_locked.columns], errors='ignore')
         final_df = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
@@ -654,7 +597,8 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
         for d in unique_dates:
             st.markdown(f"### 📅 Schedule for {d.strftime('%d-%b-%Y')}")
             day_df = df_final[df_final['Date'] == d].copy()
-            day_df.index = np.arange(1, len(day_df) + 1) # 1-Based Indexing
+            # 1-Based Indexing
+            day_df.index = np.arange(1, len(day_df) + 1)
             
             st.data_editor(
                 day_df,
