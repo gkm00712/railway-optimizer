@@ -65,11 +65,20 @@ def format_duration_hhmm(delta):
     return f"{sign}{hours:02d}:{minutes:02d}"
 
 def calculate_rounded_demurrage(duration_delta, free_time_hours):
+    """
+    1. Subtract Free Time from Total Duration.
+    2. If result <= 0, Demurrage = 0.
+    3. If result > 0, Round UP to nearest whole hour (Ceiling).
+    """
     if pd.isnull(duration_delta): return "00:00", 0
+    
     total_minutes = duration_delta.total_seconds() / 60
     free_minutes = free_time_hours * 60
     demurrage_minutes = total_minutes - free_minutes
+    
     if demurrage_minutes <= 0: return "00:00", 0
+    
+    # Ceiling logic
     rounded_hours = math.ceil(demurrage_minutes / 60)
     return f"{int(rounded_hours):02d}:00", rounded_hours
 
@@ -77,6 +86,7 @@ def check_downtime_impact(tippler_id, proposed_start, downtime_list):
     if proposed_start.tzinfo is None: proposed_start = IST.localize(proposed_start)
     relevant_dts = [d for d in downtime_list if d['Tippler'] == tippler_id]
     relevant_dts.sort(key=lambda x: x['Start'])
+    
     current_start = proposed_start
     changed = True
     while changed:
@@ -91,32 +101,48 @@ def find_column(df, candidates):
     cols_upper = [str(c).upper().strip() for c in df.columns]
     for cand in candidates:
         cand_upper = cand.upper().strip()
-        if cand_upper in cols_upper: return df.columns[cols_upper.index(cand_upper)]
+        if cand_upper in cols_upper:
+            return df.columns[cols_upper.index(cand_upper)]
         for c in cols_upper:
-            if cand_upper == c: return df.columns[cols_upper.index(c)]
+            if cand_upper == c: 
+                 return df.columns[cols_upper.index(c)]
     return None
+
+def is_valid_demurrage_string(val):
+    s = str(val).strip()
+    if not s or s.lower() == 'nan': return False
+    if re.match(r'^\d{1,2}:\d{2}$', s): return True
+    try:
+        float(s)
+        return True
+    except:
+        return False
 
 def parse_last_sequence(rake_name):
     """
-    Parses '148/1479' to return (148, 1479).
-    Returns (0,0) if format doesn't match.
+    Parses '18/1498' to return (18, 1498).
+    If just '1498', returns (0, 1498).
     """
     try:
-        # Regex to find two numbers separated by a non-digit
-        match = re.search(r'(\d+)\D+(\d+)', str(rake_name))
-        if match:
-            return int(match.group(1)), int(match.group(2))
+        s = str(rake_name).strip()
+        # Pattern: Number / Number
+        match_slash = re.search(r'(\d+)\s*[/-]\s*(\d+)', s)
+        if match_slash:
+            return int(match_slash.group(1)), int(match_slash.group(2))
         
-        # Fallback: Just one number?
-        match_single = re.search(r'^(\d+)', str(rake_name))
+        # Fallback: Just one number
+        match_single = re.search(r'(\d+)', s)
         if match_single:
-            return int(match_single.group(1)), 0
+            # Assume it's the second part ID if it's large, else seq
+            num = int(match_single.group(1))
+            if num > 1000: return 0, num
+            return num, 0
             
     except: pass
     return 0, 0
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (Cached & Strict)
+# 3. GOOGLE SHEET PARSER (Cached)
 # ==========================================
 
 def safe_parse_date(val):
@@ -125,25 +151,20 @@ def safe_parse_date(val):
         dt = pd.to_datetime(val, dayfirst=True, errors='coerce') 
         if pd.isnull(dt): return pd.NaT 
         return to_ist(dt)
-    except: return pd.NaT
+    except:
+        return pd.NaT
 
 @st.cache_data(ttl=60)
 def fetch_google_sheet_actuals(url, free_time_hours):
     try:
-        df_gs = pd.read_csv(url, header=None, skiprows=1) # Data only, Skip header row
+        df_headers = pd.read_csv(url, nrows=0) 
+        df_gs = pd.read_csv(url, header=None, skiprows=1) # Data only
         
-        if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), (0,0)
+        dem_col_idx = -1 # Column K is index 10 (0-based)
+        if len(df_gs.columns) >= 11:
+             dem_col_idx = 10 # Force K
 
-        # STRICT MAPPING
-        # Col B (1): Rake Name
-        # Col C (2): Source
-        # Col E (4): Receipt
-        # Col F (5): Placement
-        # Col G (6): Unload End
-        # Col H (7): Release
-        # Col I (8): Duration
-        # Col K (10): Demurrage (STRICTLY)
-        # Col O-R (14-17): Tipplers
+        if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), (0,0)
 
         actuals = []
         today_date = datetime.now(IST).date()
@@ -153,21 +174,22 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
-            # Capture sequence for continuation
+            # --- Sequence Tracking ---
             rake_name = str(row.iloc[1])
             seq, rid = parse_last_sequence(rake_name)
-            if seq > last_seq_tuple[0]:
+            # Update max found
+            if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
                 last_seq_tuple = (seq, rid)
 
             if arrival_dt.date() != today_date: continue
 
-            source_val = str(row.iloc[2]) 
+            source_val = str(row.iloc[2]) # Col C
             if source_val.lower() == 'nan': source_val = ""
 
             start_dt = safe_parse_date(row.iloc[5])
             end_dt = safe_parse_date(row.iloc[6])
             
-            # Duration (Col I)
+            # Duration (Col I - Index 8)
             raw_dur = row.iloc[8]
             total_dur = timedelta(0)
             if pd.notnull(raw_dur):
@@ -185,25 +207,17 @@ def fetch_google_sheet_actuals(url, free_time_hours):
 
             # Demurrage: STRICTLY Column K (Index 10)
             dem_str = "00:00"
-            raw_dem = row.iloc[10] # Column K
+            raw_dem = row.iloc[10] 
             
             if pd.notnull(raw_dem) and str(raw_dem).strip() != "":
                 clean_dem = str(raw_dem).strip()
-                # Check if it looks like a number
                 try:
-                    # If just "2", make it "02:00"
                     if clean_dem.replace('.', '', 1).isdigit():
                         dem_str = f"{int(float(clean_dem)):02d}:00"
-                    # If "02:00", keep it
                     elif ":" in clean_dem:
                         dem_str = clean_dem
                 except: pass
             
-            # If Col K was empty, fallback to calc? No, user said "take directly".
-            # If empty, we leave it as 00:00 or Calc? 
-            # "take demurrage ... directly ... whereas calculate for forecast"
-            # I will assume if Col K is missing, it's 0.
-
             used = []
             if pd.notnull(row.iloc[14]) and str(row.iloc[14]).strip() not in ["", "nan"]: used.append("T1")
             if pd.notnull(row.iloc[15]) and str(row.iloc[15]).strip() not in ["", "nan"]: used.append("T2")
@@ -363,7 +377,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
             
             df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt')
 
-            # DEDUPLICATION CHECK (By Arrival Time)
+            # DEDUPLICATION
             existing_times = set()
             if not df_locked.empty:
                 existing_times.update(df_locked['_Arrival_DT'].dt.floor('min'))
@@ -415,12 +429,11 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
     rr_tracker_A = -1 
     assignments = []
     
-    # Initialize Counters from Google Sheet
     curr_seq = last_seq_tuple[0]
     curr_id = last_seq_tuple[1]
 
     for _, rake in plan_df.iterrows():
-        # GENERATE NEW RAKE NAME
+        # GENERATE NEW RAKE NAME (Sequential)
         curr_seq += 1
         curr_id += 1
         display_name = f"{curr_seq}/{curr_id}"
@@ -522,7 +535,7 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
     tippler_state = {k: sim_start_dt for k in ['T1', 'T2', 'T3', 'T4']}
     daily_demurrage_hours = {}
     
-    # 1. State Rebuild
+    # Pass 1: State
     for _, row in edited_df.iterrows():
         if row.get('Status') == 'ACTUAL':
             for t in ['T1', 'T2', 'T3', 'T4']:
@@ -531,20 +544,17 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
                     end_dt = restore_dt(end_str, sim_start_dt)
                     if pd.notnull(end_dt) and end_dt > tippler_state[t]: tippler_state[t] = end_dt
 
-    # 2. Process
+    # Pass 2: Calc
     for _, row in edited_df.iterrows():
-        # --- ACTUALS (Google Sheet Data) ---
+        # Actuals
         if row.get('Status') == 'ACTUAL':
             dem_hrs = 0
             dem_val = str(row['Demurrage']).strip()
-            
-            # Extract number from "02:00" or "2"
             if ":" in dem_val:
                 try: dem_hrs = int(dem_val.split(":")[0])
                 except: pass
-            elif dem_val.isdigit(): 
-                dem_hrs = int(dem_val)
-                
+            elif dem_val.isdigit(): dem_hrs = int(dem_val)
+            
             try:
                 arr_dt = pd.to_datetime(row['_Arrival_DT'])
                 if arr_dt.tzinfo is None: arr_dt = IST.localize(arr_dt)
@@ -555,7 +565,7 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
             recalc_rows.append(row)
             continue
             
-        # --- FORECAST (CSV Data) ---
+        # Simulated
         arrival = pd.to_datetime(row['_Arrival_DT'])
         if arrival.tzinfo is None: arrival = IST.localize(arrival)
         ready = pd.to_datetime(row['_Shunt_Ready_DT'])
