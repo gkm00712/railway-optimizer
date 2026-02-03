@@ -156,26 +156,40 @@ def parse_last_sequence(rake_name):
 
 def parse_tippler_cell(cell_value, ref_date):
     """
-    Parses '13(06:40-08:45)' -> Returns (Start_DT, End_DT)
+    Parses ANY text containing times like "06:40" and "08:45"
+    Returns (Start_DT, End_DT) if at least 2 times are found.
     """
     if pd.isnull(cell_value): return pd.NaT, pd.NaT
     s = str(cell_value).strip()
-    match = re.search(r'\((\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\)', s)
-    if match:
-        start_str, end_str = match.group(1), match.group(2)
+    
+    # NEW: Find ALL matches of HH:MM pattern
+    times_found = re.findall(r'(\d{1,2}:\d{2})', s)
+    
+    if len(times_found) >= 2:
+        start_str = times_found[0]
+        end_str = times_found[1] # Take first two distinct times
+        
         try:
             if ref_date.tzinfo is None: ref_date = IST.localize(ref_date)
+            
             s_h, s_m = map(int, start_str.split(':'))
             e_h, e_m = map(int, end_str.split(':'))
+            
             start_dt = ref_date.replace(hour=s_h, minute=s_m, second=0, microsecond=0)
             end_dt = ref_date.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
-            # Handle day rollover
-            if end_dt < start_dt: end_dt += timedelta(days=1)
-            # Heuristic for previous day start
-            if (start_dt - ref_date).total_seconds() < -43200: 
-                 start_dt += timedelta(days=1); end_dt += timedelta(days=1)
+            
+            # Handle Day Rollover (End < Start)
+            if end_dt < start_dt:
+                end_dt += timedelta(days=1)
+                
+            # Handle Start Time Rollover (If Start is earlier than Arrival by >12 hrs, assume next day)
+            if start_dt < ref_date: # Simple check: Unload cannot start before arrival
+                 start_dt += timedelta(days=1)
+                 end_dt += timedelta(days=1)
+
             return start_dt, end_dt
         except: pass
+        
     return pd.NaT, pd.NaT
 
 # ==========================================
@@ -219,25 +233,26 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             load_type = 'BOXN'
             if 'BOBR' in str(row.iloc[1]).upper(): load_type = 'BOBR'
 
-            # Global Start/End
+            # Global Start/End fallback
             start_dt = safe_parse_date(row.iloc[5])
             end_dt = safe_parse_date(row.iloc[6])
-            if pd.isnull(start_dt): start_dt = arrival_dt # Fallback
+            if pd.isnull(start_dt): start_dt = arrival_dt 
             
-            # --- TIPPLER PARSING (With Fallback) ---
+            # --- TIPPLER PARSING (Robust) ---
             tippler_timings = {}
             used_tipplers = []
             
             for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
                 cell_val = row.iloc[idx]
+                # Is cell populated?
                 if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
-                    # 1. Try to parse specific times
+                    # 1. Try to find specific HH:MM times
                     ts, te = parse_tippler_cell(cell_val, arrival_dt)
                     
-                    # 2. Fallback: If cell is not empty but no specific time found, use Global Rake Times
+                    # 2. Fallback: If cell has data (e.g. "13") but no times found, use Global Rake Times
                     if pd.isnull(ts) and pd.notnull(start_dt):
                         ts = start_dt
-                        te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2) # Default duration if missing
+                        te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2)
                     
                     if pd.notnull(ts):
                         used_tipplers.append(t_name)
@@ -246,7 +261,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                         tippler_timings[f"{t_name}_Obj_End"] = te
 
             # --- DECISION: LOCKED OR UNPLANNED? ---
-            # Send to optimizer if no tipplers found AND it's not BOBR (BOBR doesn't use tipplers)
             if not used_tipplers and load_type != 'BOBR':
                 unplanned_actuals.append({
                     'Coal Source': source_val,
@@ -399,6 +413,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     f_a, f_b, ft_hours = params['fa'], params['fb'], params['ft']
     w_batch, w_delay, downtimes = params['wb'], params['wd'], params['downtimes']
 
+    # 1. Prepare Plan List
     to_plan = []
     
     if not df_unplanned.empty:
