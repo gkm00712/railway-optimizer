@@ -7,57 +7,13 @@ import numpy as np
 import re
 
 # ==========================================
-# 1. PAGE CONFIGURATION & INPUTS (Moved to Top)
+# 1. PAGE CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="Railway Logic Optimizer (IST)", layout="wide")
 st.title("🚂 BOXN & BOBR Rake Logistics Dashboard (IST)")
 
 # Define IST Timezone
 IST = pytz.timezone('Asia/Kolkata')
-
-# --- SIDEBAR INPUTS (Defined Early to prevent NameError) ---
-st.sidebar.header("⚙️ Settings")
-# Initialize gs_url immediately
-gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
-
-st.sidebar.markdown("---")
-sim_params = {}
-sim_params['rt1'] = st.sidebar.number_input("Tippler 1 Rate", value=6.0, step=0.5)
-sim_params['rt2'] = st.sidebar.number_input("Tippler 2 Rate", value=6.0, step=0.5)
-sim_params['rt3'] = st.sidebar.number_input("Tippler 3 Rate", value=9.0, step=0.5)
-sim_params['rt4'] = st.sidebar.number_input("Tippler 4 Rate", value=9.0, step=0.5)
-st.sidebar.markdown("---")
-sim_params['sa'] = st.sidebar.number_input("Pair A Shunt (Mins)", value=25.0, step=5.0)
-sim_params['sb'] = st.sidebar.number_input("Pair B Shunt (Mins)", value=50.0, step=5.0)
-sim_params['extra_shunt'] = st.sidebar.number_input("Cross-Pair Penalty (Mins)", value=45.0, step=5.0)
-st.sidebar.markdown("---")
-sim_params['fa'] = st.sidebar.number_input("Pair A Formation (Mins)", value=20.0, step=5.0)
-sim_params['fb'] = st.sidebar.number_input("Pair B Formation (Mins)", value=50.0, step=5.0)
-sim_params['ft'] = st.sidebar.number_input("Free Time (Hours)", value=7.0, step=0.5)
-sim_params['wb'] = st.sidebar.number_input("Wagons 1st Batch", value=30, step=1)
-sim_params['wd'] = st.sidebar.number_input("Delay 2nd Tippler (Mins)", value=0.0, step=5.0)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🛠️ Tippler Downtime")
-if 'downtimes' not in st.session_state: st.session_state.downtimes = []
-with st.sidebar.form("downtime_form"):
-    dt_tippler = st.selectbox("Select Tippler", ["T1", "T2", "T3", "T4"])
-    now_ist = datetime.now(IST)
-    dt_start_date = st.date_input("Start Date", value=now_ist.date())
-    dt_start_time = st.time_input("Start Time", value=now_ist.time())
-    dt_duration = st.number_input("Duration (Minutes)", min_value=15, step=15, value=60)
-    if st.form_submit_button("Add Downtime"):
-        start_dt = IST.localize(datetime.combine(dt_start_date, dt_start_time))
-        st.session_state.downtimes.append({"Tippler": dt_tippler, "Start": start_dt, "End": start_dt + timedelta(minutes=dt_duration)})
-        st.rerun()
-
-if st.session_state.downtimes:
-    dt_df = pd.DataFrame(st.session_state.downtimes)
-    st.sidebar.dataframe(dt_df.assign(Start=lambda x: x['Start'].dt.strftime('%d-%H:%M'), End=lambda x: x['End'].dt.strftime('%d-%H:%M'))[['Tippler', 'Start', 'End']], use_container_width=True)
-    if st.sidebar.button("Clear Downtimes"):
-        st.session_state.downtimes = []
-        st.rerun()
-sim_params['downtimes'] = st.session_state.downtimes
 
 # ==========================================
 # 2. HELPER FUNCTIONS
@@ -156,6 +112,9 @@ def parse_last_sequence(rake_name):
     return 0, 0
 
 def parse_tippler_cell(cell_value, ref_date):
+    """
+    Parses '13(06:40-08:45)' -> Returns (Start_DT, End_DT)
+    """
     if pd.isnull(cell_value): return pd.NaT, pd.NaT
     s = str(cell_value).strip()
     match = re.search(r'\((\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\)', s)
@@ -163,23 +122,20 @@ def parse_tippler_cell(cell_value, ref_date):
         start_str, end_str = match.group(1), match.group(2)
         try:
             if ref_date.tzinfo is None: ref_date = IST.localize(ref_date)
-            
             s_h, s_m = map(int, start_str.split(':'))
             e_h, e_m = map(int, end_str.split(':'))
-            
             start_dt = ref_date.replace(hour=s_h, minute=s_m, second=0, microsecond=0)
             end_dt = ref_date.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
-            
-            # Handle crossover (next day)
-            if end_dt < start_dt:
-                end_dt += timedelta(days=1)
-                
+            if end_dt < start_dt: end_dt += timedelta(days=1)
+            # Adjust day if vastly different (heuristic for previous day start)
+            if (start_dt - ref_date).total_seconds() < -43200: 
+                 start_dt += timedelta(days=1); end_dt += timedelta(days=1)
             return start_dt, end_dt
         except: pass
     return pd.NaT, pd.NaT
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER
+# 3. GOOGLE SHEET PARSER (Splits Locked vs Unplanned)
 # ==========================================
 
 def safe_parse_date(val):
@@ -196,7 +152,9 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         df_gs = pd.read_csv(url, header=None, skiprows=1) 
         if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), (0,0)
 
-        actuals = []
+        locked_actuals = []
+        unplanned_actuals = [] # To be sent to optimizer
+        
         today_date = datetime.now(IST).date()
         last_seq_tuple = (0, 0)
 
@@ -217,9 +175,48 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             load_type = 'BOXN'
             if 'BOBR' in str(row.iloc[1]).upper(): load_type = 'BOBR'
 
+            # Global Start/End fallback
             start_dt = safe_parse_date(row.iloc[5])
             end_dt = safe_parse_date(row.iloc[6])
             
+            # --- TIPPLER PARSING ---
+            tippler_timings = {}
+            used_tipplers = []
+            
+            for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
+                cell_val = row.iloc[idx]
+                if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
+                    ts, te = parse_tippler_cell(cell_val, arrival_dt)
+                    
+                    # If specific time parsing failed but cell is not empty, use Global times
+                    if pd.isnull(ts) and pd.notnull(start_dt) and pd.notnull(end_dt):
+                        ts, te = start_dt, end_dt
+                    
+                    if pd.notnull(ts):
+                        used_tipplers.append(t_name)
+                        tippler_timings[f"{t_name} Start"] = format_dt(ts)
+                        tippler_timings[f"{t_name} End"] = format_dt(te)
+                        tippler_timings[f"{t_name}_Obj_End"] = te
+
+            # --- DECISION: LOCKED OR UNPLANNED? ---
+            # If no tipplers used AND not BOBR, send to Optimizer
+            if not used_tipplers and load_type != 'BOBR':
+                unplanned_actuals.append({
+                    'Coal Source': source_val,
+                    'Load Type': load_type,
+                    'Wagons': 58,
+                    'Status': 'Pending (G-Sheet)',
+                    '_Arrival_DT': arrival_dt,
+                    '_Form_Mins': 0,
+                    'Optimization Type': 'Auto-Planned (G-Sheet)',
+                    'Extra Shunt (Mins)': 0,
+                    'is_gs_unplanned': True # Flag to sort or highlight
+                })
+                continue # Skip adding to locked_actuals
+
+            # --- PROCESS LOCKED ACTUAL ---
+            
+            # Duration (Col I)
             raw_dur = row.iloc[8]
             total_dur = timedelta(0)
             if pd.notnull(raw_dur):
@@ -240,20 +237,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 clean = str(raw_dem).strip()
                 if ":" in clean: dem_str = clean
                 elif clean.replace('.','',1).isdigit(): dem_str = f"{int(float(clean)):02d}:00"
-            
-            tippler_timings = {}
-            used_tipplers = []
-            
-            # Parse O, P, Q, R with correct times
-            for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
-                cell_val = row.iloc[idx]
-                if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
-                    ts, te = parse_tippler_cell(cell_val, arrival_dt)
-                    if pd.notnull(ts):
-                        used_tipplers.append(t_name)
-                        tippler_timings[f"{t_name} Start"] = format_dt(ts)
-                        tippler_timings[f"{t_name} End"] = format_dt(te)
-                        tippler_timings[f"{t_name}_Obj_End"] = te
 
             entry = {
                 'Rake': rake_name,
@@ -285,9 +268,9 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 entry[f"{t} End"] = tippler_timings.get(f"{t} End", "")
                 entry[f"{t} Idle"] = ""
             
-            actuals.append(entry)
+            locked_actuals.append(entry)
 
-        return pd.DataFrame(actuals), pd.DataFrame(), last_seq_tuple
+        return pd.DataFrame(locked_actuals), pd.DataFrame(unplanned_actuals), last_seq_tuple
 
     except Exception as e:
         return pd.DataFrame(), pd.DataFrame(), (0,0)
@@ -317,15 +300,49 @@ def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state,
     
     finish_A = prim['eff_start'] + timedelta(hours=wagons / prim['rate'])
     
-    # Logic simplified for display - assumes option A wins often, keeps code stable
-    # (Full branching logic available in previous iterations if needed)
+    finish_B = pd.NaT
+    sec = None
+    if len(sorted_tipplers) > 1 and wagons > wagons_first_batch:
+        sec = sorted_tipplers[1]
+        w_first = wagons_first_batch
+        w_second = wagons - w_first
+        fin_prim_split = prim['eff_start'] + timedelta(hours=w_first / prim['rate'])
+        start_sec_theory = ready_time + timedelta(minutes=inter_tippler_delay)
+        prop_start_sec = max(start_sec_theory, sec['eff_start'])
+        real_start_sec = check_downtime_impact(sec['id'], prop_start_sec, downtime_list)
+        fin_sec_split = real_start_sec + timedelta(hours=w_second / sec['rate'])
+        finish_B = max(fin_prim_split, fin_sec_split)
     
-    idle_prim = max(timedelta(0), prim['eff_start'] - prim['free_at'])
-    detailed_timings[f"{t_primary}_Idle"] = idle_prim
-    detailed_timings[f"{t_primary}_Start"] = prim['eff_start']
-    detailed_timings[f"{t_primary}_End"] = finish_A
+    final_mode = "Solo"
+    if pd.notnull(finish_B) and finish_B <= finish_A: final_mode = "Split"
     
-    return finish_A, ", ".join(used_tipplers_list), prim['eff_start'], detailed_timings, idle_prim
+    total_idle_cost = timedelta(0)
+    if final_mode == "Split":
+        used_tipplers_list.append(sec['id'])
+        idle_prim = max(timedelta(0), prim['eff_start'] - prim['free_at'])
+        detailed_timings[f"{t_primary}_Idle"] = idle_prim
+        detailed_timings[f"{t_primary}_Start"] = prim['eff_start']
+        detailed_timings[f"{t_primary}_End"] = fin_prim_split
+        total_idle_cost += idle_prim
+        
+        idle_sec = max(timedelta(0), real_start_sec - sec['free_at'])
+        detailed_timings[f"{sec['id']}_Idle"] = idle_sec
+        detailed_timings[f"{sec['id']}_Start"] = real_start_sec
+        detailed_timings[f"{sec['id']}_End"] = fin_sec_split
+        total_idle_cost += idle_sec
+        
+        actual_start_prim = prim['eff_start']
+        overall_finish = finish_B
+    else:
+        idle_prim = max(timedelta(0), prim['eff_start'] - prim['free_at'])
+        detailed_timings[f"{t_primary}_Idle"] = idle_prim
+        detailed_timings[f"{t_primary}_Start"] = prim['eff_start']
+        detailed_timings[f"{t_primary}_End"] = finish_A
+        total_idle_cost += idle_prim
+        actual_start_prim = prim['eff_start']
+        overall_finish = finish_A
+
+    return overall_finish, ", ".join(sorted(used_tipplers_list)), actual_start_prim, detailed_timings, total_idle_cost
 
 def get_line_entry_time(group, arrival, line_groups):
     grp = line_groups[group]
@@ -333,20 +350,25 @@ def get_line_entry_time(group, arrival, line_groups):
     if len(active) < grp['capacity']: return arrival
     return active[len(active) - grp['capacity']]
 
-def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
+def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_seq_tuple):
     rates = {'T1': params['rt1'], 'T2': params['rt2'], 'T3': params['rt3'], 'T4': params['rt4']}
     s_a, s_b, extra_shunt_cross = params['sa'], params['sb'], params['extra_shunt']
     f_a, f_b, ft_hours = params['fa'], params['fb'], params['ft']
     w_batch, w_delay, downtimes = params['wb'], params['wd'], params['downtimes']
 
+    # 1. Prepare Plan List
     to_plan = []
     
+    # Add Unplanned from Google Sheet first
+    if not df_unplanned.empty:
+        for _, row in df_unplanned.iterrows():
+            to_plan.append(row.to_dict())
+
+    # Add Forecast from CSV
     if not df_csv.empty:
         df = df_csv.copy()
-        
         load_col = find_column(df, ['LOAD TYPE', 'CMDT', 'COMMODITY'])
         if load_col:
-            # Allow BOXN and BOBR (Case Insensitive)
             df = df[df[load_col].astype(str).str.upper().str.contains('BOXN|BOBR', regex=True, na=False)]
         
         wagon_col = find_column(df, ['TOTL UNTS', 'WAGONS', 'UNITS', 'TOTAL UNITS'])
@@ -368,9 +390,10 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
             
             df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt')
 
+            # Deduplicate against Locked + Unplanned (Time based)
             existing_times = set()
-            if not df_locked.empty:
-                existing_times.update(df_locked['_Arrival_DT'].dt.floor('min'))
+            if not df_locked.empty: existing_times.update(df_locked['_Arrival_DT'].dt.floor('min'))
+            if not df_unplanned.empty: existing_times.update(df_unplanned['_Arrival_DT'].dt.floor('min'))
 
             for _, row in df.iterrows():
                 if row['arrival_dt'].floor('min') in existing_times: continue 
@@ -383,8 +406,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
                     '_Arrival_DT': row['arrival_dt'],
                     '_Form_Mins': 0,
                     'Optimization Type': 'Forecast',
-                    'Extra Shunt (Mins)': 0,
-                    'is_csv': True 
+                    'Extra Shunt (Mins)': 0
                 })
 
     plan_df = pd.DataFrame(to_plan)
@@ -399,7 +421,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
     sim_start_time = first_arrival.replace(hour=0, minute=0, second=0, microsecond=0)
     if sim_start_time.tzinfo is None: sim_start_time = IST.localize(sim_start_time)
 
-    # REBUILD STATE from Locked Actuals
+    # State from Locked Actuals
     tippler_state = {k: sim_start_time for k in ['T1', 'T2', 'T3', 'T4']}
     if not df_locked.empty:
         for _, row in df_locked.iterrows():
@@ -458,7 +480,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
             assignments.append(row_data)
             continue
 
-        # Standard BOXN Logic
         entry_A = get_line_entry_time('Group_Lines_8_10', rake['_Arrival_DT'], line_groups)
         ready_A = entry_A + timedelta(minutes=s_a)
         fin_A, used_A, start_A, tim_A, _ = calculate_generic_finish(
@@ -481,7 +502,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
             '_Arrival_DT': rake['_Arrival_DT'],
             '_Shunt_Ready_DT': ready_A,
             '_Form_Mins': f_a,
-            'Optimization Type': 'Forecast',
+            'Optimization Type': rake['Optimization Type'],
             'Extra Shunt (Mins)': 0,
             'Line Allotted': '8/9/10',
             'Line Entry Time': format_dt(entry_A),
@@ -528,6 +549,51 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
     return pd.DataFrame(recalc_rows), daily_demurrage_hours
 
 # ==========================================
+# 5. SIDEBAR PARAMS (TOP)
+# ==========================================
+st.sidebar.header("⚙️ Settings")
+gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
+
+st.sidebar.markdown("---")
+sim_params = {}
+sim_params['rt1'] = st.sidebar.number_input("Tippler 1 Rate", value=6.0, step=0.5)
+sim_params['rt2'] = st.sidebar.number_input("Tippler 2 Rate", value=6.0, step=0.5)
+sim_params['rt3'] = st.sidebar.number_input("Tippler 3 Rate", value=9.0, step=0.5)
+sim_params['rt4'] = st.sidebar.number_input("Tippler 4 Rate", value=9.0, step=0.5)
+st.sidebar.markdown("---")
+sim_params['sa'] = st.sidebar.number_input("Pair A Shunt (Mins)", value=25.0, step=5.0)
+sim_params['sb'] = st.sidebar.number_input("Pair B Shunt (Mins)", value=50.0, step=5.0)
+sim_params['extra_shunt'] = st.sidebar.number_input("Cross-Pair Penalty (Mins)", value=45.0, step=5.0)
+st.sidebar.markdown("---")
+sim_params['fa'] = st.sidebar.number_input("Pair A Formation (Mins)", value=20.0, step=5.0)
+sim_params['fb'] = st.sidebar.number_input("Pair B Formation (Mins)", value=50.0, step=5.0)
+sim_params['ft'] = st.sidebar.number_input("Free Time (Hours)", value=7.0, step=0.5)
+sim_params['wb'] = st.sidebar.number_input("Wagons 1st Batch", value=30, step=1)
+sim_params['wd'] = st.sidebar.number_input("Delay 2nd Tippler (Mins)", value=0.0, step=5.0)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🛠️ Tippler Downtime")
+if 'downtimes' not in st.session_state: st.session_state.downtimes = []
+with st.sidebar.form("downtime_form"):
+    dt_tippler = st.selectbox("Select Tippler", ["T1", "T2", "T3", "T4"])
+    now_ist = datetime.now(IST)
+    dt_start_date = st.date_input("Start Date", value=now_ist.date())
+    dt_start_time = st.time_input("Start Time", value=now_ist.time())
+    dt_duration = st.number_input("Duration (Minutes)", min_value=15, step=15, value=60)
+    if st.form_submit_button("Add Downtime"):
+        start_dt = IST.localize(datetime.combine(dt_start_date, dt_start_time))
+        st.session_state.downtimes.append({"Tippler": dt_tippler, "Start": start_dt, "End": start_dt + timedelta(minutes=dt_duration)})
+        st.rerun()
+
+if st.session_state.downtimes:
+    dt_df = pd.DataFrame(st.session_state.downtimes)
+    st.sidebar.dataframe(dt_df.assign(Start=lambda x: x['Start'].dt.strftime('%d-%H:%M'), End=lambda x: x['End'].dt.strftime('%d-%H:%M'))[['Tippler', 'Start', 'End']], use_container_width=True)
+    if st.sidebar.button("Clear Downtimes"):
+        st.session_state.downtimes = []
+        st.rerun()
+sim_params['downtimes'] = st.session_state.downtimes
+
+# ==========================================
 # 6. MAIN EXECUTION
 # ==========================================
 
@@ -542,10 +608,11 @@ if gs_url and ('last_gs_url' not in st.session_state or st.session_state.last_gs
     st.session_state.last_gs_url = gs_url
 
 if input_changed or 'raw_data_cached' not in st.session_state:
-    actuals_df, _, last_seq = pd.DataFrame(), pd.DataFrame(), (0,0)
+    actuals_df, unplanned_df, last_seq = pd.DataFrame(), pd.DataFrame(), (0,0)
     if gs_url:
-        actuals_df, _, last_seq = fetch_google_sheet_actuals(gs_url, sim_params['ft'])
+        actuals_df, unplanned_df, last_seq = fetch_google_sheet_actuals(gs_url, sim_params['ft'])
     st.session_state.actuals_df = actuals_df
+    st.session_state.unplanned_df = unplanned_df
     st.session_state.last_seq = last_seq
     if uploaded_file:
         try:
@@ -559,16 +626,16 @@ if input_changed or 'raw_data_cached' not in st.session_state:
 if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_raw = st.session_state.get('raw_data_cached', pd.DataFrame())
     df_act = st.session_state.get('actuals_df', pd.DataFrame())
+    df_unplanned = st.session_state.get('unplanned_df', pd.DataFrame())
     start_seq = st.session_state.get('last_seq', (0,0))
     
     if input_changed or 'sim_result' not in st.session_state:
-        sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, start_seq)
+        sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, df_unplanned, start_seq)
         st.session_state.sim_result = sim_result
         st.session_state.sim_start_dt = sim_start_dt
 
     if 'sim_result' in st.session_state and not st.session_state.sim_result.empty:
         df_final = st.session_state.sim_result
-        # Make Date String for Grouping (Robust against Timezone/Obj issues)
         df_final['Date_Str'] = df_final['_Arrival_DT'].dt.strftime('%Y-%m-%d')
         unique_dates = sorted(df_final['Date_Str'].unique())
 
