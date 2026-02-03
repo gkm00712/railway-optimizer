@@ -20,7 +20,6 @@ IST = pytz.timezone('Asia/Kolkata')
 # ==========================================
 
 def to_ist(dt):
-    """Ensures a datetime object is in IST."""
     if pd.isnull(dt): return pd.NaT
     if dt.tzinfo is None:
         return IST.localize(dt)
@@ -97,26 +96,27 @@ def find_column(df, candidates):
             if cand_upper == c: return df.columns[cols_upper.index(c)]
     return None
 
-def is_valid_demurrage_string(val):
-    s = str(val).strip()
-    if not s or s.lower() == 'nan': return False
-    if re.match(r'^\d{1,2}:\d{2}$', s): return True
+def parse_last_sequence(rake_name):
+    """
+    Parses '148/1479' to return (148, 1479).
+    Returns (0,0) if format doesn't match.
+    """
     try:
-        float(s)
-        return True
-    except: return False
-
-def get_sequence_number(rake_name):
-    """Extracts the leading number from '148/BOXN' format."""
-    try:
-        match = re.match(r'^(\d+)[/-]', str(rake_name).strip())
+        # Regex to find two numbers separated by a non-digit
+        match = re.search(r'(\d+)\D+(\d+)', str(rake_name))
         if match:
-            return int(match.group(1))
+            return int(match.group(1)), int(match.group(2))
+        
+        # Fallback: Just one number?
+        match_single = re.search(r'^(\d+)', str(rake_name))
+        if match_single:
+            return int(match_single.group(1)), 0
+            
     except: pass
-    return 0
+    return 0, 0
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER
+# 3. GOOGLE SHEET PARSER (Cached & Strict)
 # ==========================================
 
 def safe_parse_date(val):
@@ -130,44 +130,86 @@ def safe_parse_date(val):
 @st.cache_data(ttl=60)
 def fetch_google_sheet_actuals(url, free_time_hours):
     try:
-        df_headers = pd.read_csv(url, nrows=0) 
-        df_gs = pd.read_csv(url, header=None, skiprows=1)
+        df_gs = pd.read_csv(url, header=None, skiprows=1) # Data only, Skip header row
         
-        dem_col_idx = -1
-        cols_upper = [str(c).upper().strip() for c in df_headers.columns]
-        for i, c in enumerate(cols_upper):
-            if "DEMURRAGE" in c or "WHARFAGE" in c:
-                dem_col_idx = i; break
+        if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), (0,0)
 
-        if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), 0
+        # STRICT MAPPING
+        # Col B (1): Rake Name
+        # Col C (2): Source
+        # Col E (4): Receipt
+        # Col F (5): Placement
+        # Col G (6): Unload End
+        # Col H (7): Release
+        # Col I (8): Duration
+        # Col K (10): Demurrage (STRICTLY)
+        # Col O-R (14-17): Tipplers
 
-        locked_actuals = []
-        unplanned_actuals = [] # Rakes in sheet but missing Tippler data
-        max_seq_num = 0
+        actuals = []
         today_date = datetime.now(IST).date()
+        last_seq_tuple = (0, 0)
 
         for _, row in df_gs.iterrows():
-            arrival_dt = safe_parse_date(row.iloc[4]) # Col E
+            arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
+            
+            # Capture sequence for continuation
+            rake_name = str(row.iloc[1])
+            seq, rid = parse_last_sequence(rake_name)
+            if seq > last_seq_tuple[0]:
+                last_seq_tuple = (seq, rid)
+
             if arrival_dt.date() != today_date: continue
 
-            rake_name = str(row.iloc[1]) # Col B
-            
-            # Track Sequence Number
-            seq = get_sequence_number(rake_name)
-            if seq > max_seq_num: max_seq_num = seq
-
-            source_val = str(row.iloc[2]) # Col C
+            source_val = str(row.iloc[2]) 
             if source_val.lower() == 'nan': source_val = ""
 
-            # Check if Tipplers are assigned
+            start_dt = safe_parse_date(row.iloc[5])
+            end_dt = safe_parse_date(row.iloc[6])
+            
+            # Duration (Col I)
+            raw_dur = row.iloc[8]
+            total_dur = timedelta(0)
+            if pd.notnull(raw_dur):
+                try:
+                    if ":" in str(raw_dur):
+                        parts = str(raw_dur).split(":")
+                        total_dur = timedelta(hours=int(parts[0]), minutes=int(parts[1]))
+                    else:
+                        total_dur = timedelta(days=float(raw_dur))
+                except:
+                    if pd.notnull(safe_parse_date(row.iloc[7])): 
+                        total_dur = safe_parse_date(row.iloc[7]) - arrival_dt
+
+            if pd.isnull(start_dt): start_dt = arrival_dt 
+
+            # Demurrage: STRICTLY Column K (Index 10)
+            dem_str = "00:00"
+            raw_dem = row.iloc[10] # Column K
+            
+            if pd.notnull(raw_dem) and str(raw_dem).strip() != "":
+                clean_dem = str(raw_dem).strip()
+                # Check if it looks like a number
+                try:
+                    # If just "2", make it "02:00"
+                    if clean_dem.replace('.', '', 1).isdigit():
+                        dem_str = f"{int(float(clean_dem)):02d}:00"
+                    # If "02:00", keep it
+                    elif ":" in clean_dem:
+                        dem_str = clean_dem
+                except: pass
+            
+            # If Col K was empty, fallback to calc? No, user said "take directly".
+            # If empty, we leave it as 00:00 or Calc? 
+            # "take demurrage ... directly ... whereas calculate for forecast"
+            # I will assume if Col K is missing, it's 0.
+
             used = []
             if pd.notnull(row.iloc[14]) and str(row.iloc[14]).strip() not in ["", "nan"]: used.append("T1")
             if pd.notnull(row.iloc[15]) and str(row.iloc[15]).strip() not in ["", "nan"]: used.append("T2")
             if pd.notnull(row.iloc[16]) and str(row.iloc[16]).strip() not in ["", "nan"]: used.append("T3")
             if pd.notnull(row.iloc[17]) and str(row.iloc[17]).strip() not in ["", "nan"]: used.append("T4")
-
-            # DATA ENTRY OBJECT
+            
             entry = {
                 'Rake': rake_name,
                 'Coal Source': source_val,
@@ -175,73 +217,34 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 'Wagons': 58,
                 'Status': 'ACTUAL',
                 '_Arrival_DT': arrival_dt,
+                '_Shunt_Ready_DT': start_dt,
                 '_Form_Mins': 0,
+                'Optimization Type': 'Actual (G-Sheet)',
                 'Extra Shunt (Mins)': 0,
                 'Line Allotted': 'N/A',
-                'Line Entry Time': format_dt(arrival_dt)
+                'Line Entry Time': format_dt(arrival_dt),
+                'Shunting Complete': format_dt(start_dt),
+                'Tippler Start Time': format_dt(start_dt),
+                'Finish Unload': format_dt(end_dt),
+                'Tipplers Used': ", ".join(used),
+                'Wait (Tippler)': format_duration_hhmm(start_dt - arrival_dt) if pd.notnull(start_dt) else "",
+                'Total Duration': format_duration_hhmm(total_dur),
+                'Demurrage': dem_str,
+                '_raw_end_dt': end_dt,
+                '_raw_tipplers': used
             }
+            
+            for t in ['T1', 'T2', 'T3', 'T4']:
+                entry[f"{t} Start"] = format_dt(start_dt) if t in used else ""
+                entry[f"{t} End"] = format_dt(end_dt) if t in used else ""
+                entry[f"{t} Idle"] = ""
+            
+            actuals.append(entry)
 
-            # LOGIC SPLIT: Locked vs Unplanned
-            if not used:
-                # If NO Tipplers assigned, treat as a forecast item (Unplanned)
-                entry['Status'] = 'Pending (G-Sheet)'
-                entry['Optimization Type'] = 'Auto-Planned'
-                unplanned_actuals.append(entry)
-            else:
-                # Fully Locked Actual
-                start_dt = safe_parse_date(row.iloc[5])
-                end_dt = safe_parse_date(row.iloc[6])
-                if pd.isnull(start_dt): start_dt = arrival_dt
-                
-                # Duration & Demurrage
-                raw_dur = row.iloc[8]
-                total_dur = timedelta(0)
-                if pd.notnull(raw_dur):
-                    try:
-                        if ":" in str(raw_dur):
-                            parts = str(raw_dur).split(":")
-                            total_dur = timedelta(hours=int(parts[0]), minutes=int(parts[1]))
-                        else: total_dur = timedelta(days=float(raw_dur))
-                    except:
-                        if pd.notnull(safe_parse_date(row.iloc[7])): total_dur = safe_parse_date(row.iloc[7]) - arrival_dt
-
-                # Demurrage from Sheet or Calc
-                use_sheet_dem = False
-                dem_str = "00:00"
-                if dem_col_idx != -1:
-                    raw_dem = row.iloc[dem_col_idx]
-                    if is_valid_demurrage_string(raw_dem):
-                        use_sheet_dem = True
-                        dem_str = str(raw_dem).strip()
-                        if ":" not in dem_str: dem_str = f"{int(float(dem_str)):02d}:00"
-                
-                if not use_sheet_dem: dem_str, _ = calculate_rounded_demurrage(total_dur, free_time_hours)
-
-                entry.update({
-                    '_Shunt_Ready_DT': start_dt,
-                    'Optimization Type': 'Actual (G-Sheet)',
-                    'Shunting Complete': format_dt(start_dt),
-                    'Tippler Start Time': format_dt(start_dt),
-                    'Finish Unload': format_dt(end_dt),
-                    'Tipplers Used': ", ".join(used),
-                    'Wait (Tippler)': format_duration_hhmm(start_dt - arrival_dt),
-                    'Total Duration': format_duration_hhmm(total_dur),
-                    'Demurrage': dem_str,
-                    '_raw_end_dt': end_dt,
-                    '_raw_tipplers': used
-                })
-                
-                for t in ['T1', 'T2', 'T3', 'T4']:
-                    entry[f"{t} Start"] = format_dt(start_dt) if t in used else ""
-                    entry[f"{t} End"] = format_dt(end_dt) if t in used else ""
-                    entry[f"{t} Idle"] = ""
-                
-                locked_actuals.append(entry)
-
-        return pd.DataFrame(locked_actuals), pd.DataFrame(unplanned_actuals), max_seq_num
+        return pd.DataFrame(actuals), pd.DataFrame(), last_seq_tuple
 
     except Exception as e:
-        return pd.DataFrame(), pd.DataFrame(), 0
+        return pd.DataFrame(), pd.DataFrame(), (0,0)
 
 # ==========================================
 # 4. CORE SIMULATION LOGIC
@@ -327,21 +330,15 @@ def find_specific_line(group, entry, status, last_idx):
         if status[l] <= entry: return l
     return cands[0]
 
-def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, start_seq_num):
+def run_full_simulation_initial(df_csv, params, df_locked, last_seq_tuple):
     rates = {'T1': params['rt1'], 'T2': params['rt2'], 'T3': params['rt3'], 'T4': params['rt4']}
     s_a, s_b, extra_shunt_cross = params['sa'], params['sb'], params['extra_shunt']
     f_a, f_b, ft_hours = params['fa'], params['fb'], params['ft']
     w_batch, w_delay, downtimes = params['wb'], params['wd'], params['downtimes']
 
-    # 1. PROCESS CSV DATA
     to_plan = []
     
-    # Process Unplanned Actuals (from G-Sheet but no tippler data)
-    if not df_unplanned.empty:
-        for _, row in df_unplanned.iterrows():
-            to_plan.append(row.to_dict())
-
-    # Process CSV Forecast
+    # Process Forecast (CSV)
     if not df_csv.empty:
         df = df_csv.copy()
         load_col = find_column(df, ['LOAD TYPE', 'CMDT', 'COMMODITY'])
@@ -351,13 +348,12 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, start_s
         if wagon_col: df['wagon_count'] = df[wagon_col].apply(parse_wagons)
         else: df['wagon_count'] = 58 
 
-        rake_col = find_column(df, ['RAKE NAME', 'RAKE', 'TRAIN NAME'])
         src_col = find_column(df, ['STTS FROM', 'STTN FROM', 'FROM_STN', 'SRC', 'SOURCE', 'FROM'])
         arvl_col = find_column(df, ['EXPD ARVLTIME', 'ARRIVAL TIME', 'EXPECTED ARRIVAL'])
         stts_time_col = find_column(df, ['STTS TIME'])
         stts_code_col = find_column(df, ['STTS CODE', 'STATUS'])
 
-        if rake_col:
+        if arvl_col:
             df['exp_arrival_dt'] = pd.to_datetime(df[arvl_col], errors='coerce').apply(to_ist) if arvl_col else pd.NaT
             if stts_time_col and stts_code_col:
                 df['stts_time_dt'] = pd.to_datetime(df[stts_time_col], errors='coerce').apply(to_ist)
@@ -367,22 +363,16 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, start_s
             
             df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt')
 
-            # Create Check Set for Deduplication (Receipt Time)
-            # Both Locked and Unplanned are "Existing"
+            # DEDUPLICATION CHECK (By Arrival Time)
             existing_times = set()
             if not df_locked.empty:
                 existing_times.update(df_locked['_Arrival_DT'].dt.floor('min'))
-            if not df_unplanned.empty:
-                existing_times.update(df_unplanned['_Arrival_DT'].dt.floor('min'))
 
             for _, row in df.iterrows():
-                # DEDUPLICATION LOGIC: Check Receipt Time
                 r_time = row['arrival_dt'].floor('min')
-                if r_time in existing_times:
-                    continue # Skip if duplicate time found
+                if r_time in existing_times: continue 
 
                 to_plan.append({
-                    'Rake': row[rake_col], # Placeholder name
                     'Coal Source': row.get(src_col, '') if src_col else '',
                     'Load Type': row.get(load_col, 'BOXN'),
                     'Wagons': row['wagon_count'],
@@ -391,20 +381,22 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, start_s
                     '_Form_Mins': 0,
                     'Optimization Type': 'Forecast',
                     'Extra Shunt (Mins)': 0,
-                    'is_csv': True # Mark as CSV for renaming
+                    'is_csv': True 
                 })
 
-    # Sort ALL planning items by Arrival Time
     plan_df = pd.DataFrame(to_plan)
-    if plan_df.empty: return df_locked, datetime.now(IST)
+    if plan_df.empty and df_locked.empty: return pd.DataFrame(), datetime.now(IST)
     
-    plan_df = plan_df.sort_values('_Arrival_DT').reset_index(drop=True)
+    if not plan_df.empty:
+        plan_df = plan_df.sort_values('_Arrival_DT').reset_index(drop=True)
+        first_arrival = plan_df['_Arrival_DT'].min()
+    else:
+        first_arrival = datetime.now(IST)
 
-    # INITIALIZE STATE
-    first_arrival = plan_df['_Arrival_DT'].min()
     sim_start_time = first_arrival.replace(hour=0, minute=0, second=0, microsecond=0)
     if sim_start_time.tzinfo is None: sim_start_time = IST.localize(sim_start_time)
 
+    # REBUILD STATE from Locked Actuals
     tippler_state = {k: sim_start_time for k in ['T1', 'T2', 'T3', 'T4']}
     if not df_locked.empty:
         for _, row in df_locked.iterrows():
@@ -423,14 +415,15 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, start_s
     rr_tracker_A = -1 
     assignments = []
     
-    current_seq = start_seq_num
+    # Initialize Counters from Google Sheet
+    curr_seq = last_seq_tuple[0]
+    curr_id = last_seq_tuple[1]
 
     for _, rake in plan_df.iterrows():
-        # RENAME LOGIC: If it's a CSV rake, apply sequential naming
-        rake_display_name = rake['Rake']
-        if rake.get('is_csv', False):
-            current_seq += 1
-            rake_display_name = f"{current_seq}/{rake['Rake']}"
+        # GENERATE NEW RAKE NAME
+        curr_seq += 1
+        curr_id += 1
+        display_name = f"{curr_seq}/{curr_id}"
 
         options = []
         entry_A = get_line_entry_time('Group_Lines_8_10', rake['_Arrival_DT'], line_groups)
@@ -487,7 +480,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, start_s
         dem_str, _ = calculate_rounded_demurrage(tot_dur_final, ft_hours)
 
         row_data = {
-            'Rake': rake_display_name,
+            'Rake': display_name,
             'Coal Source': rake['Coal Source'],
             'Load Type': rake['Load Type'],
             'Wagons': rake['Wagons'],
@@ -540,21 +533,17 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
 
     # 2. Process
     for _, row in edited_df.iterrows():
+        # --- ACTUALS (Google Sheet Data) ---
         if row.get('Status') == 'ACTUAL':
             dem_hrs = 0
             dem_val = str(row['Demurrage']).strip()
+            
+            # Extract number from "02:00" or "2"
             if ":" in dem_val:
                 try: dem_hrs = int(dem_val.split(":")[0])
                 except: pass
-            elif dem_val.isdigit(): dem_hrs = int(dem_val)
-            elif dem_val in ["00:00", "", "nan"]:
-                try:
-                    dur_str = row['Total Duration']
-                    sign = -1 if dur_str.startswith('-') else 1
-                    parts = dur_str.replace('-','').split(':')
-                    dur_td = timedelta(hours=int(parts[0]), minutes=int(parts[1])) * sign
-                    _, dem_hrs = calculate_rounded_demurrage(dur_td, free_time_hours)
-                except: pass
+            elif dem_val.isdigit(): 
+                dem_hrs = int(dem_val)
                 
             try:
                 arr_dt = pd.to_datetime(row['_Arrival_DT'])
@@ -566,6 +555,7 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
             recalc_rows.append(row)
             continue
             
+        # --- FORECAST (CSV Data) ---
         arrival = pd.to_datetime(row['_Arrival_DT'])
         if arrival.tzinfo is None: arrival = IST.localize(arrival)
         ready = pd.to_datetime(row['_Shunt_Ready_DT'])
@@ -661,25 +651,6 @@ sim_params['downtimes'] = st.session_state.downtimes
 # 6. MAIN EXECUTION
 # ==========================================
 
-if gs_url and 'actuals_df_disp' not in st.session_state:
-    st.session_state.actuals_df_disp = pd.DataFrame()
-    
-if gs_url:
-    try:
-        if 'actuals_df' not in st.session_state or st.session_state.actuals_df.empty:
-             df_disp, _, _ = fetch_google_sheet_actuals(gs_url, sim_params['ft'])
-             st.session_state.actuals_df_disp = df_disp
-        else:
-             st.session_state.actuals_df_disp = st.session_state.actuals_df
-    except: pass
-
-st.subheader("📊 Live Unloading Status (Today)")
-if 'actuals_df_disp' in st.session_state and not st.session_state.actuals_df_disp.empty:
-    disp_cols = ['Rake', 'Coal Source', 'Status', 'Tippler Start Time', 'Finish Unload', 'Total Duration', 'Demurrage']
-    st.dataframe(st.session_state.actuals_df_disp[disp_cols], use_container_width=True)
-else:
-    st.info("Loading Google Sheet data or no data found for today...")
-
 uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
 
 input_changed = False
@@ -691,15 +662,12 @@ if gs_url and ('last_gs_url' not in st.session_state or st.session_state.last_gs
     st.session_state.last_gs_url = gs_url
 
 if input_changed or 'raw_data_cached' not in st.session_state:
-    actuals_df, unplanned_df, max_seq = pd.DataFrame(), pd.DataFrame(), 0
+    actuals_df, unplanned_df, last_seq = pd.DataFrame(), pd.DataFrame(), (0,0)
     if gs_url:
-        actuals_df, unplanned_df, max_seq = fetch_google_sheet_actuals(gs_url, sim_params['ft'])
-        st.session_state.actuals_df_disp = actuals_df
+        actuals_df, unplanned_df, last_seq = fetch_google_sheet_actuals(gs_url, sim_params['ft'])
     
     st.session_state.actuals_df = actuals_df
-    st.session_state.unplanned_df = unplanned_df
-    st.session_state.max_seq = max_seq
-    st.session_state.actuals_state = {}
+    st.session_state.last_seq = last_seq
 
     if uploaded_file:
         try:
@@ -717,11 +685,10 @@ if input_changed or 'raw_data_cached' not in st.session_state:
 if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_raw = st.session_state.get('raw_data_cached', pd.DataFrame())
     df_act = st.session_state.get('actuals_df', pd.DataFrame())
-    df_unplanned = st.session_state.get('unplanned_df', pd.DataFrame())
-    start_seq = st.session_state.get('max_seq', 0)
+    start_seq = st.session_state.get('last_seq', (0,0))
     
     if input_changed or 'sim_result' not in st.session_state:
-        sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, df_unplanned, start_seq)
+        sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, start_seq)
         st.session_state.sim_result = sim_result
         st.session_state.sim_start_dt = sim_start_dt
 
