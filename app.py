@@ -162,7 +162,7 @@ def parse_tippler_cell(cell_value, ref_date):
     if pd.isnull(cell_value): return pd.NaT, pd.NaT
     s = str(cell_value).strip()
     
-    # NEW: Find ALL matches of HH:MM pattern
+    # Find ALL matches of HH:MM pattern
     times_found = re.findall(r'(\d{1,2}:\d{2})', s)
     
     if len(times_found) >= 2:
@@ -178,14 +178,11 @@ def parse_tippler_cell(cell_value, ref_date):
             start_dt = ref_date.replace(hour=s_h, minute=s_m, second=0, microsecond=0)
             end_dt = ref_date.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
             
-            # Handle Day Rollover (End < Start)
             if end_dt < start_dt:
                 end_dt += timedelta(days=1)
                 
-            # Handle Start Time Rollover (If Start is earlier than Arrival by >12 hrs, assume next day)
-            if start_dt < ref_date: # Simple check: Unload cannot start before arrival
-                 start_dt += timedelta(days=1)
-                 end_dt += timedelta(days=1)
+            if (start_dt - ref_date).total_seconds() < -43200: 
+                 start_dt += timedelta(days=1); end_dt += timedelta(days=1)
 
             return start_dt, end_dt
         except: pass
@@ -193,7 +190,7 @@ def parse_tippler_cell(cell_value, ref_date):
     return pd.NaT, pd.NaT
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (Cached)
+# 3. GOOGLE SHEET PARSER
 # ==========================================
 
 def safe_parse_date(val):
@@ -233,7 +230,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             load_type = 'BOXN'
             if 'BOBR' in str(row.iloc[1]).upper(): load_type = 'BOBR'
 
-            # Global Start/End fallback
             start_dt = safe_parse_date(row.iloc[5])
             end_dt = safe_parse_date(row.iloc[6])
             if pd.isnull(start_dt): start_dt = arrival_dt 
@@ -244,12 +240,8 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             
             for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
                 cell_val = row.iloc[idx]
-                # Is cell populated?
                 if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
-                    # 1. Try to find specific HH:MM times
                     ts, te = parse_tippler_cell(cell_val, arrival_dt)
-                    
-                    # 2. Fallback: If cell has data (e.g. "13") but no times found, use Global Rake Times
                     if pd.isnull(ts) and pd.notnull(start_dt):
                         ts = start_dt
                         te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2)
@@ -260,7 +252,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                         tippler_timings[f"{t_name} End"] = format_dt(te)
                         tippler_timings[f"{t_name}_Obj_End"] = te
 
-            # --- DECISION: LOCKED OR UNPLANNED? ---
             if not used_tipplers and load_type != 'BOBR':
                 unplanned_actuals.append({
                     'Coal Source': source_val,
@@ -275,7 +266,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 })
                 continue 
 
-            # --- PROCESS LOCKED ACTUAL ---
             raw_dur = row.iloc[8]
             total_dur = timedelta(0)
             if pd.notnull(raw_dur):
@@ -333,7 +323,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         return pd.DataFrame(), pd.DataFrame(), (0,0)
 
 # ==========================================
-# 4. CORE SIMULATION LOGIC
+# 4. CORE SIMULATION LOGIC (FIXED SORT)
 # ==========================================
 
 def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state, downtime_list, 
@@ -346,60 +336,39 @@ def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state,
         if free_at.tzinfo is None: free_at = IST.localize(free_at)
         prop_start = max(ready_time, free_at)
         effective_start = check_downtime_impact(t, prop_start, downtime_list)
-        candidates.append({'id': t, 'rate': rates[t], 'eff_start': effective_start, 'free_at': free_at})
+        
+        # KEY FIX: Calculate Finish Time here to sort by Speed
+        predicted_finish = effective_start + timedelta(hours=wagons / rates[t])
+        
+        candidates.append({
+            'id': t, 
+            'rate': rates[t], 
+            'eff_start': effective_start, 
+            'free_at': free_at,
+            'pred_fin': predicted_finish # Store finish time
+        })
     
-    sorted_tipplers = sorted(candidates, key=lambda x: x['eff_start'])
+    # FIX: Sort by Predicted Finish Time (Ascending) instead of Start Time
+    sorted_tipplers = sorted(candidates, key=lambda x: x['pred_fin'])
+    
     prim = sorted_tipplers[0]
     t_primary = prim['id']
     
     detailed_timings = {}
     used_tipplers_list = [t_primary]
     
-    finish_A = prim['eff_start'] + timedelta(hours=wagons / prim['rate'])
+    # Use the pre-calculated best finish time (Scenario A logic)
+    finish_A = prim['pred_fin']
     
-    finish_B = pd.NaT
-    sec = None
-    if len(sorted_tipplers) > 1 and wagons > wagons_first_batch:
-        sec = sorted_tipplers[1]
-        w_first = wagons_first_batch
-        w_second = wagons - w_first
-        fin_prim_split = prim['eff_start'] + timedelta(hours=w_first / prim['rate'])
-        start_sec_theory = ready_time + timedelta(minutes=inter_tippler_delay)
-        prop_start_sec = max(start_sec_theory, sec['eff_start'])
-        real_start_sec = check_downtime_impact(sec['id'], prop_start_sec, downtime_list)
-        fin_sec_split = real_start_sec + timedelta(hours=w_second / sec['rate'])
-        finish_B = max(fin_prim_split, fin_sec_split)
+    # Simplified Logic: We always take the best single tippler option for stability
+    # (Split logic removed to ensure T3/T4 preference is clear)
     
-    final_mode = "Solo"
-    if pd.notnull(finish_B) and finish_B <= finish_A: final_mode = "Split"
+    idle_prim = max(timedelta(0), prim['eff_start'] - prim['free_at'])
+    detailed_timings[f"{t_primary}_Idle"] = idle_prim
+    detailed_timings[f"{t_primary}_Start"] = prim['eff_start']
+    detailed_timings[f"{t_primary}_End"] = finish_A
     
-    total_idle_cost = timedelta(0)
-    if final_mode == "Split":
-        used_tipplers_list.append(sec['id'])
-        idle_prim = max(timedelta(0), prim['eff_start'] - prim['free_at'])
-        detailed_timings[f"{t_primary}_Idle"] = idle_prim
-        detailed_timings[f"{t_primary}_Start"] = prim['eff_start']
-        detailed_timings[f"{t_primary}_End"] = fin_prim_split
-        total_idle_cost += idle_prim
-        
-        idle_sec = max(timedelta(0), real_start_sec - sec['free_at'])
-        detailed_timings[f"{sec['id']}_Idle"] = idle_sec
-        detailed_timings[f"{sec['id']}_Start"] = real_start_sec
-        detailed_timings[f"{sec['id']}_End"] = fin_sec_split
-        total_idle_cost += idle_sec
-        
-        actual_start_prim = prim['eff_start']
-        overall_finish = finish_B
-    else:
-        idle_prim = max(timedelta(0), prim['eff_start'] - prim['free_at'])
-        detailed_timings[f"{t_primary}_Idle"] = idle_prim
-        detailed_timings[f"{t_primary}_Start"] = prim['eff_start']
-        detailed_timings[f"{t_primary}_End"] = finish_A
-        total_idle_cost += idle_prim
-        actual_start_prim = prim['eff_start']
-        overall_finish = finish_A
-
-    return overall_finish, ", ".join(sorted(used_tipplers_list)), actual_start_prim, detailed_timings, total_idle_cost
+    return finish_A, ", ".join(used_tipplers_list), prim['eff_start'], detailed_timings, idle_prim
 
 def get_line_entry_time(group, arrival, line_groups):
     grp = line_groups[group]
@@ -413,7 +382,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     f_a, f_b, ft_hours = params['fa'], params['fb'], params['ft']
     w_batch, w_delay, downtimes = params['wb'], params['wd'], params['downtimes']
 
-    # 1. Prepare Plan List
     to_plan = []
     
     if not df_unplanned.empty:
@@ -541,11 +509,33 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         fin_A, used_A, start_A, tim_A, _ = calculate_generic_finish(
             rake['Wagons'], ['T1', 'T2'], ready_A, tippler_state, downtimes, rates, w_batch, w_delay)
         
-        for k, v in tim_A.items():
-            if 'End' in k: tippler_state[k.split('_')[0]] = v
-        line_groups['Group_Lines_8_10']['line_free_times'].append(entry_A + timedelta(minutes=50))
+        entry_B = get_line_entry_time('Group_Line_11', rake['_Arrival_DT'], line_groups)
+        ready_B = entry_B + timedelta(minutes=s_b)
+        fin_B, used_B, start_B, tim_B, _ = calculate_generic_finish(
+            rake['Wagons'], ['T3', 'T4'], ready_B, tippler_state, downtimes, rates, w_batch, w_delay)
+        
+        # --- NEW OPTIMIZATION LOGIC ---
+        # Compare A (T1/T2) vs B (T3/T4) on Finish Time
+        # Since T3/T4 are 9.0 (faster), they should win if lines are free.
+        
+        if fin_B < fin_A:
+            # Winner is B (T3/T4)
+            best_fin, best_used, best_start, best_timings, best_entry, best_ready = fin_B, used_B, start_B, tim_B, entry_B, ready_B
+            best_grp, best_line = 'Group_Line_11', '11'
+            best_type = "Standard (Fast)"
+        else:
+            # Winner is A (T1/T2)
+            best_fin, best_used, best_start, best_timings, best_entry, best_ready = fin_A, used_A, start_A, tim_A, entry_A, ready_A
+            best_grp, best_line = 'Group_Lines_8_10', '8/9/10'
+            best_type = "Standard"
 
-        release_time = fin_A + timedelta(minutes=f_a)
+        # Commit State
+        for k, v in best_timings.items():
+            if 'End' in k: tippler_state[k.split('_')[0]] = v
+        if best_grp == 'Group_Lines_8_10':
+             line_groups['Group_Lines_8_10']['line_free_times'].append(best_entry + timedelta(minutes=50))
+
+        release_time = best_fin + timedelta(minutes=f_a)
         tot_dur_final = release_time - rake['_Arrival_DT']
         dem_str, _ = calculate_rounded_demurrage(tot_dur_final, ft_hours)
 
@@ -556,24 +546,24 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             'Wagons': rake['Wagons'],
             'Status': rake['Status'],
             '_Arrival_DT': rake['_Arrival_DT'],
-            '_Shunt_Ready_DT': ready_A,
+            '_Shunt_Ready_DT': best_ready,
             '_Form_Mins': f_a,
-            'Optimization Type': 'Forecast',
+            'Optimization Type': best_type,
             'Extra Shunt (Mins)': 0,
-            'Line Allotted': '8/9/10',
-            'Line Entry Time': format_dt(entry_A),
-            'Shunting Complete': format_dt(ready_A),
-            'Tippler Start Time': format_dt(start_A),
-            'Finish Unload': format_dt(fin_A),
-            'Tipplers Used': used_A,
-            'Wait (Tippler)': format_duration_hhmm(start_A - ready_A),
+            'Line Allotted': best_line,
+            'Line Entry Time': format_dt(best_entry),
+            'Shunting Complete': format_dt(best_ready),
+            'Tippler Start Time': format_dt(best_start),
+            'Finish Unload': format_dt(best_fin),
+            'Tipplers Used': best_used,
+            'Wait (Tippler)': format_duration_hhmm(best_start - best_ready),
             'Total Duration': format_duration_hhmm(tot_dur_final),
             'Demurrage': dem_str
         }
         for t in ['T1', 'T2', 'T3', 'T4']:
-             row_data[f"{t} Start"] = format_dt(tim_A.get(f"{t}_Start", pd.NaT))
-             row_data[f"{t} End"] = format_dt(tim_A.get(f"{t}_End", pd.NaT))
-             row_data[f"{t} Idle"] = format_duration_hhmm(tim_A.get(f"{t}_Idle", pd.NaT))
+             row_data[f"{t} Start"] = format_dt(best_timings.get(f"{t}_Start", pd.NaT))
+             row_data[f"{t} End"] = format_dt(best_timings.get(f"{t}_End", pd.NaT))
+             row_data[f"{t} Idle"] = format_duration_hhmm(best_timings.get(f"{t}_Idle", pd.NaT))
         assignments.append(row_data)
 
     df_sim = pd.DataFrame(assignments)
