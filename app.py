@@ -155,36 +155,39 @@ def parse_last_sequence(rake_name):
     return 0, 0
 
 def parse_tippler_cell(cell_value, ref_date):
+    """
+    Parses ANY text containing times like "06:40" and "08:45"
+    Returns (Start_DT, End_DT) if at least 2 times are found.
+    """
     if pd.isnull(cell_value): return pd.NaT, pd.NaT
     s = str(cell_value).strip()
+    
+    # Find ALL matches of HH:MM pattern
     times_found = re.findall(r'(\d{1,2}:\d{2})', s)
+    
     if len(times_found) >= 2:
-        start_str, end_str = times_found[0], times_found[1]
+        start_str = times_found[0]
+        end_str = times_found[1] # Take first two distinct times
+        
         try:
             if ref_date.tzinfo is None: ref_date = IST.localize(ref_date)
+            
             s_h, s_m = map(int, start_str.split(':'))
             e_h, e_m = map(int, end_str.split(':'))
+            
             start_dt = ref_date.replace(hour=s_h, minute=s_m, second=0, microsecond=0)
             end_dt = ref_date.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
-            if end_dt < start_dt: end_dt += timedelta(days=1)
+            
+            if end_dt < start_dt:
+                end_dt += timedelta(days=1)
+                
             if (start_dt - ref_date).total_seconds() < -43200: 
                  start_dt += timedelta(days=1); end_dt += timedelta(days=1)
+
             return start_dt, end_dt
         except: pass
+        
     return pd.NaT, pd.NaT
-
-def parse_col_d_wagon_type(cell_val):
-    wagons = 58 
-    load_type = 'BOXN' 
-    if pd.isnull(cell_val): return wagons, load_type
-    s = str(cell_val).strip().upper()
-    match_num = re.search(r'(\d{2})', s)
-    if match_num:
-        try: wagons = int(match_num.group(1))
-        except: pass
-    if 'R' in s: load_type = 'BOBR'
-    elif 'N' in s: load_type = 'BOXN'
-    return wagons, load_type
 
 # ==========================================
 # 3. GOOGLE SHEET PARSER (Cached)
@@ -208,7 +211,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         unplanned_actuals = [] 
         
         # --- REMOVED TODAY DATE FILTER ---
-        # Now processes entire sheet history visible in CSV
+        today_date = datetime.now(IST).date()
         last_seq_tuple = (0, 0)
 
         for _, row in df_gs.iterrows():
@@ -223,13 +226,14 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             source_val = str(row.iloc[2]) 
             if source_val.lower() == 'nan': source_val = ""
             
-            col_d_val = row.iloc[3]
-            wagons, load_type = parse_col_d_wagon_type(col_d_val)
+            load_type = 'BOXN'
+            if 'BOBR' in str(row.iloc[1]).upper(): load_type = 'BOBR'
 
             start_dt = safe_parse_date(row.iloc[5])
             end_dt = safe_parse_date(row.iloc[6])
             if pd.isnull(start_dt): start_dt = arrival_dt 
             
+            # --- TIPPLER PARSING (Robust) ---
             tippler_timings = {}
             used_tipplers = []
             
@@ -251,7 +255,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 unplanned_actuals.append({
                     'Coal Source': source_val,
                     'Load Type': load_type,
-                    'Wagons': wagons,
+                    'Wagons': 58,
                     'Status': 'Pending (G-Sheet)',
                     '_Arrival_DT': arrival_dt,
                     '_Form_Mins': 0,
@@ -284,7 +288,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 'Rake': rake_name,
                 'Coal Source': source_val,
                 'Load Type': load_type,
-                'Wagons': wagons,
+                'Wagons': 58,
                 'Status': 'ACTUAL',
                 '_Arrival_DT': arrival_dt,
                 '_Shunt_Ready_DT': start_dt,
@@ -318,7 +322,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         return pd.DataFrame(), pd.DataFrame(), (0,0)
 
 # ==========================================
-# 4. CORE SIMULATION LOGIC
+# 4. CORE SIMULATION LOGIC (FIXED SORT)
 # ==========================================
 
 def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state, downtime_list, 
@@ -331,10 +335,21 @@ def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state,
         if free_at.tzinfo is None: free_at = IST.localize(free_at)
         prop_start = max(ready_time, free_at)
         effective_start = check_downtime_impact(t, prop_start, downtime_list)
+        
+        # Calculate Finish Time here to sort by Speed
         predicted_finish = effective_start + timedelta(hours=wagons / rates[t])
-        candidates.append({'id': t, 'rate': rates[t], 'eff_start': effective_start, 'free_at': free_at, 'pred_fin': predicted_finish})
+        
+        candidates.append({
+            'id': t, 
+            'rate': rates[t], 
+            'eff_start': effective_start, 
+            'free_at': free_at,
+            'pred_fin': predicted_finish # Store finish time
+        })
     
+    # Sort by Predicted Finish Time (Ascending) instead of Start Time
     sorted_tipplers = sorted(candidates, key=lambda x: x['pred_fin'])
+    
     prim = sorted_tipplers[0]
     t_primary = prim['id']
     
@@ -370,6 +385,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
 
     if not df_csv.empty:
         df = df_csv.copy()
+        
         load_col = find_column(df, ['LOAD TYPE', 'CMDT', 'COMMODITY'])
         if load_col:
             df = df[df[load_col].astype(str).str.upper().str.contains('BOXN|BOBR', regex=True, na=False)]
@@ -424,6 +440,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     sim_start_time = first_arrival.replace(hour=0, minute=0, second=0, microsecond=0)
     if sim_start_time.tzinfo is None: sim_start_time = IST.localize(sim_start_time)
 
+    # State from Locked
     tippler_state = {k: sim_start_time for k in ['T1', 'T2', 'T3', 'T4']}
     if not df_locked.empty:
         for _, row in df_locked.iterrows():
@@ -443,6 +460,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                         if t in used_str and end_val > tippler_state[t]:
                             tippler_state[t] = end_val
 
+    # RESTORED KEYS HERE
     line_groups = {
         'Group_Lines_8_10': {'capacity': 2, 'clearance_mins': 50, 'line_free_times': []},
         'Group_Line_11': {'capacity': 1, 'clearance_mins': 100, 'line_free_times': []}
@@ -496,15 +514,19 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         fin_B, used_B, start_B, tim_B, _ = calculate_generic_finish(
             rake['Wagons'], ['T3', 'T4'], ready_B, tippler_state, downtimes, rates, w_batch, w_delay)
         
+        # --- OPTIMIZATION (Speed Check) ---
         if fin_B < fin_A:
+            # Winner is B (T3/T4)
             best_fin, best_used, best_start, best_timings, best_entry, best_ready = fin_B, used_B, start_B, tim_B, entry_B, ready_B
             best_grp, best_line = 'Group_Line_11', '11'
             best_type = "Standard (Fast)"
         else:
+            # Winner is A (T1/T2)
             best_fin, best_used, best_start, best_timings, best_entry, best_ready = fin_A, used_A, start_A, tim_A, entry_A, ready_A
             best_grp, best_line = 'Group_Lines_8_10', '8/9/10'
             best_type = "Standard"
 
+        # Commit State
         for k, v in best_timings.items():
             if 'End' in k: tippler_state[k.split('_')[0]] = v
         if best_grp == 'Group_Lines_8_10':
