@@ -12,6 +12,7 @@ import re
 st.set_page_config(page_title="Railway Logic Optimizer (IST)", layout="wide")
 st.title("🚂 BOXN & BOBR Rake Logistics Dashboard (IST)")
 
+# Define IST Timezone
 IST = pytz.timezone('Asia/Kolkata')
 
 # --- SIDEBAR INPUTS ---
@@ -63,7 +64,8 @@ sim_params['downtimes'] = st.session_state.downtimes
 
 def to_ist(dt):
     if pd.isnull(dt): return pd.NaT
-    if dt.tzinfo is None: return IST.localize(dt)
+    if dt.tzinfo is None:
+        return IST.localize(dt)
     return dt.astimezone(IST)
 
 def parse_wagons(val):
@@ -87,8 +89,10 @@ def restore_dt(dt_str, ref_dt):
         day = int(parts[0])
         time_parts = parts[1].split(':')
         hour, minute = int(time_parts[0]), int(time_parts[1])
+        
         if ref_dt.tzinfo is None: ref_dt = IST.localize(ref_dt)
         new_dt = ref_dt.replace(day=day, hour=hour, minute=minute, second=0)
+        
         if day < ref_dt.day - 15: new_dt = new_dt + pd.DateOffset(months=1)
         elif day > ref_dt.day + 15: new_dt = new_dt - pd.DateOffset(months=1)
         return new_dt
@@ -130,7 +134,8 @@ def find_column(df, candidates):
     cols_upper = [str(c).upper().strip() for c in df.columns]
     for cand in candidates:
         cand_upper = cand.upper().strip()
-        if cand_upper in cols_upper: return df.columns[cols_upper.index(cand_upper)]
+        if cand_upper in cols_upper:
+            return df.columns[cols_upper.index(cand_upper)]
         for c in cols_upper:
             if cand_upper == c: return df.columns[cols_upper.index(c)]
     return None
@@ -139,7 +144,8 @@ def parse_last_sequence(rake_name):
     try:
         s = str(rake_name).strip()
         match_complex = re.search(r'(\d+)\D+(\d+)', s)
-        if match_complex: return int(match_complex.group(1)), int(match_complex.group(2))
+        if match_complex:
+            return int(match_complex.group(1)), int(match_complex.group(2))
         match_single = re.search(r'^(\d+)', s)
         if match_single:
             val = int(match_single.group(1))
@@ -168,27 +174,16 @@ def parse_tippler_cell(cell_value, ref_date):
     return pd.NaT, pd.NaT
 
 def parse_col_d_wagon_type(cell_val):
-    """
-    Parses Column D string like '58N' or '59R'.
-    Returns (wagons, load_type).
-    """
-    wagons = 58 # Default
-    load_type = 'BOXN' # Default
-    
+    wagons = 58 
+    load_type = 'BOXN' 
     if pd.isnull(cell_val): return wagons, load_type
     s = str(cell_val).strip().upper()
-    
-    # Extract first 2 digits
     match_num = re.search(r'(\d{2})', s)
     if match_num:
         try: wagons = int(match_num.group(1))
         except: pass
-        
-    # Extract Type Char (N or R)
-    # Use simple check: if 'R' is present, BOBR. Else BOXN.
     if 'R' in s: load_type = 'BOBR'
     elif 'N' in s: load_type = 'BOXN'
-    
     return wagons, load_type
 
 # ==========================================
@@ -211,7 +206,9 @@ def fetch_google_sheet_actuals(url, free_time_hours):
 
         locked_actuals = []
         unplanned_actuals = [] 
-        today_date = datetime.now(IST).date()
+        
+        # --- REMOVED TODAY DATE FILTER ---
+        # Now processes entire sheet history visible in CSV
         last_seq_tuple = (0, 0)
 
         for _, row in df_gs.iterrows():
@@ -223,12 +220,9 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
                 last_seq_tuple = (seq, rid)
 
-            if arrival_dt.date() != today_date: continue
-
             source_val = str(row.iloc[2]) 
             if source_val.lower() == 'nan': source_val = ""
             
-            # --- NEW PARSING FOR COL D (Index 3) ---
             col_d_val = row.iloc[3]
             wagons, load_type = parse_col_d_wagon_type(col_d_val)
 
@@ -236,7 +230,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             end_dt = safe_parse_date(row.iloc[6])
             if pd.isnull(start_dt): start_dt = arrival_dt 
             
-            # --- TIPPLER PARSING ---
             tippler_timings = {}
             used_tipplers = []
             
@@ -431,7 +424,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     sim_start_time = first_arrival.replace(hour=0, minute=0, second=0, microsecond=0)
     if sim_start_time.tzinfo is None: sim_start_time = IST.localize(sim_start_time)
 
-    # State from Locked
     tippler_state = {k: sim_start_time for k in ['T1', 'T2', 'T3', 'T4']}
     if not df_locked.empty:
         for _, row in df_locked.iterrows():
@@ -504,7 +496,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         fin_B, used_B, start_B, tim_B, _ = calculate_generic_finish(
             rake['Wagons'], ['T3', 'T4'], ready_B, tippler_state, downtimes, rates, w_batch, w_delay)
         
-        # --- OPTIMIZATION (Speed Check) ---
         if fin_B < fin_A:
             best_fin, best_used, best_start, best_timings, best_entry, best_ready = fin_B, used_B, start_B, tim_B, entry_B, ready_B
             best_grp, best_line = 'Group_Line_11', '11'
@@ -514,7 +505,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             best_grp, best_line = 'Group_Lines_8_10', '8/9/10'
             best_type = "Standard"
 
-        # Commit State
         for k, v in best_timings.items():
             if 'End' in k: tippler_state[k.split('_')[0]] = v
         if best_grp == 'Group_Lines_8_10':
