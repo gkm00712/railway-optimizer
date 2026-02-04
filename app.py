@@ -139,7 +139,8 @@ def parse_last_sequence(rake_name):
     try:
         s = str(rake_name).strip()
         match_complex = re.search(r'(\d+)\D+(\d+)', s)
-        if match_complex: return int(match_complex.group(1)), int(match_complex.group(2))
+        if match_complex:
+            return int(match_complex.group(1)), int(match_complex.group(2))
         match_single = re.search(r'^(\d+)', s)
         if match_single:
             val = int(match_single.group(1))
@@ -149,18 +150,27 @@ def parse_last_sequence(rake_name):
     return 0, 0
 
 def parse_tippler_cell(cell_value, ref_date):
+    """
+    Parses ANY text containing times like "06:40" and "08:45"
+    Returns (Start_DT, End_DT) if at least 2 times are found.
+    """
     if pd.isnull(cell_value): return pd.NaT, pd.NaT
     s = str(cell_value).strip()
+    
     times_found = re.findall(r'(\d{1,2}:\d{2})', s)
+    
     if len(times_found) >= 2:
-        start_str, end_str = times_found[0], times_found[1]
+        start_str = times_found[0]
+        end_str = times_found[1] 
         try:
             if ref_date.tzinfo is None: ref_date = IST.localize(ref_date)
             s_h, s_m = map(int, start_str.split(':'))
             e_h, e_m = map(int, end_str.split(':'))
             start_dt = ref_date.replace(hour=s_h, minute=s_m, second=0, microsecond=0)
             end_dt = ref_date.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
+            
             if end_dt < start_dt: end_dt += timedelta(days=1)
+            # Heuristic for previous day
             if (start_dt - ref_date).total_seconds() < -43200: 
                  start_dt += timedelta(days=1); end_dt += timedelta(days=1)
             return start_dt, end_dt
@@ -181,7 +191,7 @@ def parse_col_d_wagon_type(cell_val):
     return wagons, load_type
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER
+# 3. GOOGLE SHEET PARSER (Fixed Seq Logic)
 # ==========================================
 
 def safe_parse_date(val):
@@ -202,28 +212,22 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         unplanned_actuals = [] 
         
         today_date = datetime.now(IST).date()
-        last_seq_tuple = (0, 0)
+        last_seq_tuple = (0, 0) # Format: (Seq, ID)
 
         for _, row in df_gs.iterrows():
-            # --- 1. VALIDITY CHECK (B & C Must be Filled) ---
-            # B=Index 1, C=Index 2
+            # --- 1. VALIDITY CHECK ---
             val_b = str(row.iloc[1]).strip()
             val_c = str(row.iloc[2]).strip()
             if not val_b or not val_c or val_b.lower() == 'nan' or val_c.lower() == 'nan':
-                continue # Skip row completely
+                continue 
 
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
-            # --- 2. SEQUENCE TRACKING ---
             rake_name = val_b
-            seq, rid = parse_last_sequence(rake_name)
-            if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
-                last_seq_tuple = (seq, rid)
-
             source_val = val_c
             
-            # --- 3. PARSE COL D (Index 3) ---
+            # Parse Col D
             col_d_val = row.iloc[3]
             wagons, load_type = parse_col_d_wagon_type(col_d_val)
 
@@ -231,7 +235,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             end_dt = safe_parse_date(row.iloc[6])
             if pd.isnull(start_dt): start_dt = arrival_dt 
             
-            # --- 4. TIPPLER PARSING & CHECK ---
+            # Parse Tipplers
             tippler_timings = {}
             used_tipplers = []
             
@@ -249,9 +253,20 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                         tippler_timings[f"{t_name} End"] = format_dt(te)
                         tippler_timings[f"{t_name}_Obj_End"] = te
 
-            # --- 5. LOGIC SPLIT ---
-            # Case A: Unplanned (No Tipplers Assigned)
-            if not used_tipplers and load_type != 'BOBR':
+            # --- DECISION: LOCKED OR UNPLANNED? ---
+            is_unplanned = (not used_tipplers and load_type != 'BOBR')
+            
+            # --- FILTERING LOGIC (MOVED BEFORE SEQUENCE TRACKING) ---
+            # If Actual and Yesterday -> Skip completely (Sequence NOT tracked for hidden items)
+            if not is_unplanned and arrival_dt.date() < today_date:
+                continue
+                
+            # --- SEQUENCE TRACKING (Only for Visible Rows) ---
+            seq, rid = parse_last_sequence(rake_name)
+            if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
+                last_seq_tuple = (seq, rid)
+
+            if is_unplanned:
                 unplanned_actuals.append({
                     'Coal Source': source_val,
                     'Load Type': load_type,
@@ -263,15 +278,9 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                     'Extra Shunt (Mins)': 0,
                     'is_gs_unplanned': True 
                 })
-                # Note: We do NOT filter unplanned by date (backlog must be cleared)
                 continue 
 
-            # Case B: Locked Actuals
-            # Filter Logic: "dont show yesterday data even if unloading ends on current day"
-            # Strict Interpretation: If Arrival < Today, HIDE IT.
-            if arrival_dt.date() < today_date:
-                continue
-
+            # Process Locked Actual
             raw_dur = row.iloc[8]
             total_dur = timedelta(0)
             if pd.notnull(raw_dur):
