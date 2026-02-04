@@ -210,7 +210,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         locked_actuals = []
         unplanned_actuals = [] 
         
-        # --- REMOVED TODAY DATE FILTER ---
         today_date = datetime.now(IST).date()
         last_seq_tuple = (0, 0)
 
@@ -218,6 +217,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
+            # --- 1. ALWAYS TRACK SEQUENCE (Even if filtered out) ---
             rake_name = str(row.iloc[1])
             seq, rid = parse_last_sequence(rake_name)
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
@@ -233,7 +233,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             end_dt = safe_parse_date(row.iloc[6])
             if pd.isnull(start_dt): start_dt = arrival_dt 
             
-            # --- TIPPLER PARSING (Robust) ---
+            # --- 2. TIPPLER PARSING ---
             tippler_timings = {}
             used_tipplers = []
             
@@ -251,6 +251,20 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                         tippler_timings[f"{t_name} End"] = format_dt(te)
                         tippler_timings[f"{t_name}_Obj_End"] = te
 
+            # --- 3. FILTERING: HIDE OLD COMPLETED RAKES ---
+            # Keep if:
+            # 1. Active (No End Time)
+            # 2. Finished Today or Future
+            # 3. Arrived Today or Future
+            is_active = pd.isnull(end_dt)
+            is_finished_today_or_later = (pd.notnull(end_dt) and end_dt.date() >= today_date)
+            is_arrived_today_or_later = (arrival_dt.date() >= today_date)
+
+            if not (is_active or is_finished_today_or_later or is_arrived_today_or_later):
+                # This is old history -> Skip adding to list, but Sequence was already tracked above.
+                continue
+
+            # --- 4. DECISION: LOCKED OR UNPLANNED? ---
             if not used_tipplers and load_type != 'BOBR':
                 unplanned_actuals.append({
                     'Coal Source': source_val,
@@ -385,7 +399,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
 
     if not df_csv.empty:
         df = df_csv.copy()
-        
         load_col = find_column(df, ['LOAD TYPE', 'CMDT', 'COMMODITY'])
         if load_col:
             df = df[df[load_col].astype(str).str.upper().str.contains('BOXN|BOBR', regex=True, na=False)]
