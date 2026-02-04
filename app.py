@@ -155,42 +155,57 @@ def parse_last_sequence(rake_name):
     return 0, 0
 
 def parse_tippler_cell(cell_value, ref_date):
-    """
-    Parses ANY text containing times like "06:40" and "08:45"
-    Returns (Start_DT, End_DT) if at least 2 times are found.
-    """
     if pd.isnull(cell_value): return pd.NaT, pd.NaT
     s = str(cell_value).strip()
-    
-    # Find ALL matches of HH:MM pattern
+    # Find any time format HH:MM
     times_found = re.findall(r'(\d{1,2}:\d{2})', s)
     
     if len(times_found) >= 2:
         start_str = times_found[0]
-        end_str = times_found[1] # Take first two distinct times
-        
+        end_str = times_found[1] 
         try:
             if ref_date.tzinfo is None: ref_date = IST.localize(ref_date)
-            
             s_h, s_m = map(int, start_str.split(':'))
             e_h, e_m = map(int, end_str.split(':'))
             
             start_dt = ref_date.replace(hour=s_h, minute=s_m, second=0, microsecond=0)
             end_dt = ref_date.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
             
-            if end_dt < start_dt:
-                end_dt += timedelta(days=1)
-                
+            if end_dt < start_dt: end_dt += timedelta(days=1)
+            # Heuristic for previous day
             if (start_dt - ref_date).total_seconds() < -43200: 
                  start_dt += timedelta(days=1); end_dt += timedelta(days=1)
 
             return start_dt, end_dt
         except: pass
-        
     return pd.NaT, pd.NaT
 
+def parse_col_d_wagon_type(cell_val):
+    """
+    Parses Column D string like '58N' or '59R'.
+    Returns (wagons, load_type).
+    """
+    wagons = 58 # Default
+    load_type = 'BOXN' # Default
+    
+    if pd.isnull(cell_val): return wagons, load_type
+    s = str(cell_val).strip().upper()
+    
+    # 1. Extract first 2 digits
+    match_num = re.search(r'(\d{2})', s)
+    if match_num:
+        try: wagons = int(match_num.group(1))
+        except: pass
+        
+    # 2. Extract Type Char (N or R)
+    # Check if 'R' exists -> BOBR. Else 'N' or default -> BOXN.
+    if 'R' in s: load_type = 'BOBR'
+    elif 'N' in s: load_type = 'BOXN'
+    
+    return wagons, load_type
+
 # ==========================================
-# 3. GOOGLE SHEET PARSER (Cached)
+# 3. GOOGLE SHEET PARSER (Strict Date Filter + Col D Parse)
 # ==========================================
 
 def safe_parse_date(val):
@@ -217,23 +232,31 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
-            # --- 1. ALWAYS TRACK SEQUENCE (Even if filtered out) ---
+            # --- 1. ALWAYS TRACK SEQUENCE (Even if hidden) ---
             rake_name = str(row.iloc[1])
             seq, rid = parse_last_sequence(rake_name)
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
                 last_seq_tuple = (seq, rid)
 
+            # --- 2. STRICT DATE FILTER ---
+            # "dont show yesterday data even if unloading ends on current day"
+            # This means: If Arrival Date < Today, IGNORE IT.
+            if arrival_dt.date() < today_date:
+                continue
+
             source_val = str(row.iloc[2]) 
             if source_val.lower() == 'nan': source_val = ""
             
-            load_type = 'BOXN'
-            if 'BOBR' in str(row.iloc[1]).upper(): load_type = 'BOBR'
+            # --- 3. PARSE COL D (Index 3) for WAGONS & TYPE ---
+            col_d_val = row.iloc[3]
+            wagons, load_type = parse_col_d_wagon_type(col_d_val)
 
             start_dt = safe_parse_date(row.iloc[5])
             end_dt = safe_parse_date(row.iloc[6])
+            # Fallback Start
             if pd.isnull(start_dt): start_dt = arrival_dt 
             
-            # --- 2. TIPPLER PARSING ---
+            # --- 4. TIPPLER PARSING ---
             tippler_timings = {}
             used_tipplers = []
             
@@ -241,6 +264,8 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 cell_val = row.iloc[idx]
                 if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
                     ts, te = parse_tippler_cell(cell_val, arrival_dt)
+                    
+                    # Fallback logic if cell is used but no time found
                     if pd.isnull(ts) and pd.notnull(start_dt):
                         ts = start_dt
                         te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2)
@@ -251,25 +276,12 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                         tippler_timings[f"{t_name} End"] = format_dt(te)
                         tippler_timings[f"{t_name}_Obj_End"] = te
 
-            # --- 3. FILTERING: HIDE OLD COMPLETED RAKES ---
-            # Keep if:
-            # 1. Active (No End Time)
-            # 2. Finished Today or Future
-            # 3. Arrived Today or Future
-            is_active = pd.isnull(end_dt)
-            is_finished_today_or_later = (pd.notnull(end_dt) and end_dt.date() >= today_date)
-            is_arrived_today_or_later = (arrival_dt.date() >= today_date)
-
-            if not (is_active or is_finished_today_or_later or is_arrived_today_or_later):
-                # This is old history -> Skip adding to list, but Sequence was already tracked above.
-                continue
-
-            # --- 4. DECISION: LOCKED OR UNPLANNED? ---
+            # --- 5. DECISION: LOCKED OR UNPLANNED? ---
             if not used_tipplers and load_type != 'BOBR':
                 unplanned_actuals.append({
                     'Coal Source': source_val,
                     'Load Type': load_type,
-                    'Wagons': 58,
+                    'Wagons': wagons,
                     'Status': 'Pending (G-Sheet)',
                     '_Arrival_DT': arrival_dt,
                     '_Form_Mins': 0,
@@ -302,7 +314,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 'Rake': rake_name,
                 'Coal Source': source_val,
                 'Load Type': load_type,
-                'Wagons': 58,
+                'Wagons': wagons,
                 'Status': 'ACTUAL',
                 '_Arrival_DT': arrival_dt,
                 '_Shunt_Ready_DT': start_dt,
@@ -336,7 +348,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         return pd.DataFrame(), pd.DataFrame(), (0,0)
 
 # ==========================================
-# 4. CORE SIMULATION LOGIC (FIXED SORT)
+# 4. CORE SIMULATION LOGIC
 # ==========================================
 
 def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state, downtime_list, 
@@ -361,9 +373,7 @@ def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state,
             'pred_fin': predicted_finish # Store finish time
         })
     
-    # Sort by Predicted Finish Time (Ascending) instead of Start Time
     sorted_tipplers = sorted(candidates, key=lambda x: x['pred_fin'])
-    
     prim = sorted_tipplers[0]
     t_primary = prim['id']
     
@@ -399,6 +409,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
 
     if not df_csv.empty:
         df = df_csv.copy()
+        
         load_col = find_column(df, ['LOAD TYPE', 'CMDT', 'COMMODITY'])
         if load_col:
             df = df[df[load_col].astype(str).str.upper().str.contains('BOXN|BOBR', regex=True, na=False)]
@@ -529,12 +540,10 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         
         # --- OPTIMIZATION (Speed Check) ---
         if fin_B < fin_A:
-            # Winner is B (T3/T4)
             best_fin, best_used, best_start, best_timings, best_entry, best_ready = fin_B, used_B, start_B, tim_B, entry_B, ready_B
             best_grp, best_line = 'Group_Line_11', '11'
             best_type = "Standard (Fast)"
         else:
-            # Winner is A (T1/T2)
             best_fin, best_used, best_start, best_timings, best_entry, best_ready = fin_A, used_A, start_A, tim_A, entry_A, ready_A
             best_grp, best_line = 'Group_Lines_8_10', '8/9/10'
             best_type = "Standard"
