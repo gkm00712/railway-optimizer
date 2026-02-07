@@ -19,6 +19,7 @@ st.sidebar.header("⚙️ Settings")
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
 
 st.sidebar.markdown("---")
+# Collect params into a dictionary to track changes
 sim_params = {}
 sim_params['rt1'] = st.sidebar.number_input("Tippler 1 Rate", value=6.0, step=0.5)
 sim_params['rt2'] = st.sidebar.number_input("Tippler 2 Rate", value=6.0, step=0.5)
@@ -242,20 +243,14 @@ def fetch_google_sheet_actuals(url, free_time_hours):
 
             is_unplanned = (not used_tipplers and load_type != 'BOBR')
             
-            # --- 1. FILTER: KEEP "ACTIVE" PAST RAKES ---
-            # If a rake arrived yesterday but is NOT finished (or finished Today), KEEP IT.
-            # Only drop if it completely finished yesterday or earlier.
-            if not is_unplanned:
-                is_finished_in_past = (pd.notnull(end_dt) and end_dt.date() < today_date)
-                if arrival_dt.date() < today_date and is_finished_in_past:
-                    continue # Truly done and dusted. Skip.
+            # --- FILTER LOGIC (UPDATED) ---
+            # If Actual and Yesterday -> SKIP. AND DO NOT count sequence.
+            # This ensures next rake number starts after the last VISIBLE rake.
+            if not is_unplanned and arrival_dt.date() < today_date:
+                continue
             
-            # --- 2. SEQUENCE (Visible Only) ---
-            # Now that we've filtered out the truly old stuff, track sequence.
-            # Note: Carry-over rakes (Arrived Yesterday, End Today) ARE tracked here
-            # because they are mathematically part of today's workload.
+            # --- SEQUENCE TRACKING (Only visible rakes) ---
             seq, rid = parse_last_sequence(rake_name)
-            # Only update sequence if this rake is 'fresh' enough to be relevant
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
                 last_seq_tuple = (seq, rid)
 
@@ -579,13 +574,9 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     df_sim = pd.DataFrame(assignments)
     
     if not df_locked.empty:
-        # VISUAL FILTER: Drop carry-over rakes (Arrived Yesterday) from Display
-        # Note: We keep them in calculation but drop them here
-        today_date = datetime.now(IST).date()
-        df_locked_visible = df_locked[df_locked['_Arrival_DT'].dt.date >= today_date]
-        
+        # Visual Filter to drop old rakes from display
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers']
-        actuals_clean = df_locked_visible.drop(columns=[c for c in cols_to_drop if c in df_locked_visible.columns], errors='ignore')
+        actuals_clean = df_locked.drop(columns=[c for c in cols_to_drop if c in df_locked.columns], errors='ignore')
         final_df = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
     else:
         final_df = df_sim
@@ -614,6 +605,16 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
 # ==========================================
 
 uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
+
+# RE-RUN DETECTION
+# We store a "last_params_hash" to detect sidebar changes explicitly
+curr_params_hash = str(sim_params)
+params_changed = False
+if 'last_params_hash' not in st.session_state:
+    st.session_state.last_params_hash = curr_params_hash
+elif st.session_state.last_params_hash != curr_params_hash:
+    params_changed = True
+    st.session_state.last_params_hash = curr_params_hash
 
 input_changed = False
 if uploaded_file and ('last_file_id' not in st.session_state or st.session_state.last_file_id != uploaded_file.file_id):
@@ -645,7 +646,8 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_unplanned = st.session_state.get('unplanned_df', pd.DataFrame())
     start_seq = st.session_state.get('last_seq', (0,0))
     
-    if input_changed or 'sim_result' not in st.session_state:
+    # Run logic if: New File OR New Params OR First Load
+    if input_changed or params_changed or 'sim_result' not in st.session_state:
         sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, df_unplanned, start_seq)
         st.session_state.sim_result = sim_result
         st.session_state.sim_start_dt = sim_start_dt
