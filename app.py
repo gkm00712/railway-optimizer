@@ -19,7 +19,7 @@ st.sidebar.header("⚙️ Settings")
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
 
 st.sidebar.markdown("---")
-# Collect params into a dictionary to track changes
+# Params collection
 sim_params = {}
 sim_params['rt1'] = st.sidebar.number_input("Tippler 1 Rate", value=6.0, step=0.5)
 sim_params['rt2'] = st.sidebar.number_input("Tippler 2 Rate", value=6.0, step=0.5)
@@ -58,6 +58,15 @@ if st.session_state.downtimes:
         st.rerun()
 sim_params['downtimes'] = st.session_state.downtimes
 
+# Detect Parameter Changes to Trigger Rerun
+curr_params_hash = str(sim_params)
+params_changed = False
+if 'last_params_hash' not in st.session_state:
+    st.session_state.last_params_hash = curr_params_hash
+elif st.session_state.last_params_hash != curr_params_hash:
+    params_changed = True
+    st.session_state.last_params_hash = curr_params_hash
+
 # ==========================================
 # 2. HELPER FUNCTIONS
 # ==========================================
@@ -81,18 +90,17 @@ def format_dt(dt):
     if dt.tzinfo is None: dt = IST.localize(dt)
     return dt.strftime('%d-%H:%M')
 
-def restore_dt(dt_str, ref_dt):
-    if not isinstance(dt_str, str) or dt_str.strip() == "": return pd.NaT
+def parse_dt_from_str(dt_str, year_ref):
+    # Reverse of format_dt for calculation
     try:
-        parts = dt_str.split('-') 
+        if not dt_str: return pd.NaT
+        parts = dt_str.split('-')
         day = int(parts[0])
-        time_parts = parts[1].split(':')
-        hour, minute = int(time_parts[0]), int(time_parts[1])
-        if ref_dt.tzinfo is None: ref_dt = IST.localize(ref_dt)
-        new_dt = ref_dt.replace(day=day, hour=hour, minute=minute, second=0)
-        if day < ref_dt.day - 15: new_dt = new_dt + pd.DateOffset(months=1)
-        elif day > ref_dt.day + 15: new_dt = new_dt - pd.DateOffset(months=1)
-        return new_dt
+        hm = parts[1].split(':')
+        h, m = int(hm[0]), int(hm[1])
+        # Construct approximate date
+        dt = datetime(year_ref, datetime.now().month, day, h, m)
+        return IST.localize(dt)
     except: return pd.NaT
 
 def format_duration_hhmm(delta):
@@ -183,7 +191,7 @@ def parse_col_d_wagon_type(cell_val):
     return wagons, load_type
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (Intelligent Filter)
+# 3. GOOGLE SHEET PARSER
 # ==========================================
 
 def safe_parse_date(val):
@@ -207,6 +215,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         last_seq_tuple = (0, 0)
 
         for _, row in df_gs.iterrows():
+            # Validity Check
             val_b = str(row.iloc[1]).strip()
             val_c = str(row.iloc[2]).strip()
             if not val_b or not val_c or val_b.lower() == 'nan' or val_c.lower() == 'nan':
@@ -241,15 +250,14 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                         tippler_timings[f"{t_name} End"] = format_dt(te)
                         tippler_timings[f"{t_name}_Obj_End"] = te
 
+            # Logic
             is_unplanned = (not used_tipplers and load_type != 'BOBR')
             
-            # --- FILTER LOGIC (UPDATED) ---
-            # If Actual and Yesterday -> SKIP. AND DO NOT count sequence.
-            # This ensures next rake number starts after the last VISIBLE rake.
+            # Filter: If Arrival < Today AND not unplanned -> Skip
             if not is_unplanned and arrival_dt.date() < today_date:
                 continue
             
-            # --- SEQUENCE TRACKING (Only visible rakes) ---
+            # Sequence (Visible Only)
             seq, rid = parse_last_sequence(rake_name)
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
                 last_seq_tuple = (seq, rid)
@@ -338,12 +346,7 @@ def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state,
         prop_start = max(ready_time, free_at)
         effective_start = check_downtime_impact(t, prop_start, downtime_list)
         pred_finish = effective_start + timedelta(hours=wagons / rates[t])
-        
-        candidates.append({
-            'id': t, 'rate': rates[t], 
-            'eff_start': effective_start, 'free_at': free_at, 
-            'pred_fin': pred_finish
-        })
+        candidates.append({'id': t, 'rate': rates[t], 'eff_start': effective_start, 'free_at': free_at, 'pred_fin': pred_finish})
     
     candidates.sort(key=lambda x: x['pred_fin'])
     best_solo = candidates[0]
@@ -574,9 +577,10 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     df_sim = pd.DataFrame(assignments)
     
     if not df_locked.empty:
-        # Visual Filter to drop old rakes from display
+        today_date = datetime.now(IST).date()
+        df_locked_visible = df_locked[df_locked['_Arrival_DT'].dt.date >= today_date]
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers']
-        actuals_clean = df_locked.drop(columns=[c for c in cols_to_drop if c in df_locked.columns], errors='ignore')
+        actuals_clean = df_locked_visible.drop(columns=[c for c in cols_to_drop if c in df_locked_visible.columns], errors='ignore')
         final_df = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
     else:
         final_df = df_sim
@@ -584,21 +588,60 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     return final_df, sim_start_time
 
 def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
-    recalc_rows = []
-    daily_demurrage_hours = {}
+    # Stats Accumulator
+    daily_stats = {} # {DateStr: {'demurrage': 0, 'T1': 0, 'T2': 0...}}
+    
     for _, row in edited_df.iterrows():
-        try:
-            dem_val = str(row['Demurrage']).strip()
-            dem_hrs = 0
-            if ":" in dem_val: dem_hrs = int(dem_val.split(":")[0])
-            elif dem_val.isdigit(): dem_hrs = int(dem_val)
-            arr_dt = pd.to_datetime(row['_Arrival_DT'])
-            if arr_dt.tzinfo is None: arr_dt = IST.localize(arr_dt)
-            d_str = arr_dt.strftime('%Y-%m-%d')
-            daily_demurrage_hours[d_str] = daily_demurrage_hours.get(d_str, 0) + dem_hrs
-        except: pass
-        recalc_rows.append(row)
-    return pd.DataFrame(recalc_rows), daily_demurrage_hours
+        # Demurrage
+        dem_val = str(row['Demurrage']).strip()
+        dem_hrs = 0
+        if ":" in dem_val: dem_hrs = int(dem_val.split(":")[0])
+        elif dem_val.isdigit(): dem_hrs = int(dem_val)
+        
+        arr_dt = pd.to_datetime(row['_Arrival_DT'])
+        if arr_dt.tzinfo is None: arr_dt = IST.localize(arr_dt)
+        d_str = arr_dt.strftime('%Y-%m-%d')
+        
+        if d_str not in daily_stats: daily_stats[d_str] = {'Demurrage': 0, 'T1': 0.0, 'T2': 0.0, 'T3': 0.0, 'T4': 0.0}
+        daily_stats[d_str]['Demurrage'] += dem_hrs
+        
+        # Efficiency (T1-T4)
+        current_year = datetime.now().year
+        for t in ['T1', 'T2', 'T3', 'T4']:
+            start_str = str(row.get(f"{t} Start", ""))
+            end_str = str(row.get(f"{t} End", ""))
+            if start_str and end_str:
+                s_dt = parse_dt_from_str(start_str, current_year)
+                e_dt = parse_dt_from_str(end_str, current_year)
+                
+                # Handle Year Crossover (simple check)
+                if pd.notnull(s_dt) and pd.notnull(e_dt):
+                    if e_dt < s_dt: e_dt += timedelta(days=1) # Midnight cross
+                    
+                    # Split duration across days
+                    curr = s_dt
+                    while curr < e_dt:
+                        curr_day_str = curr.strftime('%Y-%m-%d')
+                        next_midnight = (curr + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                        segment_end = min(e_dt, next_midnight)
+                        hours = (segment_end - curr).total_seconds() / 3600.0
+                        
+                        if curr_day_str not in daily_stats: 
+                            daily_stats[curr_day_str] = {'Demurrage': 0, 'T1': 0.0, 'T2': 0.0, 'T3': 0.0, 'T4': 0.0}
+                        
+                        daily_stats[curr_day_str][t] += hours
+                        curr = segment_end
+
+    # Format Output
+    output_rows = []
+    for d, v in sorted(daily_stats.items()):
+        row = {'Date': d, 'Demurrage': f"{int(v['Demurrage'])} Hours"}
+        for t in ['T1', 'T2', 'T3', 'T4']:
+            eff = min(100.0, (v[t] / 24.0) * 100.0)
+            row[f"{t} Eff %"] = f"{int(eff)}%"
+        output_rows.append(row)
+        
+    return edited_df, pd.DataFrame(output_rows)
 
 # ==========================================
 # 6. MAIN EXECUTION
@@ -606,8 +649,6 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
 
 uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
 
-# RE-RUN DETECTION
-# We store a "last_params_hash" to detect sidebar changes explicitly
 curr_params_hash = str(sim_params)
 params_changed = False
 if 'last_params_hash' not in st.session_state:
@@ -646,7 +687,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_unplanned = st.session_state.get('unplanned_df', pd.DataFrame())
     start_seq = st.session_state.get('last_seq', (0,0))
     
-    # Run logic if: New File OR New Params OR First Load
     if input_changed or params_changed or 'sim_result' not in st.session_state:
         sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, df_unplanned, start_seq)
         st.session_state.sim_result = sim_result
@@ -681,8 +721,8 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                 key=f"editor_{d}"
             )
 
-        _, daily_stats = recalculate_cascade_reactive(df_final, sim_params['ft'], st.session_state.sim_start_dt)
-        st.markdown("### 📅 Demurrage Forecast")
-        st.dataframe(pd.DataFrame(list(daily_stats.items()), columns=['Date', 'Total Hours']).assign(Demurrage=lambda x: x['Total Hours'].apply(lambda h: f"{int(h)} Hours"))[['Date', 'Demurrage']], hide_index=True)
+        _, daily_stats_df = recalculate_cascade_reactive(df_final, sim_params['ft'], st.session_state.sim_start_dt)
+        st.markdown("### 📊 Daily Performance & Demurrage Forecast")
+        st.dataframe(daily_stats_df, hide_index=True)
         
         st.download_button("📥 Download Final Report", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
