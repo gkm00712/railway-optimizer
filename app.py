@@ -182,7 +182,7 @@ def parse_col_d_wagon_type(cell_val):
     return wagons, load_type
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER
+# 3. GOOGLE SHEET PARSER (Intelligent Filter)
 # ==========================================
 
 def safe_parse_date(val):
@@ -240,14 +240,22 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                         tippler_timings[f"{t_name} End"] = format_dt(te)
                         tippler_timings[f"{t_name}_Obj_End"] = te
 
-            # Logic Split
             is_unplanned = (not used_tipplers and load_type != 'BOBR')
             
-            if not is_unplanned and arrival_dt.date() < today_date:
-                continue
-                
-            # Sequence only for visible
+            # --- 1. FILTER: KEEP "ACTIVE" PAST RAKES ---
+            # If a rake arrived yesterday but is NOT finished (or finished Today), KEEP IT.
+            # Only drop if it completely finished yesterday or earlier.
+            if not is_unplanned:
+                is_finished_in_past = (pd.notnull(end_dt) and end_dt.date() < today_date)
+                if arrival_dt.date() < today_date and is_finished_in_past:
+                    continue # Truly done and dusted. Skip.
+            
+            # --- 2. SEQUENCE (Visible Only) ---
+            # Now that we've filtered out the truly old stuff, track sequence.
+            # Note: Carry-over rakes (Arrived Yesterday, End Today) ARE tracked here
+            # because they are mathematically part of today's workload.
             seq, rid = parse_last_sequence(rake_name)
+            # Only update sequence if this rake is 'fresh' enough to be relevant
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
                 last_seq_tuple = (seq, rid)
 
@@ -321,14 +329,13 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         return pd.DataFrame(), pd.DataFrame(), (0,0)
 
 # ==========================================
-# 4. CORE SIMULATION LOGIC (With Pairing)
+# 4. CORE SIMULATION LOGIC
 # ==========================================
 
 def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state, downtime_list, 
                            rates, wagons_first_batch, inter_tippler_delay):
     if wagons == 0: return ready_time, "", ready_time, {}, timedelta(0)
     
-    # 1. EVALUATE EACH CANDIDATE (Solo Finish Time)
     candidates = []
     for t in target_tipplers:
         free_at = tippler_state[t]
@@ -343,12 +350,10 @@ def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state,
             'pred_fin': pred_finish
         })
     
-    # Sort candidates by earliest predicted finish (Solo Mode)
     candidates.sort(key=lambda x: x['pred_fin'])
     best_solo = candidates[0]
     
-    # 2. EVALUATE PAIR OPTION (If multiple available)
-    finish_A = best_solo['pred_fin'] # Default winner is solo
+    finish_A = best_solo['pred_fin']
     used_list = [best_solo['id']]
     final_timings = {
         f"{best_solo['id']}_Start": best_solo['eff_start'],
@@ -360,35 +365,23 @@ def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state,
     if len(candidates) > 1 and wagons > wagons_first_batch:
         prim = candidates[0]
         sec = candidates[1]
-        
-        # Split Logic
         w_first = wagons_first_batch
         w_second = wagons - w_first
-        
-        # Primary Timing
         fin_prim_split = prim['eff_start'] + timedelta(hours=w_first / prim['rate'])
-        
-        # Secondary Timing (Must wait for inter-tippler delay e.g. uncoupling)
         sec_ready_theory = ready_time + timedelta(minutes=inter_tippler_delay)
         prop_start_sec = max(sec_ready_theory, sec['free_at'])
         real_start_sec = check_downtime_impact(sec['id'], prop_start_sec, downtime_list)
         fin_sec_split = real_start_sec + timedelta(hours=w_second / sec['rate'])
-        
         finish_pair = max(fin_prim_split, fin_sec_split)
         
-        # COMPARE: Does Pair beat Solo?
         if finish_pair < finish_A:
             finish_A = finish_pair
             used_list = sorted([prim['id'], sec['id']])
-            actual_start = prim['eff_start'] # Overall start determined by primary
-            
-            # Update timings map
+            actual_start = prim['eff_start']
             final_timings = {}
-            # Prim
             final_timings[f"{prim['id']}_Start"] = prim['eff_start']
             final_timings[f"{prim['id']}_End"] = fin_prim_split
             final_timings[f"{prim['id']}_Idle"] = max(timedelta(0), prim['eff_start'] - prim['free_at'])
-            # Sec
             final_timings[f"{sec['id']}_Start"] = real_start_sec
             final_timings[f"{sec['id']}_End"] = fin_sec_split
             final_timings[f"{sec['id']}_Idle"] = max(timedelta(0), real_start_sec - sec['free_at'])
@@ -528,7 +521,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             assignments.append(row_data)
             continue
 
-        # Standard Evaluation (Including Pair Split Check)
         entry_A = get_line_entry_time('Group_Lines_8_10', rake['_Arrival_DT'], line_groups)
         ready_A = entry_A + timedelta(minutes=s_a)
         fin_A, used_A, start_A, tim_A, _ = calculate_generic_finish(
@@ -587,8 +579,13 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     df_sim = pd.DataFrame(assignments)
     
     if not df_locked.empty:
+        # VISUAL FILTER: Drop carry-over rakes (Arrived Yesterday) from Display
+        # Note: We keep them in calculation but drop them here
+        today_date = datetime.now(IST).date()
+        df_locked_visible = df_locked[df_locked['_Arrival_DT'].dt.date >= today_date]
+        
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers']
-        actuals_clean = df_locked.drop(columns=[c for c in cols_to_drop if c in df_locked.columns], errors='ignore')
+        actuals_clean = df_locked_visible.drop(columns=[c for c in cols_to_drop if c in df_locked_visible.columns], errors='ignore')
         final_df = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
     else:
         final_df = df_sim
