@@ -343,7 +343,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 '_raw_end_dt': end_dt,
                 '_raw_tipplers_data': tippler_timings,
                 '_raw_wagon_counts': wagon_counts_map,
-                '_raw_tipplers': active_tipplers_row # FIX: Added this key back
+                '_raw_tipplers': active_tipplers_row
             }
             for t in ['T1', 'T2', 'T3', 'T4']:
                 entry[f"{t} Start"] = tippler_timings.get(f"{t} Start", "")
@@ -500,7 +500,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                     if t_end_obj > tippler_state[t]: tippler_state[t] = t_end_obj
                     parsed_found = True
             if not parsed_found:
-                # Use the restored _raw_tipplers safely
                 if '_raw_tipplers' in row:
                     used_list = row['_raw_tipplers']
                     end_val = row['_raw_end_dt']
@@ -668,22 +667,27 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
                 if pd.notnull(s_dt) and pd.notnull(e_dt):
                     if e_dt < s_dt: e_dt += timedelta(days=1)
                     
-                    start_day_str = s_dt.strftime('%Y-%m-%d')
-                    if start_day_str in daily_stats:
-                        daily_stats[start_day_str][f'{t}_wag'] += wag_map.get(f"{t}_Wagons", 0)
+                    total_dur_sec = (e_dt - s_dt).total_seconds()
+                    total_wagons = wag_map.get(f"{t}_Wagons", 0)
                     
                     curr = s_dt
                     while curr < e_dt:
                         curr_day_str = curr.strftime('%Y-%m-%d')
                         next_midnight = (curr + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
                         segment_end = min(e_dt, next_midnight)
-                        hours = (segment_end - curr).total_seconds() / 3600.0
+                        segment_dur_sec = (segment_end - curr).total_seconds()
+                        hours = segment_dur_sec / 3600.0
                         
                         if curr_day_str not in daily_stats: 
                             daily_stats[curr_day_str] = {'Demurrage': 0}
                             for tx in ['T1', 'T2', 'T3', 'T4']: 
                                 daily_stats[curr_day_str][f'{tx}_hrs'] = 0.0
-                                daily_stats[curr_day_str][f'{tx}_wag'] = 0
+                                daily_stats[curr_day_str][f'{tx}_wag'] = 0.0
+                        
+                        # Proportionally distribute wagons based on time fraction
+                        if total_dur_sec > 0:
+                            fraction = segment_dur_sec / total_dur_sec
+                            daily_stats[curr_day_str][f'{t}_wag'] += (total_wagons * fraction)
                         
                         daily_stats[curr_day_str][f'{t}_hrs'] += hours
                         curr = segment_end
