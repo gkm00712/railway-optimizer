@@ -196,7 +196,7 @@ def parse_col_d_wagon_type(cell_val):
     return wagons, load_type
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (Visibility: Yesterday+)
+# 3. GOOGLE SHEET PARSER
 # ==========================================
 
 def safe_parse_date(val):
@@ -262,10 +262,8 @@ def fetch_google_sheet_actuals(url, free_time_hours):
 
             is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
-            # --- FILTER: Keep active/today/yesterday rakes ---
-            # Drop only if finished BEFORE yesterday
-            is_finished_before_yesterday = (pd.notnull(end_dt) and end_dt.date() < yesterday_date)
-            if not is_unplanned and arrival_dt.date() < yesterday_date and is_finished_before_yesterday:
+            is_finished_past = (pd.notnull(end_dt) and end_dt.date() < yesterday_date)
+            if not is_unplanned and arrival_dt.date() < yesterday_date and is_finished_past:
                 continue
             
             seq, rid = parse_last_sequence(rake_name)
@@ -344,7 +342,8 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 'Demurrage': dem_str,
                 '_raw_end_dt': end_dt,
                 '_raw_tipplers_data': tippler_timings,
-                '_raw_wagon_counts': wagon_counts_map
+                '_raw_wagon_counts': wagon_counts_map,
+                '_raw_tipplers': active_tipplers_row # FIX: Added this key back
             }
             for t in ['T1', 'T2', 'T3', 'T4']:
                 entry[f"{t} Start"] = tippler_timings.get(f"{t} Start", "")
@@ -501,12 +500,14 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                     if t_end_obj > tippler_state[t]: tippler_state[t] = t_end_obj
                     parsed_found = True
             if not parsed_found:
-                used_str = str(row['_raw_tipplers'])
-                end_val = row['_raw_end_dt']
-                if pd.notnull(end_val):
-                    for t in ['T1', 'T2', 'T3', 'T4']:
-                        if t in used_str and end_val > tippler_state[t]:
-                            tippler_state[t] = end_val
+                # Use the restored _raw_tipplers safely
+                if '_raw_tipplers' in row:
+                    used_list = row['_raw_tipplers']
+                    end_val = row['_raw_end_dt']
+                    if pd.notnull(end_val) and isinstance(used_list, list):
+                        for t in ['T1', 'T2', 'T3', 'T4']:
+                            if t in used_list and end_val > tippler_state[t]:
+                                tippler_state[t] = end_val
 
     line_groups = {
         'Group_Lines_8_10': {'capacity': 2, 'clearance_mins': 50, 'line_free_times': []},
@@ -614,20 +615,17 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         today_date = datetime.now(IST).date()
         yesterday_date = today_date - timedelta(days=1)
         
-        # VISUAL FILTER: Show Yesterday, Today, Future
         def keep_row(r):
             ad = r['_Arrival_DT'].date()
             if ad >= yesterday_date: return True
-            return False # Hide older history
+            return False 
             
         df_locked_visible = df_locked[df_locked.apply(keep_row, axis=1)]
         
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers']
         actuals_clean = df_locked_visible.drop(columns=[c for c in cols_to_drop if c in df_locked_visible.columns], errors='ignore')
         
-        # Display DF (Subset)
         final_df_display = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
-        # Stats DF (FULL History)
         final_df_all = pd.concat([df_locked.drop(columns=cols_to_drop, errors='ignore'), df_sim], ignore_index=True)
     else:
         final_df_display = df_sim
@@ -671,7 +669,6 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
                     if e_dt < s_dt: e_dt += timedelta(days=1)
                     
                     start_day_str = s_dt.strftime('%Y-%m-%d')
-                    # Attribute wagons to the start day
                     if start_day_str in daily_stats:
                         daily_stats[start_day_str][f'{t}_wag'] += wag_map.get(f"{t}_Wagons", 0)
                     
