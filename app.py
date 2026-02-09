@@ -57,7 +57,7 @@ if st.session_state.downtimes:
         st.rerun()
 sim_params['downtimes'] = st.session_state.downtimes
 
-# Detect Parameter Changes
+# Check param changes
 curr_params_hash = str(sim_params)
 params_changed = False
 if 'last_params_hash' not in st.session_state:
@@ -156,6 +156,7 @@ def parse_last_sequence(rake_name):
     return 0, 0
 
 def parse_tippler_cell(cell_value, ref_date):
+    """Parses Time (Start-End). Returns (Start, End)."""
     if pd.isnull(cell_value): return pd.NaT, pd.NaT
     s = str(cell_value).strip()
     times_found = re.findall(r'(\d{1,2}:\d{2})', s)
@@ -173,6 +174,21 @@ def parse_tippler_cell(cell_value, ref_date):
             return start_dt, end_dt
         except: pass
     return pd.NaT, pd.NaT
+
+def parse_wagon_count_from_cell(cell_value):
+    """
+    Parses exact wagon count from text like '19' or '20 (06:00..)'
+    Excludes numbers that look like times.
+    """
+    if pd.isnull(cell_value): return None
+    s = str(cell_value).strip()
+    # Remove time patterns (HH:MM) to avoid confusion
+    clean_s = re.sub(r'\d{1,2}:\d{2}', '', s)
+    # Find remaining integers
+    matches = re.findall(r'\b(\d{1,3})\b', clean_s)
+    if matches:
+        return int(matches[0]) # Take the first valid integer found
+    return None
 
 def parse_col_d_wagon_type(cell_val):
     wagons = 58 
@@ -207,11 +223,11 @@ def fetch_google_sheet_actuals(url, free_time_hours):
 
         locked_actuals = []
         unplanned_actuals = [] 
+        
         today_date = datetime.now(IST).date()
         last_seq_tuple = (0, 0)
 
         for _, row in df_gs.iterrows():
-            # Validity Check
             val_b = str(row.iloc[1]).strip()
             val_c = str(row.iloc[2]).strip()
             if not val_b or not val_c or val_b.lower() == 'nan' or val_c.lower() == 'nan':
@@ -230,41 +246,34 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             if pd.isnull(start_dt): start_dt = arrival_dt 
             
             tippler_timings = {}
-            used_tipplers = []
-            wagon_counts_map = {} # New: store counts for reporting
-            
-            # Count how many tipplers used to distribute wagons
-            # Note: G-Sheet doesn't explicitly store wagon split per tippler.
-            # We assume equal split if multiple used, or 100% if one used.
-            # Just detection here.
-            
             active_tipplers_row = []
+            explicit_wagon_counts = {}
+            
             for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
                 cell_val = row.iloc[idx]
                 if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
                     ts, te = parse_tippler_cell(cell_val, arrival_dt)
+                    wc = parse_wagon_count_from_cell(cell_val) # NEW: Extract wagon count
+                    
                     if pd.isnull(ts) and pd.notnull(start_dt):
                         ts = start_dt
                         te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2)
                     
                     if pd.notnull(ts):
-                        used_tipplers.append(t_name)
                         active_tipplers_row.append(t_name)
                         tippler_timings[f"{t_name} Start"] = format_dt(ts)
                         tippler_timings[f"{t_name} End"] = format_dt(te)
                         tippler_timings[f"{t_name}_Obj_End"] = te
+                        if wc is not None:
+                            explicit_wagon_counts[t_name] = wc
 
-            # Logic
-            is_unplanned = (not used_tipplers and load_type != 'BOBR')
+            is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
-            # --- FILTER: Keep "Carry-Over" ---
-            # If Arrival < Today AND Finished < Today -> Skip.
-            # If Arrival < Today BUT (Finished Today OR Active) -> KEEP.
+            # --- FILTER: Keep active/today rakes ---
             is_finished_past = (pd.notnull(end_dt) and end_dt.date() < today_date)
             if not is_unplanned and arrival_dt.date() < today_date and is_finished_past:
                 continue
             
-            # Sequence (Visible Only)
             seq, rid = parse_last_sequence(rake_name)
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
                 last_seq_tuple = (seq, rid)
@@ -283,15 +292,27 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 })
                 continue 
 
-            # Estimate wagon split for Actuals (Equal Share)
+            # Build Tippler Used String with Counts
+            # Priority: Explicit Count > Calculated Split
             t_str_list = []
-            if len(active_tipplers_row) > 0:
+            wagon_counts_map = {}
+            
+            # If we found explicit counts, use them
+            if explicit_wagon_counts:
+                for t in active_tipplers_row:
+                    cnt = explicit_wagon_counts.get(t, 0) # 0 if not found but time exists
+                    # Fallback logic: if explicit count missing for one but not others?
+                    # Simplified: Just use what we found
+                    t_str_list.append(f"{t} ({cnt})")
+                    wagon_counts_map[f"{t}_Wagons"] = cnt
+            elif len(active_tipplers_row) > 0:
+                # Equal Split Fallback
                 share = wagons // len(active_tipplers_row)
                 rem = wagons % len(active_tipplers_row)
                 for i, t in enumerate(active_tipplers_row):
                     cnt = share + (1 if i < rem else 0)
                     t_str_list.append(f"{t} ({cnt})")
-                    wagon_counts_map[f"{t}_Wagons"] = cnt # Store for efficiency calc
+                    wagon_counts_map[f"{t}_Wagons"] = cnt
             
             used_tipplers_str = ", ".join(t_str_list)
 
@@ -336,7 +357,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 'Demurrage': dem_str,
                 '_raw_end_dt': end_dt,
                 '_raw_tipplers_data': tippler_timings,
-                '_raw_wagon_counts': wagon_counts_map # Pass map
+                '_raw_wagon_counts': wagon_counts_map
             }
             for t in ['T1', 'T2', 'T3', 'T4']:
                 entry[f"{t} Start"] = tippler_timings.get(f"{t} Start", "")
@@ -365,12 +386,7 @@ def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state,
         prop_start = max(ready_time, free_at)
         effective_start = check_downtime_impact(t, prop_start, downtime_list)
         pred_finish = effective_start + timedelta(hours=wagons / rates[t])
-        
-        candidates.append({
-            'id': t, 'rate': rates[t], 
-            'eff_start': effective_start, 'free_at': free_at, 
-            'pred_fin': pred_finish
-        })
+        candidates.append({'id': t, 'rate': rates[t], 'eff_start': effective_start, 'free_at': free_at, 'pred_fin': pred_finish})
     
     candidates.sort(key=lambda x: x['pred_fin'])
     best_solo = candidates[0]
@@ -400,13 +416,10 @@ def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state,
         
         if finish_pair < finish_A:
             finish_A = finish_pair
-            # Determine order for display
             ts = [(prim['id'], w_first), (sec['id'], w_second)]
             ts.sort(key=lambda x: x[0])
             used_list_str = [f"{x[0]} ({x[1]})" for x in ts]
-            
             wagon_counts = {f"{prim['id']}_Wagons": w_first, f"{sec['id']}_Wagons": w_second}
-            
             actual_start = prim['eff_start']
             final_timings = {}
             final_timings[f"{prim['id']}_Start"] = prim['eff_start']
@@ -545,7 +558,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                 'Wait (Tippler)': "",
                 'Total Duration': "",
                 'Demurrage': "00:00",
-                '_raw_wagon_counts': {} # Empty for BOBR
+                '_raw_wagon_counts': {}
             }
             for t in ['T1', 'T2', 'T3', 'T4']:
                  row_data[f"{t} Start"] = ""; row_data[f"{t} End"] = ""; row_data[f"{t} Idle"] = ""
@@ -611,33 +624,34 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     df_sim = pd.DataFrame(assignments)
     
     if not df_locked.empty:
-        # VISUAL FILTER: Show carry-over rakes (Arrived Yesterday AND Active/Finished Today)
         today_date = datetime.now(IST).date()
-        
-        # Keep if Arrival >= Today OR EndTime >= Today OR No EndTime (Active)
+        # Keep if: Arrival >= Today OR EndTime >= Today OR Still Active
         def keep_row(r):
             ad = r['_Arrival_DT'].date()
             ed = r['_raw_end_dt']
             if ad >= today_date: return True
-            if pd.isnull(ed): return True # Still active
-            if ed.date() >= today_date: return True # Finished today
+            if pd.isnull(ed): return True 
+            if ed.date() >= today_date: return True
             return False
             
         df_locked_visible = df_locked[df_locked.apply(keep_row, axis=1)]
         
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers']
         actuals_clean = df_locked_visible.drop(columns=[c for c in cols_to_drop if c in df_locked_visible.columns], errors='ignore')
-        final_df = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
+        # IMPORTANT: Use FULL df_locked for stats, visible for display
+        final_df_display = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
+        # Combine FULL data for Stats Calculation
+        final_df_all = pd.concat([df_locked.drop(columns=cols_to_drop, errors='ignore'), df_sim], ignore_index=True)
     else:
-        final_df = df_sim
+        final_df_display = df_sim
+        final_df_all = df_sim
 
-    return final_df, sim_start_time
+    return final_df_display, final_df_all, sim_start_time
 
-def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
-    # Stats Accumulator
-    daily_stats = {} # {DateStr: {'demurrage': 0, 'T1_hrs': 0, 'T1_wag': 0 ...}}
+def recalculate_cascade_reactive(df_all, free_time_hours):
+    daily_stats = {} 
     
-    for _, row in edited_df.iterrows():
+    for _, row in df_all.iterrows():
         dem_val = str(row['Demurrage']).strip()
         dem_hrs = 0
         if ":" in dem_val: dem_hrs = int(dem_val.split(":")[0])
@@ -655,7 +669,6 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
         
         daily_stats[d_str]['Demurrage'] += dem_hrs
         
-        # Wagons & Hours
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
         
@@ -670,12 +683,10 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
                 if pd.notnull(s_dt) and pd.notnull(e_dt):
                     if e_dt < s_dt: e_dt += timedelta(days=1)
                     
-                    # Add wagons to the day of START
                     start_day_str = s_dt.strftime('%Y-%m-%d')
                     if start_day_str in daily_stats:
                         daily_stats[start_day_str][f'{t}_wag'] += wag_map.get(f"{t}_Wagons", 0)
                     
-                    # Split duration
                     curr = s_dt
                     while curr < e_dt:
                         curr_day_str = curr.strftime('%Y-%m-%d')
@@ -692,19 +703,17 @@ def recalculate_cascade_reactive(edited_df, free_time_hours, sim_start_dt):
                         daily_stats[curr_day_str][f'{t}_hrs'] += hours
                         curr = segment_end
 
-    # Format Output
     output_rows = []
     for d, v in sorted(daily_stats.items()):
         row = {'Date': d, 'Demurrage': f"{int(v['Demurrage'])} Hours"}
         for t in ['T1', 'T2', 'T3', 'T4']:
             eff = min(100.0, (v[f'{t}_hrs'] / 24.0) * 100.0)
             rate = 0.0
-            if v[f'{t}_hrs'] > 0: rate = v[f'{t}_wag'] / v[f'{t}_hrs']
-            row[f"{t} Eff %"] = f"{int(eff)}%"
+            if v[f'{t}_hrs'] > 0.1: rate = v[f'{t}_wag'] / v[f'{t}_hrs']
             row[f"{t} Rate"] = f"{rate:.2f}"
         output_rows.append(row)
         
-    return edited_df, pd.DataFrame(output_rows)
+    return pd.DataFrame(output_rows)
 
 # ==========================================
 # 6. MAIN EXECUTION
@@ -751,8 +760,9 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     start_seq = st.session_state.get('last_seq', (0,0))
     
     if input_changed or params_changed or 'sim_result' not in st.session_state:
-        sim_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, df_unplanned, start_seq)
+        sim_result, sim_full_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, df_unplanned, start_seq)
         st.session_state.sim_result = sim_result
+        st.session_state.sim_full_result = sim_full_result
         st.session_state.sim_start_dt = sim_start_dt
 
     if 'sim_result' in st.session_state and not st.session_state.sim_result.empty:
@@ -784,7 +794,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                 key=f"editor_{d}"
             )
 
-        _, daily_stats_df = recalculate_cascade_reactive(df_final, sim_params['ft'], st.session_state.sim_start_dt)
+        daily_stats_df = recalculate_cascade_reactive(st.session_state.sim_full_result, sim_params['ft'], st.session_state.sim_start_dt)
         st.markdown("### 📊 Daily Performance & Demurrage Forecast")
         st.dataframe(daily_stats_df, hide_index=True)
         
