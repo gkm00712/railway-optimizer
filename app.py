@@ -704,7 +704,7 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
 
 def highlight_bobr(row):
     if 'BOBR' in str(row['Load Type']).upper():
-        return ['background-color: #DFFF00'] * len(row)
+        return ['background-color: #FFD700; color: black'] * len(row)
     return [''] * len(row)
 
 # ==========================================
