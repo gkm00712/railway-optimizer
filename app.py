@@ -684,7 +684,6 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
                                 daily_stats[curr_day_str][f'{tx}_hrs'] = 0.0
                                 daily_stats[curr_day_str][f'{tx}_wag'] = 0.0
                         
-                        # Proportionally distribute wagons based on time fraction
                         if total_dur_sec > 0:
                             fraction = segment_dur_sec / total_dur_sec
                             daily_stats[curr_day_str][f'{t}_wag'] += (total_wagons * fraction)
@@ -702,6 +701,11 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
         output_rows.append(row)
         
     return pd.DataFrame(output_rows)
+
+def highlight_bobr(row):
+    if 'BOBR' in str(row['Load Type']).upper():
+        return ['background-color: #DFFF00'] * len(row)
+    return [''] * len(row)
 
 # ==========================================
 # 6. MAIN EXECUTION
@@ -773,13 +777,10 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             day_df = df_final[df_final['Date_Str'] == d].copy()
             day_df.index = np.arange(1, len(day_df) + 1)
             
-            st.data_editor(
-                day_df,
+            st.dataframe(
+                day_df.style.apply(highlight_bobr, axis=1),
                 use_container_width=True,
-                num_rows="fixed",
-                column_config=col_cfg,
-                disabled=["Rake", "Coal Source", "Load Type", "Wagons", "Line Allotted", "Wait (Tippler)", "Total Duration", "Demurrage", "Tipplers Used", "Status", "T1 Start", "T1 End", "T2 Start", "T2 End", "T3 Start", "T3 End", "T4 Start", "T4 End"],
-                key=f"editor_{d}"
+                column_config=col_cfg
             )
 
         daily_stats_df = recalculate_cascade_reactive(st.session_state.sim_full_result, sim_params['ft'])
