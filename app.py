@@ -196,7 +196,7 @@ def parse_col_d_wagon_type(cell_val):
     return wagons, load_type
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER
+# 3. GOOGLE SHEET PARSER (Visibility: Yesterday+)
 # ==========================================
 
 def safe_parse_date(val):
@@ -217,6 +217,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         unplanned_actuals = [] 
         
         today_date = datetime.now(IST).date()
+        yesterday_date = today_date - timedelta(days=1)
         last_seq_tuple = (0, 0)
 
         for _, row in df_gs.iterrows():
@@ -261,8 +262,10 @@ def fetch_google_sheet_actuals(url, free_time_hours):
 
             is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
-            is_finished_past = (pd.notnull(end_dt) and end_dt.date() < today_date)
-            if not is_unplanned and arrival_dt.date() < today_date and is_finished_past:
+            # --- FILTER: Keep active/today/yesterday rakes ---
+            # Drop only if finished BEFORE yesterday
+            is_finished_before_yesterday = (pd.notnull(end_dt) and end_dt.date() < yesterday_date)
+            if not is_unplanned and arrival_dt.date() < yesterday_date and is_finished_before_yesterday:
                 continue
             
             seq, rid = parse_last_sequence(rake_name)
@@ -609,19 +612,22 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     
     if not df_locked.empty:
         today_date = datetime.now(IST).date()
+        yesterday_date = today_date - timedelta(days=1)
+        
+        # VISUAL FILTER: Show Yesterday, Today, Future
         def keep_row(r):
             ad = r['_Arrival_DT'].date()
-            ed = r['_raw_end_dt']
-            if ad >= today_date: return True
-            if pd.isnull(ed): return True 
-            if ed.date() >= today_date: return True
-            return False
+            if ad >= yesterday_date: return True
+            return False # Hide older history
             
         df_locked_visible = df_locked[df_locked.apply(keep_row, axis=1)]
         
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers']
         actuals_clean = df_locked_visible.drop(columns=[c for c in cols_to_drop if c in df_locked_visible.columns], errors='ignore')
+        
+        # Display DF (Subset)
         final_df_display = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
+        # Stats DF (FULL History)
         final_df_all = pd.concat([df_locked.drop(columns=cols_to_drop, errors='ignore'), df_sim], ignore_index=True)
     else:
         final_df_display = df_sim
@@ -665,6 +671,7 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
                     if e_dt < s_dt: e_dt += timedelta(days=1)
                     
                     start_day_str = s_dt.strftime('%Y-%m-%d')
+                    # Attribute wagons to the start day
                     if start_day_str in daily_stats:
                         daily_stats[start_day_str][f'{t}_wag'] += wag_map.get(f"{t}_Wagons", 0)
                     
@@ -688,10 +695,9 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
     for d, v in sorted(daily_stats.items()):
         row = {'Date': d, 'Demurrage': f"{int(v['Demurrage'])} Hours"}
         for t in ['T1', 'T2', 'T3', 'T4']:
-            eff = min(100.0, (v[f'{t}_hrs'] / 24.0) * 100.0)
             rate = 0.0
             if v[f'{t}_hrs'] > 0.1: rate = v[f'{t}_wag'] / v[f'{t}_hrs']
-            row[f"{t} Rate"] = f"{rate:.2f}"
+            row[f"{t} Rate (W/Hr)"] = f"{rate:.2f}"
         output_rows.append(row)
         
     return pd.DataFrame(output_rows)
