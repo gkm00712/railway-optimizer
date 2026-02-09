@@ -57,14 +57,6 @@ if st.session_state.downtimes:
         st.rerun()
 sim_params['downtimes'] = st.session_state.downtimes
 
-curr_params_hash = str(sim_params)
-params_changed = False
-if 'last_params_hash' not in st.session_state:
-    st.session_state.last_params_hash = curr_params_hash
-elif st.session_state.last_params_hash != curr_params_hash:
-    params_changed = True
-    st.session_state.last_params_hash = curr_params_hash
-
 # ==========================================
 # 2. HELPER FUNCTIONS
 # ==========================================
@@ -713,14 +705,7 @@ def highlight_bobr(row):
 
 uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
 
-curr_params_hash = str(sim_params)
-params_changed = False
-if 'last_params_hash' not in st.session_state:
-    st.session_state.last_params_hash = curr_params_hash
-elif st.session_state.last_params_hash != curr_params_hash:
-    params_changed = True
-    st.session_state.last_params_hash = curr_params_hash
-
+# Simply refresh if inputs change (no complex hash logic needed here anymore)
 input_changed = False
 if uploaded_file and ('last_file_id' not in st.session_state or st.session_state.last_file_id != uploaded_file.file_id):
     input_changed = True
@@ -751,11 +736,11 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_unplanned = st.session_state.get('unplanned_df', pd.DataFrame())
     start_seq = st.session_state.get('last_seq', (0,0))
     
-    if input_changed or params_changed or 'sim_result' not in st.session_state:
-        sim_result, sim_full_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, df_unplanned, start_seq)
-        st.session_state.sim_result = sim_result
-        st.session_state.sim_full_result = sim_full_result
-        st.session_state.sim_start_dt = sim_start_dt
+    # ALWAYS RUN SIMULATION (Robust fix for "Output not changing")
+    sim_result, sim_full_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, df_unplanned, start_seq)
+    st.session_state.sim_result = sim_result
+    st.session_state.sim_full_result = sim_full_result
+    st.session_state.sim_start_dt = sim_start_dt
 
     if 'sim_result' in st.session_state and not st.session_state.sim_result.empty:
         df_final = st.session_state.sim_result
