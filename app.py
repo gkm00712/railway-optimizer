@@ -57,7 +57,6 @@ if st.session_state.downtimes:
         st.rerun()
 sim_params['downtimes'] = st.session_state.downtimes
 
-# Check param changes
 curr_params_hash = str(sim_params)
 params_changed = False
 if 'last_params_hash' not in st.session_state:
@@ -156,7 +155,6 @@ def parse_last_sequence(rake_name):
     return 0, 0
 
 def parse_tippler_cell(cell_value, ref_date):
-    """Parses Time (Start-End). Returns (Start, End)."""
     if pd.isnull(cell_value): return pd.NaT, pd.NaT
     s = str(cell_value).strip()
     times_found = re.findall(r'(\d{1,2}:\d{2})', s)
@@ -176,18 +174,12 @@ def parse_tippler_cell(cell_value, ref_date):
     return pd.NaT, pd.NaT
 
 def parse_wagon_count_from_cell(cell_value):
-    """
-    Parses exact wagon count from text like '19' or '20 (06:00..)'
-    Excludes numbers that look like times.
-    """
     if pd.isnull(cell_value): return None
     s = str(cell_value).strip()
-    # Remove time patterns (HH:MM) to avoid confusion
     clean_s = re.sub(r'\d{1,2}:\d{2}', '', s)
-    # Find remaining integers
     matches = re.findall(r'\b(\d{1,3})\b', clean_s)
     if matches:
-        return int(matches[0]) # Take the first valid integer found
+        return int(matches[0]) 
     return None
 
 def parse_col_d_wagon_type(cell_val):
@@ -253,7 +245,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 cell_val = row.iloc[idx]
                 if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
                     ts, te = parse_tippler_cell(cell_val, arrival_dt)
-                    wc = parse_wagon_count_from_cell(cell_val) # NEW: Extract wagon count
+                    wc = parse_wagon_count_from_cell(cell_val)
                     
                     if pd.isnull(ts) and pd.notnull(start_dt):
                         ts = start_dt
@@ -269,7 +261,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
 
             is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
-            # --- FILTER: Keep active/today rakes ---
             is_finished_past = (pd.notnull(end_dt) and end_dt.date() < today_date)
             if not is_unplanned and arrival_dt.date() < today_date and is_finished_past:
                 continue
@@ -292,21 +283,14 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 })
                 continue 
 
-            # Build Tippler Used String with Counts
-            # Priority: Explicit Count > Calculated Split
             t_str_list = []
             wagon_counts_map = {}
-            
-            # If we found explicit counts, use them
             if explicit_wagon_counts:
                 for t in active_tipplers_row:
-                    cnt = explicit_wagon_counts.get(t, 0) # 0 if not found but time exists
-                    # Fallback logic: if explicit count missing for one but not others?
-                    # Simplified: Just use what we found
+                    cnt = explicit_wagon_counts.get(t, 0)
                     t_str_list.append(f"{t} ({cnt})")
                     wagon_counts_map[f"{t}_Wagons"] = cnt
             elif len(active_tipplers_row) > 0:
-                # Equal Split Fallback
                 share = wagons // len(active_tipplers_row)
                 rem = wagons % len(active_tipplers_row)
                 for i, t in enumerate(active_tipplers_row):
@@ -625,7 +609,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     
     if not df_locked.empty:
         today_date = datetime.now(IST).date()
-        # Keep if: Arrival >= Today OR EndTime >= Today OR Still Active
         def keep_row(r):
             ad = r['_Arrival_DT'].date()
             ed = r['_raw_end_dt']
@@ -638,9 +621,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers']
         actuals_clean = df_locked_visible.drop(columns=[c for c in cols_to_drop if c in df_locked_visible.columns], errors='ignore')
-        # IMPORTANT: Use FULL df_locked for stats, visible for display
         final_df_display = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
-        # Combine FULL data for Stats Calculation
         final_df_all = pd.concat([df_locked.drop(columns=cols_to_drop, errors='ignore'), df_sim], ignore_index=True)
     else:
         final_df_display = df_sim
@@ -794,7 +775,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                 key=f"editor_{d}"
             )
 
-        daily_stats_df = recalculate_cascade_reactive(st.session_state.sim_full_result, sim_params['ft'], st.session_state.sim_start_dt)
+        daily_stats_df = recalculate_cascade_reactive(st.session_state.sim_full_result, sim_params['ft'])
         st.markdown("### 📊 Daily Performance & Demurrage Forecast")
         st.dataframe(daily_stats_df, hide_index=True)
         
