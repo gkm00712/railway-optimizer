@@ -18,8 +18,7 @@ IST = pytz.timezone('Asia/Kolkata')
 st.sidebar.header("⚙️ Settings")
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
 
-# History Toggle
-show_history = st.sidebar.checkbox("Show All Historical Data", value=False, help="Check this to see old completed rakes like 15/1532")
+show_history = st.sidebar.checkbox("Show All Historical Data", value=False, help="Check this to see old completed rakes")
 
 st.sidebar.markdown("---")
 sim_params = {}
@@ -199,7 +198,7 @@ def parse_col_d_wagon_type(cell_val):
     return wagons, load_type
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (Relaxed Logic)
+# 3. GOOGLE SHEET PARSER
 # ==========================================
 
 def safe_parse_date(val):
@@ -224,19 +223,12 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
         last_seq_tuple = (0, 0)
 
         for _, row in df_gs.iterrows():
-            # --- 1. RELAXED VALIDITY CHECK ---
-            val_b = str(row.iloc[1]).strip() # Rake Name
-            val_c = str(row.iloc[2]).strip() # Source
+            val_b = str(row.iloc[1]).strip()
+            val_c = str(row.iloc[2]).strip()
+            # If Name is missing, skip. Source can be missing.
+            if not val_b or val_b.lower() == 'nan': continue 
             
-            # Fix: Only skip if NAME is missing. If Source is missing, just mark unknown.
-            if not val_b or val_b.lower() == 'nan':
-                continue 
-            
-            if not val_c or val_c.lower() == 'nan':
-                source_val = "Unknown Source"
-            else:
-                source_val = val_c
-
+            source_val = "Unknown" if (not val_c or val_c.lower() == 'nan') else val_c
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
@@ -257,25 +249,20 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
                 if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
                     ts, te = parse_tippler_cell(cell_val, arrival_dt)
                     wc = parse_wagon_count_from_cell(cell_val)
-                    
                     if pd.isnull(ts) and pd.notnull(start_dt):
                         ts = start_dt
                         te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2)
-                    
                     if pd.notnull(ts):
                         active_tipplers_row.append(t_name)
                         tippler_timings[f"{t_name} Start"] = format_dt(ts)
                         tippler_timings[f"{t_name} End"] = format_dt(te)
                         tippler_timings[f"{t_name}_Obj_End"] = te
-                        if wc is not None:
-                            explicit_wagon_counts[t_name] = wc
+                        if wc is not None: explicit_wagon_counts[t_name] = wc
 
             is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
-            # --- FILTER LOGIC (Toggle Aware) ---
             if not show_full_history:
                 is_finished_before_yesterday = (pd.notnull(end_dt) and end_dt.date() < yesterday_date)
-                # Keep active/today/yesterday. Only hide really old stuff if toggle is OFF
                 if not is_unplanned and arrival_dt.date() < yesterday_date and is_finished_before_yesterday:
                     continue
             
@@ -285,6 +272,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
 
             if is_unplanned:
                 unplanned_actuals.append({
+                    'Rake': rake_name,  # SAVE ORIGINAL NAME
                     'Coal Source': source_val,
                     'Load Type': load_type,
                     'Wagons': wagons,
@@ -436,7 +424,6 @@ def get_line_entry_time(group, arrival, line_groups):
     if len(active) < grp['capacity']: return arrival
     return active[len(active) - grp['capacity']]
 
-# FIX: Added show_history_flag argument
 def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_seq_tuple, show_history_flag):
     rates = {'T1': params['rt1'], 'T2': params['rt2'], 'T3': params['rt3'], 'T4': params['rt4']}
     s_a, s_b, extra_shunt_cross = params['sa'], params['sb'], params['extra_shunt']
@@ -532,9 +519,17 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     assignments = []
 
     for _, rake in plan_df.iterrows():
-        curr_seq += 1
-        curr_id += 1
-        display_name = f"{curr_seq}/{curr_id}"
+        # LOGIC: If GS Unplanned, USE ORIGINAL NAME. Else Generate.
+        if rake.get('is_gs_unplanned', False):
+            display_name = str(rake['Rake'])
+            # Update seq tracking based on this manual name if parseable
+            s, i = parse_last_sequence(display_name)
+            if s > 0: 
+                curr_seq, curr_id = s, i
+        else:
+            curr_seq += 1
+            curr_id += 1
+            display_name = f"{curr_seq}/{curr_id}"
         
         is_bobr = 'BOBR' in str(rake['Load Type']).upper()
 
@@ -768,7 +763,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_unplanned = st.session_state.get('unplanned_df', pd.DataFrame())
     start_seq = st.session_state.get('last_seq', (0,0))
     
-    # PASS show_history HERE
     sim_result, sim_full_result, sim_start_dt = run_full_simulation_initial(
         df_raw, sim_params, df_act, df_unplanned, start_seq, show_history
     )
