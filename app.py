@@ -198,7 +198,7 @@ def parse_col_d_wagon_type(cell_val):
     return wagons, load_type
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER
+# 3. GOOGLE SHEET PARSER (Intelligent Seq)
 # ==========================================
 
 def safe_parse_date(val):
@@ -225,7 +225,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
         for _, row in df_gs.iterrows():
             val_b = str(row.iloc[1]).strip()
             val_c = str(row.iloc[2]).strip()
-            # If Name is missing, skip. Source can be missing.
             if not val_b or val_b.lower() == 'nan': continue 
             
             source_val = "Unknown" if (not val_c or val_c.lower() == 'nan') else val_c
@@ -261,18 +260,25 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
 
             is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
+            # --- FILTER: Visibility Check ---
+            is_visible = True
             if not show_full_history:
                 is_finished_before_yesterday = (pd.notnull(end_dt) and end_dt.date() < yesterday_date)
                 if not is_unplanned and arrival_dt.date() < yesterday_date and is_finished_before_yesterday:
-                    continue
+                    is_visible = False
             
-            seq, rid = parse_last_sequence(rake_name)
-            if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
-                last_seq_tuple = (seq, rid)
+            # --- SEQ UPDATE: Only if row is VISIBLE ---
+            # This ensures sequence counting continues from the last visible completed rake
+            if is_visible:
+                seq, rid = parse_last_sequence(rake_name)
+                if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
+                    last_seq_tuple = (seq, rid)
+
+            if not is_visible: continue
 
             if is_unplanned:
                 unplanned_actuals.append({
-                    'Rake': rake_name,  # SAVE ORIGINAL NAME
+                    'Rake': rake_name,  # Keep Original Name
                     'Coal Source': source_val,
                     'Load Type': load_type,
                     'Wagons': wagons,
@@ -432,10 +438,13 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
 
     to_plan = []
     
+    # 1. PROCESS UNPLANNED (Pending from G-Sheet)
+    # We must consume them first to update sequence logic correctly
     if not df_unplanned.empty:
         for _, row in df_unplanned.iterrows():
             to_plan.append(row.to_dict())
 
+    # 2. PROCESS FORECAST (from CSV)
     if not df_csv.empty:
         df = df_csv.copy()
         load_col = find_column(df, ['LOAD TYPE', 'CMDT', 'COMMODITY'])
@@ -482,6 +491,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     if plan_df.empty and df_locked.empty: return pd.DataFrame(), pd.DataFrame(), datetime.now(IST)
     
     if not plan_df.empty:
+        # Sort combined plan by arrival time
         plan_df = plan_df.sort_values('_Arrival_DT').reset_index(drop=True)
         first_arrival = plan_df['_Arrival_DT'].min()
     else:
@@ -519,14 +529,22 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     assignments = []
 
     for _, rake in plan_df.iterrows():
-        # LOGIC: If GS Unplanned, USE ORIGINAL NAME. Else Generate.
-        if rake.get('is_gs_unplanned', False):
-            display_name = str(rake['Rake'])
-            # Update seq tracking based on this manual name if parseable
+        # LOGIC FIX:
+        # 1. If it's from G-Sheet (Unplanned), it likely HAS a name (e.g. 52/1532).
+        #    Use that name and update the counter.
+        # 2. If it's from CSV (Forecast), it DOES NOT have a name.
+        #    Generate next number.
+        
+        orig_name = str(rake.get('Rake', ''))
+        is_gs = rake.get('is_gs_unplanned', False)
+        
+        if is_gs and '/' in orig_name:
+            # Try to respect the existing sequence number from sheet
+            display_name = orig_name
             s, i = parse_last_sequence(display_name)
-            if s > 0: 
-                curr_seq, curr_id = s, i
+            if s > 0: curr_seq, curr_id = s, i # Sync counter to this
         else:
+            # Generate new sequence
             curr_seq += 1
             curr_id += 1
             display_name = f"{curr_seq}/{curr_id}"
@@ -763,6 +781,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_unplanned = st.session_state.get('unplanned_df', pd.DataFrame())
     start_seq = st.session_state.get('last_seq', (0,0))
     
+    # ALWAYS RUN
     sim_result, sim_full_result, sim_start_dt = run_full_simulation_initial(
         df_raw, sim_params, df_act, df_unplanned, start_seq, show_history
     )
