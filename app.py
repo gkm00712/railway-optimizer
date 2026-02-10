@@ -18,6 +18,9 @@ IST = pytz.timezone('Asia/Kolkata')
 st.sidebar.header("⚙️ Settings")
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
 
+# NEW: History Toggle
+show_history = st.sidebar.checkbox("Show All Historical Data", value=False, help="Check this to see old completed rakes like 52/1532")
+
 st.sidebar.markdown("---")
 sim_params = {}
 sim_params['rt1'] = st.sidebar.number_input("Tippler 1 Rate", value=6.0, step=0.5)
@@ -188,7 +191,7 @@ def parse_col_d_wagon_type(cell_val):
     return wagons, load_type
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER
+# 3. GOOGLE SHEET PARSER (With History Toggle)
 # ==========================================
 
 def safe_parse_date(val):
@@ -200,7 +203,7 @@ def safe_parse_date(val):
     except: return pd.NaT
 
 @st.cache_data(ttl=60)
-def fetch_google_sheet_actuals(url, free_time_hours):
+def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
     try:
         df_gs = pd.read_csv(url, header=None, skiprows=1) 
         if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), (0,0)
@@ -254,9 +257,13 @@ def fetch_google_sheet_actuals(url, free_time_hours):
 
             is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
-            is_finished_past = (pd.notnull(end_dt) and end_dt.date() < yesterday_date)
-            if not is_unplanned and arrival_dt.date() < yesterday_date and is_finished_past:
-                continue
+            # --- FILTER LOGIC (UPDATED WITH TOGGLE) ---
+            # Default: Keep Yesterday & Today. Hide older.
+            # If show_full_history is True, keep everything.
+            if not show_full_history:
+                is_finished_before_yesterday = (pd.notnull(end_dt) and end_dt.date() < yesterday_date)
+                if not is_unplanned and arrival_dt.date() < yesterday_date and is_finished_before_yesterday:
+                    continue
             
             seq, rid = parse_last_sequence(rake_name)
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
@@ -606,12 +613,15 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         today_date = datetime.now(IST).date()
         yesterday_date = today_date - timedelta(days=1)
         
-        def keep_row(r):
-            ad = r['_Arrival_DT'].date()
-            if ad >= yesterday_date: return True
-            return False 
-            
-        df_locked_visible = df_locked[df_locked.apply(keep_row, axis=1)]
+        # VISUAL FILTER (Dependent on Toggle)
+        if show_full_history:
+            df_locked_visible = df_locked
+        else:
+            def keep_row(r):
+                ad = r['_Arrival_DT'].date()
+                if ad >= yesterday_date: return True
+                return False 
+            df_locked_visible = df_locked[df_locked.apply(keep_row, axis=1)]
         
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers']
         actuals_clean = df_locked_visible.drop(columns=[c for c in cols_to_drop if c in df_locked_visible.columns], errors='ignore')
@@ -705,7 +715,7 @@ def highlight_bobr(row):
 
 uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
 
-# Simply refresh if inputs change (no complex hash logic needed here anymore)
+# Trigger run on any input
 input_changed = False
 if uploaded_file and ('last_file_id' not in st.session_state or st.session_state.last_file_id != uploaded_file.file_id):
     input_changed = True
@@ -717,7 +727,7 @@ if gs_url and ('last_gs_url' not in st.session_state or st.session_state.last_gs
 if input_changed or 'raw_data_cached' not in st.session_state:
     actuals_df, unplanned_df, last_seq = pd.DataFrame(), pd.DataFrame(), (0,0)
     if gs_url:
-        actuals_df, unplanned_df, last_seq = fetch_google_sheet_actuals(gs_url, sim_params['ft'])
+        actuals_df, unplanned_df, last_seq = fetch_google_sheet_actuals(gs_url, sim_params['ft'], show_history)
     st.session_state.actuals_df = actuals_df
     st.session_state.unplanned_df = unplanned_df
     st.session_state.last_seq = last_seq
@@ -736,7 +746,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_unplanned = st.session_state.get('unplanned_df', pd.DataFrame())
     start_seq = st.session_state.get('last_seq', (0,0))
     
-    # ALWAYS RUN SIMULATION (Robust fix for "Output not changing")
+    # ALWAYS RUN
     sim_result, sim_full_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, df_unplanned, start_seq)
     st.session_state.sim_result = sim_result
     st.session_state.sim_full_result = sim_full_result
