@@ -198,7 +198,7 @@ def parse_col_d_wagon_type(cell_val):
     return wagons, load_type
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (Intelligent Seq)
+# 3. GOOGLE SHEET PARSER
 # ==========================================
 
 def safe_parse_date(val):
@@ -260,15 +260,12 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
 
             is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
-            # --- FILTER: Visibility Check ---
             is_visible = True
             if not show_full_history:
                 is_finished_before_yesterday = (pd.notnull(end_dt) and end_dt.date() < yesterday_date)
                 if not is_unplanned and arrival_dt.date() < yesterday_date and is_finished_before_yesterday:
                     is_visible = False
             
-            # --- SEQ UPDATE: Only if row is VISIBLE ---
-            # This ensures sequence counting continues from the last visible completed rake
             if is_visible:
                 seq, rid = parse_last_sequence(rake_name)
                 if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
@@ -278,7 +275,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
 
             if is_unplanned:
                 unplanned_actuals.append({
-                    'Rake': rake_name,  # Keep Original Name
+                    'Rake': rake_name,  
                     'Coal Source': source_val,
                     'Load Type': load_type,
                     'Wagons': wagons,
@@ -438,13 +435,10 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
 
     to_plan = []
     
-    # 1. PROCESS UNPLANNED (Pending from G-Sheet)
-    # We must consume them first to update sequence logic correctly
     if not df_unplanned.empty:
         for _, row in df_unplanned.iterrows():
             to_plan.append(row.to_dict())
 
-    # 2. PROCESS FORECAST (from CSV)
     if not df_csv.empty:
         df = df_csv.copy()
         load_col = find_column(df, ['LOAD TYPE', 'CMDT', 'COMMODITY'])
@@ -491,7 +485,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     if plan_df.empty and df_locked.empty: return pd.DataFrame(), pd.DataFrame(), datetime.now(IST)
     
     if not plan_df.empty:
-        # Sort combined plan by arrival time
         plan_df = plan_df.sort_values('_Arrival_DT').reset_index(drop=True)
         first_arrival = plan_df['_Arrival_DT'].min()
     else:
@@ -529,22 +522,14 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     assignments = []
 
     for _, rake in plan_df.iterrows():
-        # LOGIC FIX:
-        # 1. If it's from G-Sheet (Unplanned), it likely HAS a name (e.g. 52/1532).
-        #    Use that name and update the counter.
-        # 2. If it's from CSV (Forecast), it DOES NOT have a name.
-        #    Generate next number.
-        
         orig_name = str(rake.get('Rake', ''))
         is_gs = rake.get('is_gs_unplanned', False)
         
         if is_gs and '/' in orig_name:
-            # Try to respect the existing sequence number from sheet
             display_name = orig_name
             s, i = parse_last_sequence(display_name)
-            if s > 0: curr_seq, curr_id = s, i # Sync counter to this
+            if s > 0: curr_seq, curr_id = s, i
         else:
-            # Generate new sequence
             curr_seq += 1
             curr_id += 1
             display_name = f"{curr_seq}/{curr_id}"
@@ -721,8 +706,15 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
                         daily_stats[curr_day_str][f'{t}_hrs'] += hours
                         curr = segment_end
 
+    # FILTER: Only show stats from Yesterday onwards
+    yesterday_date = datetime.now(IST).date() - timedelta(days=1)
+    yesterday_str = yesterday_date.strftime('%Y-%m-%d')
+    
     output_rows = []
     for d, v in sorted(daily_stats.items()):
+        # Filter Logic Here
+        if d < yesterday_str: continue 
+        
         row = {'Date': d, 'Demurrage': f"{int(v['Demurrage'])} Hours"}
         for t in ['T1', 'T2', 'T3', 'T4']:
             rate = 0.0
@@ -742,14 +734,6 @@ def highlight_bobr(row):
 # ==========================================
 
 uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
-
-curr_params_hash = str(sim_params)
-params_changed = False
-if 'last_params_hash' not in st.session_state:
-    st.session_state.last_params_hash = curr_params_hash
-elif st.session_state.last_params_hash != curr_params_hash:
-    params_changed = True
-    st.session_state.last_params_hash = curr_params_hash
 
 input_changed = False
 if uploaded_file and ('last_file_id' not in st.session_state or st.session_state.last_file_id != uploaded_file.file_id):
@@ -781,7 +765,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_unplanned = st.session_state.get('unplanned_df', pd.DataFrame())
     start_seq = st.session_state.get('last_seq', (0,0))
     
-    # ALWAYS RUN
     sim_result, sim_full_result, sim_start_dt = run_full_simulation_initial(
         df_raw, sim_params, df_act, df_unplanned, start_seq, show_history
     )
