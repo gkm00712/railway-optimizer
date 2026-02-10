@@ -18,8 +18,8 @@ IST = pytz.timezone('Asia/Kolkata')
 st.sidebar.header("⚙️ Settings")
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
 
-# NEW: History Toggle
-show_history = st.sidebar.checkbox("Show All Historical Data", value=False, help="Check this to see old completed rakes like 52/1532")
+# History Toggle
+show_history = st.sidebar.checkbox("Show All Historical Data", value=False, help="Check this to see old completed rakes like 15/1532")
 
 st.sidebar.markdown("---")
 sim_params = {}
@@ -199,7 +199,7 @@ def parse_col_d_wagon_type(cell_val):
     return wagons, load_type
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (Visibility: Yesterday+)
+# 3. GOOGLE SHEET PARSER (Relaxed Logic)
 # ==========================================
 
 def safe_parse_date(val):
@@ -224,16 +224,23 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
         last_seq_tuple = (0, 0)
 
         for _, row in df_gs.iterrows():
-            val_b = str(row.iloc[1]).strip()
-            val_c = str(row.iloc[2]).strip()
-            if not val_b or not val_c or val_b.lower() == 'nan' or val_c.lower() == 'nan':
+            # --- 1. RELAXED VALIDITY CHECK ---
+            val_b = str(row.iloc[1]).strip() # Rake Name
+            val_c = str(row.iloc[2]).strip() # Source
+            
+            # Fix: Only skip if NAME is missing. If Source is missing, just mark unknown.
+            if not val_b or val_b.lower() == 'nan':
                 continue 
+            
+            if not val_c or val_c.lower() == 'nan':
+                source_val = "Unknown Source"
+            else:
+                source_val = val_c
 
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
             rake_name = val_b
-            source_val = val_c
             col_d_val = row.iloc[3]
             wagons, load_type = parse_col_d_wagon_type(col_d_val)
 
@@ -265,10 +272,10 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
 
             is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
-            # --- FILTER: Keep active/today/yesterday rakes ---
-            # Drop only if finished BEFORE yesterday AND show_full_history is False
+            # --- FILTER LOGIC (Toggle Aware) ---
             if not show_full_history:
                 is_finished_before_yesterday = (pd.notnull(end_dt) and end_dt.date() < yesterday_date)
+                # Keep active/today/yesterday. Only hide really old stuff if toggle is OFF
                 if not is_unplanned and arrival_dt.date() < yesterday_date and is_finished_before_yesterday:
                     continue
             
@@ -722,6 +729,14 @@ def highlight_bobr(row):
 # ==========================================
 
 uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
+
+curr_params_hash = str(sim_params)
+params_changed = False
+if 'last_params_hash' not in st.session_state:
+    st.session_state.last_params_hash = curr_params_hash
+elif st.session_state.last_params_hash != curr_params_hash:
+    params_changed = True
+    st.session_state.last_params_hash = curr_params_hash
 
 input_changed = False
 if uploaded_file and ('last_file_id' not in st.session_state or st.session_state.last_file_id != uploaded_file.file_id):
