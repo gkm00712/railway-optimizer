@@ -60,6 +60,14 @@ if st.session_state.downtimes:
         st.rerun()
 sim_params['downtimes'] = st.session_state.downtimes
 
+curr_params_hash = str(sim_params)
+params_changed = False
+if 'last_params_hash' not in st.session_state:
+    st.session_state.last_params_hash = curr_params_hash
+elif st.session_state.last_params_hash != curr_params_hash:
+    params_changed = True
+    st.session_state.last_params_hash = curr_params_hash
+
 # ==========================================
 # 2. HELPER FUNCTIONS
 # ==========================================
@@ -191,7 +199,7 @@ def parse_col_d_wagon_type(cell_val):
     return wagons, load_type
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (With History Toggle)
+# 3. GOOGLE SHEET PARSER (Visibility: Yesterday+)
 # ==========================================
 
 def safe_parse_date(val):
@@ -257,9 +265,8 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
 
             is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
-            # --- FILTER LOGIC (UPDATED WITH TOGGLE) ---
-            # Default: Keep Yesterday & Today. Hide older.
-            # If show_full_history is True, keep everything.
+            # --- FILTER: Keep active/today/yesterday rakes ---
+            # Drop only if finished BEFORE yesterday AND show_full_history is False
             if not show_full_history:
                 is_finished_before_yesterday = (pd.notnull(end_dt) and end_dt.date() < yesterday_date)
                 if not is_unplanned and arrival_dt.date() < yesterday_date and is_finished_before_yesterday:
@@ -422,7 +429,8 @@ def get_line_entry_time(group, arrival, line_groups):
     if len(active) < grp['capacity']: return arrival
     return active[len(active) - grp['capacity']]
 
-def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_seq_tuple):
+# FIX: Added show_history_flag argument
+def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_seq_tuple, show_history_flag):
     rates = {'T1': params['rt1'], 'T2': params['rt2'], 'T3': params['rt3'], 'T4': params['rt4']}
     s_a, s_b, extra_shunt_cross = params['sa'], params['sb'], params['extra_shunt']
     f_a, f_b, ft_hours = params['fa'], params['fb'], params['ft']
@@ -477,7 +485,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                 })
 
     plan_df = pd.DataFrame(to_plan)
-    if plan_df.empty and df_locked.empty: return pd.DataFrame(), datetime.now(IST)
+    if plan_df.empty and df_locked.empty: return pd.DataFrame(), pd.DataFrame(), datetime.now(IST)
     
     if not plan_df.empty:
         plan_df = plan_df.sort_values('_Arrival_DT').reset_index(drop=True)
@@ -614,7 +622,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         yesterday_date = today_date - timedelta(days=1)
         
         # VISUAL FILTER (Dependent on Toggle)
-        if show_full_history:
+        if show_history_flag:
             df_locked_visible = df_locked
         else:
             def keep_row(r):
@@ -715,7 +723,6 @@ def highlight_bobr(row):
 
 uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
 
-# Trigger run on any input
 input_changed = False
 if uploaded_file and ('last_file_id' not in st.session_state or st.session_state.last_file_id != uploaded_file.file_id):
     input_changed = True
@@ -746,8 +753,10 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     df_unplanned = st.session_state.get('unplanned_df', pd.DataFrame())
     start_seq = st.session_state.get('last_seq', (0,0))
     
-    # ALWAYS RUN
-    sim_result, sim_full_result, sim_start_dt = run_full_simulation_initial(df_raw, sim_params, df_act, df_unplanned, start_seq)
+    # PASS show_history HERE
+    sim_result, sim_full_result, sim_start_dt = run_full_simulation_initial(
+        df_raw, sim_params, df_act, df_unplanned, start_seq, show_history
+    )
     st.session_state.sim_result = sim_result
     st.session_state.sim_full_result = sim_full_result
     st.session_state.sim_start_dt = sim_start_dt
