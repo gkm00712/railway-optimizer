@@ -19,8 +19,6 @@ st.sidebar.header("⚙️ Settings")
 st.sidebar.info("ℹ️ Multi-Tab Mode active. Fetching data from sheets like 'Dec-25', 'Jan-26'...")
 gs_url = st.sidebar.text_input("Google Sheet URL", value="https://docs.google.com/spreadsheets/d/1NgeRXtNez1Ifs7UtQVa_dOgmEP_pj4TI/edit?pli=1&gid=1051078038#gid=1051078038")
 
-# Removed "Show History" checkbox as per previous instruction (Live Tab handles filtering)
-
 st.sidebar.markdown("---")
 sim_params = {}
 sim_params['rt1'] = st.sidebar.number_input("Tippler 1 Rate", value=6.0, step=0.5)
@@ -206,7 +204,6 @@ def parse_col_d_wagon_type(cell_val):
 def classify_reason(reason_text):
     if not reason_text: return "Misc"
     txt = reason_text.upper()
-    
     mm_keys = ['MM', 'MECH', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
     emd_keys = ['EMD', 'ELEC', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
     cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
@@ -222,7 +219,6 @@ def classify_reason(reason_text):
     if any(k in txt for k in mgr_keys): return "MGR"
     if any(k in txt for k in chem_keys): return "Chemistry"
     if any(k in txt for k in opr_keys): return "OPR"
-    
     return "Misc"
 
 def parse_demurrage_special(cell_val):
@@ -308,7 +304,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
         
-        # --- START LOOK-AHEAD FOR REASONS ---
+        # Reason Lookahead
         dept_val = str(row.iloc[11]).strip()
         if dept_val.lower() in ['nan', '', 'none']: dept_val = ""
         
@@ -321,12 +317,11 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                 if reason_val.lower() not in ['nan', '', 'none']:
                     reason_detail = reason_val
         
-        # STRICT FILTER: Reason must exist to capture Department
+        # STRICT FILTER
         if dept_val and reason_detail:
             full_remarks_blob = f"{dept_val}|{reason_detail}"
         else:
             full_remarks_blob = ""
-        # ------------------------------------
 
         rake_name = val_b
         col_d_val = row.iloc[3]
@@ -360,7 +355,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                     tippler_timings[f"{t_name} End"] = format_dt(te)
                     tippler_timings[f"{t_name}_Obj_End"] = te
                     
-                    # Sanity Check
                     if pd.notnull(arrival_dt):
                         diff = (ts - arrival_dt).days
                         if diff < -300: ts = ts.replace(year=arrival_dt.year + 1)
@@ -909,7 +903,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     start_seq = st.session_state.get('last_seq', (0,0))
     
     sim_result, sim_full_result, sim_start_dt = run_full_simulation_initial(
-        df_raw, sim_params, df_act, df_unplanned, start_seq, False
+        df_raw, sim_params, df_act, df_unplanned, start_seq
     )
     st.session_state.sim_result = sim_result
     st.session_state.sim_full_result = sim_full_result
