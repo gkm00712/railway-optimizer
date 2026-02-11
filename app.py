@@ -220,7 +220,7 @@ def classify_reason(reason_text):
     return "Misc"
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (Strict Reason Filter)
+# 3. GOOGLE SHEET PARSER (LOOK-AHEAD LOGIC)
 # ==========================================
 
 def safe_parse_date(val):
@@ -254,7 +254,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
-            # --- STRICT REASON LOGIC ---
+            # --- START LOOK-AHEAD FOR REASONS ---
             dept_val = str(row.iloc[11]).strip()
             if dept_val.lower() in ['nan', '', 'none']: dept_val = ""
             
@@ -262,14 +262,12 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
             if i + 1 < len(df_gs):
                 next_row = df_gs.iloc[i + 1]
                 next_rake_name = str(next_row.iloc[1]).strip()
-                # Check for continuation row
                 if not next_rake_name or next_rake_name.lower() == 'nan':
                     reason_val = str(next_row.iloc[11]).strip()
                     if reason_val.lower() not in ['nan', '', 'none']:
                         reason_detail = reason_val
             
-            # STRICT FILTER: Only combine if BOTH Dept (Row X) and Reason (Row X+1) exist.
-            # If Reason is missing, we ignore the Department entirely.
+            # STRICT FILTER
             if dept_val and reason_detail:
                 full_remarks_blob = f"{dept_val}|{reason_detail}"
             else:
@@ -722,7 +720,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             if dept_part:
                 dept_code = classify_reason(dept_part)
                 final_text = reason_part if reason_part else dept_part
-                reason_with_rake = f"{final_text} [{rake_name}]"
+                reason_with_rake = f"[{rake_name}] - {final_text}"
                 if dept_code not in daily_stats[d_str]['Dept_Reasons']:
                     daily_stats[d_str]['Dept_Reasons'][dept_code] = set()
                 daily_stats[d_str]['Dept_Reasons'][dept_code].add(reason_with_rake)
@@ -778,7 +776,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         reasons_list = []
         for dept, reasons in v['Dept_Reasons'].items():
             reasons_list.append(f"{dept}: {', '.join(reasons)}")
-        major_reasons_str = "; ".join(reasons_list) if reasons_list else "-"
+        major_reasons_str = "  ;  ".join(reasons_list) if reasons_list else "-"
 
         row = {
             'Date': d, 
@@ -896,7 +894,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     if isinstance(dr, tuple) and len(dr) == 2: start_f, end_f = dr
             
             if start_f and end_f:
-                # Use FULL history dataframe, filtering by the selected dates
                 hist_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_f, end_filter_dt=end_f)
                 st.markdown(f"**Performance Summary ({start_f} to {end_f})**")
                 st.dataframe(hist_stats, hide_index=True, use_container_width=True)
@@ -906,7 +903,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     mask = (st.session_state.sim_full_result['_Arrival_DT'].dt.date >= start_f) & (st.session_state.sim_full_result['_Arrival_DT'].dt.date <= end_f)
                     hist_raw = st.session_state.sim_full_result[mask].copy()
                     
-                    # DEMURRAGE FILTER
                     def has_demurrage(val):
                         s = str(val).strip()
                         return s != "00:00" and s != "0"
