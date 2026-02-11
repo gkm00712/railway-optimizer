@@ -198,7 +198,7 @@ def parse_col_d_wagon_type(cell_val):
     return wagons, load_type
 
 def classify_reason(reason_text):
-    if not reason_text: return "Other"
+    if not reason_text: return "Misc"
     txt = reason_text.upper()
     
     # Keyword Lists
@@ -207,12 +207,20 @@ def classify_reason(reason_text):
     cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
     rs_keys = ['C&W', 'WAGON', 'DOOR', 'COUPL', 'RAKE']
     
+    # NEW KEYS
+    mgr_keys = ['MGR', 'TRACK', 'LOCO', 'DERAIL', 'SLEEPER']
+    chem_keys = ['CHEM', 'LAB', 'QUALITY', 'SAMPLE', 'ASH', 'MOISTURE']
+    opr_keys = ['OPR', 'OPER', 'CREW', 'SHIFT', 'MANPOWER', 'BUNKER', 'FULL', 'WAIT']
+
     if any(k in txt for k in mm_keys): return "MM"
     if any(k in txt for k in emd_keys): return "EMD"
     if any(k in txt for k in cni_keys): return "C&I"
     if any(k in txt for k in rs_keys): return "Rolling Stock"
+    if any(k in txt for k in mgr_keys): return "MGR"
+    if any(k in txt for k in chem_keys): return "Chemistry"
+    if any(k in txt for k in opr_keys): return "OPR"
     
-    return "Other"
+    return "Misc"
 
 # ==========================================
 # 3. GOOGLE SHEET PARSER
@@ -248,7 +256,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
-            # --- CAPTURE COLUMN L (Index 11) ---
             remarks_val = str(row.iloc[11]).strip()
             if remarks_val.lower() in ['nan', '', 'none']: remarks_val = ""
             
@@ -692,7 +699,6 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
         
         daily_stats[d_str]['Demurrage'] += dem_hrs
         
-        # CATEGORIZE REASON (ONLY IF DEMURRAGE > 0)
         if dem_hrs > 0:
             rem = str(row.get('_remarks', '')).strip()
             if rem and rem.lower() != 'nan':
@@ -739,7 +745,6 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
                         daily_stats[curr_day_str][f'{t}_hrs'] += hours
                         curr = segment_end
 
-    # Filter for Yesterday 00:01 onwards
     yesterday_date = datetime.now(IST).date() - timedelta(days=1)
     yesterday_str = yesterday_date.strftime('%Y-%m-%d')
     
@@ -747,7 +752,6 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
     for d, v in sorted(daily_stats.items()):
         if d < yesterday_str: continue 
         
-        # Format Reasons: "MM: Belt (1); EMD: Power (2)"
         reasons_list = []
         for dept, reasons in v['Dept_Reasons'].items():
             reasons_list.append(f"{dept}: {', '.join(reasons)}")
@@ -776,14 +780,6 @@ def highlight_bobr(row):
 # ==========================================
 
 uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
-
-curr_params_hash = str(sim_params)
-params_changed = False
-if 'last_params_hash' not in st.session_state:
-    st.session_state.last_params_hash = curr_params_hash
-elif st.session_state.last_params_hash != curr_params_hash:
-    params_changed = True
-    st.session_state.last_params_hash = curr_params_hash
 
 input_changed = False
 if uploaded_file and ('last_file_id' not in st.session_state or st.session_state.last_file_id != uploaded_file.file_id):
