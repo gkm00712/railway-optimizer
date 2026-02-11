@@ -5,6 +5,8 @@ import pytz
 import math
 import numpy as np
 import re
+import requests
+from io import StringIO
 
 # ==========================================
 # 1. PAGE CONFIGURATION & INPUTS
@@ -16,8 +18,7 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("⚙️ Settings")
-st.sidebar.info("ℹ️ Using Multi-Tab Mode: The script will try to fetch data from tabs like 'Feb-26', 'Jan-26', 'Dec-25', etc.")
-# Updated Default URL
+st.sidebar.info("ℹ️ Using Multi-Tab Mode with Smart Parsing")
 gs_url = st.sidebar.text_input("Google Sheet URL", value="https://docs.google.com/spreadsheets/d/1NgeRXtNez1Ifs7UtQVa_dOgmEP_pj4TI/edit?pli=1&gid=1051078038#gid=1051078038")
 
 show_history = st.sidebar.checkbox("Show All Historical Data", value=False, help="Check this to see old completed rakes")
@@ -60,14 +61,6 @@ if st.session_state.downtimes:
         st.session_state.downtimes = []
         st.rerun()
 sim_params['downtimes'] = st.session_state.downtimes
-
-curr_params_hash = str(sim_params)
-params_changed = False
-if 'last_params_hash' not in st.session_state:
-    st.session_state.last_params_hash = curr_params_hash
-elif st.session_state.last_params_hash != curr_params_hash:
-    params_changed = True
-    st.session_state.last_params_hash = curr_params_hash
 
 # ==========================================
 # 2. HELPER FUNCTIONS
@@ -161,7 +154,10 @@ def parse_last_sequence(rake_name):
 def parse_tippler_cell(cell_value, ref_date):
     if pd.isnull(cell_value): return pd.NaT, pd.NaT
     s = str(cell_value).strip()
+    
+    # NEW: Regex to find HH:MM-HH:MM even without brackets
     times_found = re.findall(r'(\d{1,2}:\d{2})', s)
+    
     if len(times_found) >= 2:
         start_str, end_str = times_found[0], times_found[1]
         try:
@@ -180,7 +176,8 @@ def parse_tippler_cell(cell_value, ref_date):
 def parse_wagon_count_from_cell(cell_value):
     if pd.isnull(cell_value): return None
     s = str(cell_value).strip()
-    clean_s = re.sub(r'\d{1,2}:\d{2}', '', s)
+    # Extract first distinct number which represents wagons
+    clean_s = re.sub(r'\d{1,2}:\d{2}', '', s) # Remove times
     matches = re.findall(r'\b(\d{1,3})\b', clean_s)
     if matches:
         return int(matches[0]) 
@@ -270,7 +267,7 @@ def get_sheet_gid_url(spreadsheet_id, sheet_name):
 def generate_month_sheet_names():
     names = []
     curr = datetime.now()
-    for _ in range(12): # Look back 12 months
+    for _ in range(12):
         name = curr.strftime("%b-%y") # e.g. Feb-26
         names.append(name)
         first = curr.replace(day=1)
@@ -287,21 +284,17 @@ def safe_parse_date(val):
 
 @st.cache_data(ttl=60)
 def fetch_google_sheet_actuals_multitab(url, free_time_hours):
-    # EXTRACT SPREADSHEET ID
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
     if not match:
-        sheet_urls = [url] # Fallback
+        sheet_urls = [url]
     else:
         spreadsheet_id = match.group(1)
         target_sheets = generate_month_sheet_names()
-        # Default first, then history tabs
         sheet_urls = [f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv"] 
         for name in target_sheets:
             sheet_urls.append(get_sheet_gid_url(spreadsheet_id, name))
 
     all_dfs = []
-    
-    # FETCH LOOP
     for s_url in sheet_urls:
         try:
             df_temp = pd.read_csv(s_url, header=None, skiprows=1)
@@ -313,15 +306,11 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
     if not all_dfs:
         return pd.DataFrame(), pd.DataFrame(), (0,0)
     
-    # COMBINE & DEDUPLICATE
     df_gs = pd.concat(all_dfs, ignore_index=True)
     df_gs = df_gs.drop_duplicates(subset=[1, 4], keep='first').reset_index(drop=True)
 
     locked_actuals = []
     unplanned_actuals = [] 
-    
-    today_date = datetime.now(IST).date()
-    yesterday_date = today_date - timedelta(days=1)
     last_seq_tuple = (0, 0)
 
     for i in range(len(df_gs)):
@@ -335,7 +324,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
         
-        # --- START LOOK-AHEAD FOR REASONS ---
+        # Reason Lookahead
         dept_val = str(row.iloc[11]).strip()
         if dept_val.lower() in ['nan', '', 'none']: dept_val = ""
         
@@ -348,12 +337,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                 if reason_val.lower() not in ['nan', '', 'none']:
                     reason_detail = reason_val
         
-        # STRICT REASON FILTER
-        if dept_val and reason_detail:
-            full_remarks_blob = f"{dept_val}|{reason_detail}"
-        else:
-            full_remarks_blob = ""
-        # ---------------------------
+        full_remarks_blob = f"{dept_val}|{reason_detail}" if (dept_val and reason_detail) else ""
 
         rake_name = val_b
         col_d_val = row.iloc[3]
@@ -367,19 +351,22 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         active_tipplers_row = []
         explicit_wagon_counts = {}
         tippler_objs = {}
+        
+        # SUM LOADED WAGONS
+        total_wagons_unloaded = 0
 
         for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
             cell_val = row.iloc[idx]
             if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
                 wc = parse_wagon_count_from_cell(cell_val)
                 ts, te = parse_tippler_cell(cell_val, arrival_dt)
+                
+                # If wagons but no time -> use default time
                 if pd.isnull(ts) and wc is not None:
                     if pd.notnull(start_dt):
                         ts = start_dt
                         te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2)
-                elif pd.isnull(ts) and pd.notnull(start_dt):
-                    pass
-
+                
                 if pd.notnull(ts):
                     active_tipplers_row.append(t_name)
                     tippler_timings[f"{t_name} Start"] = format_dt(ts)
@@ -389,20 +376,29 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                     tippler_objs[f"{t_name}_Start_Obj"] = ts
                     tippler_objs[f"{t_name}_End_Obj"] = te
                     
-                    if wc is not None: explicit_wagon_counts[t_name] = wc
+                    if wc is not None: 
+                        explicit_wagon_counts[t_name] = wc
+                        total_wagons_unloaded += wc
 
-        is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
+        is_bobr = 'BOBR' in str(load_type).upper()
+        # PENDING CHECK: If total unloaded < column D count (and not BOBR)
+        is_pending = False
+        if not is_bobr:
+            if total_wagons_unloaded < wagons:
+                is_pending = True
         
         seq, rid = parse_last_sequence(rake_name)
         if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
             last_seq_tuple = (seq, rid)
 
-        if is_unplanned:
+        if is_pending:
+            # Calculate remaining wagons for pending
+            rem_wagons = wagons - total_wagons_unloaded
             unplanned_actuals.append({
                 'Rake': rake_name,  
                 'Coal Source': source_val,
                 'Load Type': load_type,
-                'Wagons': wagons,
+                'Wagons': rem_wagons if rem_wagons > 0 else wagons,
                 'Status': 'Pending (G-Sheet)',
                 '_Arrival_DT': arrival_dt,
                 '_Form_Mins': 0,
@@ -804,7 +800,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             if dept_part:
                 dept_code = classify_reason(dept_part)
                 final_text = reason_part if reason_part else dept_part
-                # NEW FORMAT: [Rake] - Reason (Dept)
                 formatted_reason = f"[{rake_name}] - {final_text} ({dept_code})"
                 daily_stats[d_str]['All_Reasons'].add(formatted_reason)
         
@@ -859,7 +854,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
     output_rows = []
     for d, v in sorted(daily_stats.items()):
         reasons_set = v['All_Reasons']
-        # JOIN WITH NEWLINE
         major_reasons_str = "\n".join(sorted(reasons_set)) if reasons_set else "-"
 
         row = {
