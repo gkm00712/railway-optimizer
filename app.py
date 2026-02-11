@@ -5,8 +5,6 @@ import pytz
 import math
 import numpy as np
 import re
-import requests
-from io import StringIO
 
 # ==========================================
 # 1. PAGE CONFIGURATION & INPUTS
@@ -154,10 +152,7 @@ def parse_last_sequence(rake_name):
 def parse_tippler_cell(cell_value, ref_date):
     if pd.isnull(cell_value): return pd.NaT, pd.NaT
     s = str(cell_value).strip()
-    
-    # NEW: Regex to find HH:MM-HH:MM even without brackets
     times_found = re.findall(r'(\d{1,2}:\d{2})', s)
-    
     if len(times_found) >= 2:
         start_str, end_str = times_found[0], times_found[1]
         try:
@@ -166,9 +161,8 @@ def parse_tippler_cell(cell_value, ref_date):
             e_h, e_m = map(int, end_str.split(':'))
             start_dt = ref_date.replace(hour=s_h, minute=s_m, second=0, microsecond=0)
             end_dt = ref_date.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
+            # Basic crossover check
             if end_dt < start_dt: end_dt += timedelta(days=1)
-            if (start_dt - ref_date).total_seconds() < -43200: 
-                 start_dt += timedelta(days=1); end_dt += timedelta(days=1)
             return start_dt, end_dt
         except: pass
     return pd.NaT, pd.NaT
@@ -176,8 +170,7 @@ def parse_tippler_cell(cell_value, ref_date):
 def parse_wagon_count_from_cell(cell_value):
     if pd.isnull(cell_value): return None
     s = str(cell_value).strip()
-    # Extract first distinct number which represents wagons
-    clean_s = re.sub(r'\d{1,2}:\d{2}', '', s) # Remove times
+    clean_s = re.sub(r'\d{1,2}:\d{2}', '', s)
     matches = re.findall(r'\b(\d{1,3})\b', clean_s)
     if matches:
         return int(matches[0]) 
@@ -199,7 +192,6 @@ def parse_col_d_wagon_type(cell_val):
 def classify_reason(reason_text):
     if not reason_text: return "Misc"
     txt = reason_text.upper()
-    
     mm_keys = ['MM', 'MECH', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
     emd_keys = ['EMD', 'ELEC', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
     cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
@@ -215,18 +207,25 @@ def classify_reason(reason_text):
     if any(k in txt for k in mgr_keys): return "MGR"
     if any(k in txt for k in chem_keys): return "Chemistry"
     if any(k in txt for k in opr_keys): return "OPR"
-    
     return "Misc"
 
 def parse_demurrage_special(cell_val):
     s = str(cell_val).strip().upper()
     if s in ["", "NAN", "NIL", "-", "NONE"]: return "00:00"
+    
+    # Priority: HH:MM
     if ":" in s:
         if re.search(r'\d+:\d+', s): return s
+        
+    # Priority: Number extraction
     match = re.search(r'(\d+(\.\d+)?)', s)
     if match:
         try:
             val = float(match.group(1))
+            # Sanity Check: If > 240 (10 days) and no "hr" keyword, ignore (likely timestamp like 1500)
+            if val > 240 and "HR" not in s: 
+                return "00:00"
+            
             hours = int(val)
             minutes = int((val - hours) * 60)
             return f"{hours:02d}:{minutes:02d}"
@@ -249,11 +248,18 @@ def parse_dt_from_str_smart(dt_str, ref_dt_obj):
             month_ref = ref_dt_obj.month
             
         dt = datetime(year_ref, month_ref, day, h, m)
+        
+        # YEAR FIX: If generated date is > 30 days BEFORE reference, it's next year/month
+        # If > 30 days AFTER reference (e.g. Ref=Jan, Dt=Dec), it's previous year
         if pd.notnull(ref_dt_obj):
              naive_ref = ref_dt_obj.replace(tzinfo=None)
-             if (dt - naive_ref).days < -20: 
-                 if month_ref == 12: dt = dt.replace(year=year_ref+1, month=1)
-                 else: dt = dt.replace(month=month_ref+1)
+             diff = (dt - naive_ref).days
+             
+             if diff < -300: # e.g. Arr=Dec 25, Finish=Jan 26 (diff ~ -330)
+                 dt = dt.replace(year=year_ref+1)
+             elif diff > 300: # e.g. Arr=Jan 26, Finish=Dec 25 (diff ~ +330)
+                 dt = dt.replace(year=year_ref-1)
+                 
         return IST.localize(dt)
     except: return pd.NaT
 
@@ -268,7 +274,7 @@ def generate_month_sheet_names():
     names = []
     curr = datetime.now()
     for _ in range(12):
-        name = curr.strftime("%b-%y") # e.g. Feb-26
+        name = curr.strftime("%b-%y") 
         names.append(name)
         first = curr.replace(day=1)
         curr = first - timedelta(days=1)
@@ -324,7 +330,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
         
-        # Reason Lookahead
         dept_val = str(row.iloc[11]).strip()
         if dept_val.lower() in ['nan', '', 'none']: dept_val = ""
         
@@ -352,7 +357,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         explicit_wagon_counts = {}
         tippler_objs = {}
         
-        # SUM LOADED WAGONS
         total_wagons_unloaded = 0
 
         for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
@@ -361,7 +365,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                 wc = parse_wagon_count_from_cell(cell_val)
                 ts, te = parse_tippler_cell(cell_val, arrival_dt)
                 
-                # If wagons but no time -> use default time
+                # Use Rake times if specific time missing but wagons exist
                 if pd.isnull(ts) and wc is not None:
                     if pd.notnull(start_dt):
                         ts = start_dt
@@ -373,6 +377,16 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                     tippler_timings[f"{t_name} End"] = format_dt(te)
                     tippler_timings[f"{t_name}_Obj_End"] = te
                     
+                    # Sanity Check for Year: Adjust if diff > 300 days
+                    if pd.notnull(arrival_dt):
+                        diff = (ts - arrival_dt).days
+                        if diff < -300: ts = ts.replace(year=arrival_dt.year + 1)
+                        elif diff > 300: ts = ts.replace(year=arrival_dt.year - 1)
+                        
+                        diff_e = (te - arrival_dt).days
+                        if diff_e < -300: te = te.replace(year=arrival_dt.year + 1)
+                        elif diff_e > 300: te = te.replace(year=arrival_dt.year - 1)
+
                     tippler_objs[f"{t_name}_Start_Obj"] = ts
                     tippler_objs[f"{t_name}_End_Obj"] = te
                     
@@ -381,7 +395,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                         total_wagons_unloaded += wc
 
         is_bobr = 'BOBR' in str(load_type).upper()
-        # PENDING CHECK: If total unloaded < column D count (and not BOBR)
         is_pending = False
         if not is_bobr:
             if total_wagons_unloaded < wagons:
@@ -392,7 +405,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
             last_seq_tuple = (seq, rid)
 
         if is_pending:
-            # Calculate remaining wagons for pending
             rem_wagons = wagons - total_wagons_unloaded
             unplanned_actuals.append({
                 'Rake': rake_name,  
@@ -800,6 +812,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             if dept_part:
                 dept_code = classify_reason(dept_part)
                 final_text = reason_part if reason_part else dept_part
+                # NEW FORMAT: [Rake] - Reason (Dept)
                 formatted_reason = f"[{rake_name}] - {final_text} ({dept_code})"
                 daily_stats[d_str]['All_Reasons'].add(formatted_reason)
         
@@ -827,6 +840,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                 curr = s_dt
                 while curr < e_dt:
                     curr_day_str = curr.strftime('%Y-%m-%d')
+                    
                     curr_date = curr.date()
                     in_range = True
                     if start_filter_dt and curr_date < start_filter_dt: in_range = False
@@ -854,6 +868,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
     output_rows = []
     for d, v in sorted(daily_stats.items()):
         reasons_set = v['All_Reasons']
+        # JOIN WITH NEWLINE
         major_reasons_str = "\n".join(sorted(reasons_set)) if reasons_set else "-"
 
         row = {
