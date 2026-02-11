@@ -18,7 +18,7 @@ IST = pytz.timezone('Asia/Kolkata')
 st.sidebar.header("⚙️ Settings")
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
 
-show_history = st.sidebar.checkbox("Show All Historical Data", value=False, help="Check this to see old completed rakes")
+# NOTE: Removed the "Show History" checkbox because we now load everything for the History Tab to work.
 
 st.sidebar.markdown("---")
 sim_params = {}
@@ -219,18 +219,11 @@ def classify_reason(reason_text):
     
     return "Misc"
 
-# --- NEW: Robust Demurrage Parser ---
 def parse_demurrage_special(cell_val):
     s = str(cell_val).strip().upper()
     if s in ["", "NAN", "NIL", "-", "NONE"]: return "00:00"
-    
-    # Priority 1: Check for HH:MM format
     if ":" in s:
-        # Simple validation: looks like digits:digits
-        if re.search(r'\d+:\d+', s):
-            return s
-    
-    # Priority 2: Extract numeral (e.g. "3.5 hrs", "5", "2 hours")
+        if re.search(r'\d+:\d+', s): return s
     match = re.search(r'(\d+(\.\d+)?)', s)
     if match:
         try:
@@ -239,11 +232,10 @@ def parse_demurrage_special(cell_val):
             minutes = int((val - hours) * 60)
             return f"{hours:02d}:{minutes:02d}"
         except: pass
-        
     return "00:00"
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (LOOK-AHEAD LOGIC)
+# 3. GOOGLE SHEET PARSER (NO FILTERING HERE)
 # ==========================================
 
 def safe_parse_date(val):
@@ -255,7 +247,8 @@ def safe_parse_date(val):
     except: return pd.NaT
 
 @st.cache_data(ttl=60)
-def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
+def fetch_google_sheet_actuals(url, free_time_hours):
+    # FIXED: No more "yesterday" filtering in this function. We load ALL data.
     try:
         df_gs = pd.read_csv(url, header=None, skiprows=1) 
         if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), (0,0)
@@ -313,14 +306,11 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
                 if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
                     wc = parse_wagon_count_from_cell(cell_val)
                     ts, te = parse_tippler_cell(cell_val, arrival_dt)
-                    
-                    # LOGIC UPDATE: If Time Missing but Wagon Count Exists -> Use Rake Timings
                     if pd.isnull(ts) and wc is not None:
                         if pd.notnull(start_dt):
                             ts = start_dt
                             te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2)
                     elif pd.isnull(ts) and pd.notnull(start_dt):
-                        # Fallback for empty cells if logic requires (usually skipped)
                         pass
 
                     if pd.notnull(ts):
@@ -332,7 +322,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
 
             is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
-            is_visible = True
+            # Always track max sequence
             seq, rid = parse_last_sequence(rake_name)
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
                 last_seq_tuple = (seq, rid)
@@ -382,7 +372,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
                     if pd.notnull(safe_parse_date(row.iloc[7])): 
                         total_dur = safe_parse_date(row.iloc[7]) - arrival_dt
 
-            # DEMURRAGE PARSING UPDATE
             raw_dem_val = row.iloc[10]
             dem_str = parse_demurrage_special(raw_dem_val)
 
@@ -490,7 +479,7 @@ def get_line_entry_time(group, arrival, line_groups):
     if len(active) < grp['capacity']: return arrival
     return active[len(active) - grp['capacity']]
 
-def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_seq_tuple, show_history_flag):
+def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_seq_tuple):
     rates = {'T1': params['rt1'], 'T2': params['rt2'], 'T3': params['rt3'], 'T4': params['rt4']}
     s_a, s_b, extra_shunt_cross = params['sa'], params['sb'], params['extra_shunt']
     f_a, f_b, ft_hours = params['fa'], params['fb'], params['ft']
@@ -836,7 +825,7 @@ if gs_url and ('last_gs_url' not in st.session_state or st.session_state.last_gs
 if input_changed or 'raw_data_cached' not in st.session_state:
     actuals_df, unplanned_df, last_seq = pd.DataFrame(), pd.DataFrame(), (0,0)
     if gs_url:
-        actuals_df, unplanned_df, last_seq = fetch_google_sheet_actuals(gs_url, sim_params['ft'], show_history)
+        actuals_df, unplanned_df, last_seq = fetch_google_sheet_actuals(gs_url, sim_params['ft'])
     st.session_state.actuals_df = actuals_df
     st.session_state.unplanned_df = unplanned_df
     st.session_state.last_seq = last_seq
@@ -856,7 +845,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
     start_seq = st.session_state.get('last_seq', (0,0))
     
     sim_result, sim_full_result, sim_start_dt = run_full_simulation_initial(
-        df_raw, sim_params, df_act, df_unplanned, start_seq, show_history
+        df_raw, sim_params, df_act, df_unplanned, start_seq
     )
     st.session_state.sim_result = sim_result
     st.session_state.sim_full_result = sim_full_result
