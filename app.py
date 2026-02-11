@@ -201,13 +201,10 @@ def classify_reason(reason_text):
     if not reason_text: return "Misc"
     txt = reason_text.upper()
     
-    # Keyword Lists
     mm_keys = ['MM', 'MECH', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
     emd_keys = ['EMD', 'ELEC', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
     cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
     rs_keys = ['C&W', 'WAGON', 'DOOR', 'COUPL', 'RAKE']
-    
-    # NEW KEYS
     mgr_keys = ['MGR', 'TRACK', 'LOCO', 'DERAIL', 'SLEEPER']
     chem_keys = ['CHEM', 'LAB', 'QUALITY', 'SAMPLE', 'ASH', 'MOISTURE']
     opr_keys = ['OPR', 'OPER', 'CREW', 'SHIFT', 'MANPOWER', 'BUNKER', 'FULL', 'WAIT']
@@ -223,7 +220,7 @@ def classify_reason(reason_text):
     return "Misc"
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER
+# 3. GOOGLE SHEET PARSER (LOOK-AHEAD LOGIC)
 # ==========================================
 
 def safe_parse_date(val):
@@ -247,18 +244,44 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
         yesterday_date = today_date - timedelta(days=1)
         last_seq_tuple = (0, 0)
 
-        for _, row in df_gs.iterrows():
-            val_b = str(row.iloc[1]).strip()
-            val_c = str(row.iloc[2]).strip()
+        # ITERATE BY INDEX to check Next Row (i+1)
+        for i in range(len(df_gs)):
+            row = df_gs.iloc[i]
+            
+            val_b = str(row.iloc[1]).strip() # Rake Name
+            val_c = str(row.iloc[2]).strip() # Source
+            
+            # Skip if no Rake Name
             if not val_b or val_b.lower() == 'nan': continue 
             
             source_val = "Unknown" if (not val_c or val_c.lower() == 'nan') else val_c
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
-            remarks_val = str(row.iloc[11]).strip()
-            if remarks_val.lower() in ['nan', '', 'none']: remarks_val = ""
+            # --- START LOOK-AHEAD FOR REASONS ---
+            dept_val = str(row.iloc[11]).strip() # Current Row Col L
+            if dept_val.lower() in ['nan', '', 'none']: dept_val = ""
             
+            reason_detail = ""
+            # Check if next row exists and has EMPTY Rake Name (means it's a continuation)
+            if i + 1 < len(df_gs):
+                next_row = df_gs.iloc[i + 1]
+                next_rake_name = str(next_row.iloc[1]).strip()
+                if not next_rake_name or next_rake_name.lower() == 'nan':
+                    # It is a continuation row! Grab reason from Col L
+                    reason_val = str(next_row.iloc[11]).strip()
+                    if reason_val.lower() not in ['nan', '', 'none']:
+                        reason_detail = reason_val
+            
+            # Fallback: if no continuation row, check if Dept val itself is long
+            if not reason_detail and len(dept_val) > 5: 
+                # Maybe user put everything in one cell
+                pass 
+            
+            # Store structured reason: "DEPT_CODE | SPECIFIC_REASON"
+            full_remarks_blob = f"{dept_val}|{reason_detail}" if reason_detail else dept_val
+            # ------------------------------------
+
             rake_name = val_b
             col_d_val = row.iloc[3]
             wagons, load_type = parse_col_d_wagon_type(col_d_val)
@@ -313,7 +336,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
                     'Optimization Type': 'Auto-Planned (G-Sheet)',
                     'Extra Shunt (Mins)': 0,
                     'is_gs_unplanned': True,
-                    '_remarks': remarks_val
+                    '_remarks': full_remarks_blob
                 })
                 continue 
 
@@ -377,7 +400,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
                 '_raw_tipplers_data': tippler_timings,
                 '_raw_wagon_counts': wagon_counts_map,
                 '_raw_tipplers': active_tipplers_row,
-                '_remarks': remarks_val
+                '_remarks': full_remarks_blob
             }
             for t in ['T1', 'T2', 'T3', 'T4']:
                 entry[f"{t} Start"] = tippler_timings.get(f"{t} Start", "")
@@ -644,7 +667,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             'Total Duration': format_duration_hhmm(tot_dur_final),
             'Demurrage': dem_str,
             '_raw_wagon_counts': best_wag,
-            '_remarks': ""
+            '_remarks': rake.get('_remarks', "")
         }
         for t in ['T1', 'T2', 'T3', 'T4']:
              row_data[f"{t} Start"] = format_dt(best_timings.get(f"{t}_Start", pd.NaT))
@@ -695,17 +718,26 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
             daily_stats[d_str] = {'Demurrage': 0, 'Dept_Reasons': {}}
             for t in ['T1', 'T2', 'T3', 'T4']: 
                 daily_stats[d_str][f'{t}_hrs'] = 0.0
-                daily_stats[d_str][f'{t}_wag'] = 0
+                daily_stats[d_str][f'{t}_wag'] = 0.0
         
         daily_stats[d_str]['Demurrage'] += dem_hrs
         
         if dem_hrs > 0:
             rem = str(row.get('_remarks', '')).strip()
-            if rem and rem.lower() != 'nan':
-                dept = classify_reason(rem)
-                if dept not in daily_stats[d_str]['Dept_Reasons']:
-                    daily_stats[d_str]['Dept_Reasons'][dept] = set()
-                daily_stats[d_str]['Dept_Reasons'][dept].add(rem)
+            # Split raw string "DEPT|REASON"
+            if '|' in rem:
+                dept_part, reason_part = rem.split('|', 1)
+            else:
+                dept_part, reason_part = rem, ""
+            
+            # Classification
+            if dept_part:
+                dept_code = classify_reason(dept_part) # Use Code (MM, EMD) as Key
+                final_text = reason_part if reason_part else dept_part
+                
+                if dept_code not in daily_stats[d_str]['Dept_Reasons']:
+                    daily_stats[d_str]['Dept_Reasons'][dept_code] = set()
+                daily_stats[d_str]['Dept_Reasons'][dept_code].add(final_text)
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
