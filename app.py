@@ -90,14 +90,36 @@ def format_dt(dt):
     if dt.tzinfo is None: dt = IST.localize(dt)
     return dt.strftime('%d-%H:%M')
 
-def parse_dt_from_str(dt_str, year_ref):
+# FIXED: Logic to use Reference Date (Arrival) instead of Current Date
+def parse_dt_from_str_smart(dt_str, ref_dt_obj):
     try:
         if not dt_str: return pd.NaT
         parts = dt_str.split('-')
         day = int(parts[0])
         hm = parts[1].split(':')
         h, m = int(hm[0]), int(hm[1])
-        dt = datetime(year_ref, datetime.now().month, day, h, m)
+        
+        # Use Month/Year from Reference Object (Arrival Date)
+        if pd.isnull(ref_dt_obj):
+            year_ref = datetime.now().year
+            month_ref = datetime.now().month
+        else:
+            year_ref = ref_dt_obj.year
+            month_ref = ref_dt_obj.month
+            
+        dt = datetime(year_ref, month_ref, day, h, m)
+        
+        # Handle month rollover (e.g. Arrival 31st Jan, Unload 1st Feb)
+        # If created date is much earlier than arrival, it likely belongs to next month
+        if pd.notnull(ref_dt_obj):
+             naive_ref = ref_dt_obj.replace(tzinfo=None)
+             if (dt - naive_ref).days < -20: # If it looks like a month behind
+                 # Add roughly a month? Simplest is to rely on the day number
+                 if month_ref == 12:
+                     dt = dt.replace(year=year_ref+1, month=1)
+                 else:
+                     dt = dt.replace(month=month_ref+1)
+                     
         return IST.localize(dt)
     except: return pd.NaT
 
@@ -235,7 +257,7 @@ def parse_demurrage_special(cell_val):
     return "00:00"
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (FETCH ALL + STORE HIDDEN DT OBJECTS)
+# 3. GOOGLE SHEET PARSER (ALL DATA)
 # ==========================================
 
 def safe_parse_date(val):
@@ -255,8 +277,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         locked_actuals = []
         unplanned_actuals = [] 
         
-        today_date = datetime.now(IST).date()
-        yesterday_date = today_date - timedelta(days=1)
         last_seq_tuple = (0, 0)
 
         for i in range(len(df_gs)):
@@ -269,7 +289,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
-            # --- START LOOK-AHEAD FOR REASONS ---
             dept_val = str(row.iloc[11]).strip()
             if dept_val.lower() in ['nan', '', 'none']: dept_val = ""
             
@@ -286,7 +305,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 full_remarks_blob = f"{dept_val}|{reason_detail}"
             else:
                 full_remarks_blob = ""
-            # ---------------------------
 
             rake_name = val_b
             col_d_val = row.iloc[3]
@@ -299,9 +317,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             tippler_timings = {}
             active_tipplers_row = []
             explicit_wagon_counts = {}
-            
-            # Store REAL Objects
-            tippler_objs = {} 
+            tippler_objs = {} # Store Date Objects
 
             for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
                 cell_val = row.iloc[idx]
@@ -407,7 +423,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 '_raw_tipplers': active_tipplers_row,
                 '_remarks': full_remarks_blob
             }
-            # Inject Hidden Timings
+            # INJECT HIDDEN OBJECTS
             for t, obj in tippler_objs.items():
                 entry[t] = obj # e.g. T1_Start_Obj
 
@@ -690,7 +706,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         today_date = datetime.now(IST).date()
         yesterday_date = today_date - timedelta(days=1)
         
-        # TAB 1 VISUAL FILTER
+        # VISUAL FILTER (TAB 1 ONLY)
         def keep_row(r):
             ad = r['_Arrival_DT'].date()
             if ad >= yesterday_date: return True
@@ -701,8 +717,8 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         actuals_clean = df_locked_visible.drop(columns=[c for c in cols_to_drop if c in df_locked_visible.columns], errors='ignore')
         
         final_df_display = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
-        # FULL HISTORY FOR TAB 2
-        final_df_all = pd.concat([df_locked.drop(columns=cols_to_drop, errors='ignore'), df_sim], ignore_index=True)
+        # FIXED: DO NOT DROP '_Obj' COLUMNS HERE FOR TAB 2
+        final_df_all = pd.concat([df_locked, df_sim], ignore_index=True)
     else:
         final_df_display = df_sim
         final_df_all = df_sim
@@ -744,26 +760,24 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             if dept_part:
                 dept_code = classify_reason(dept_part)
                 final_text = reason_part if reason_part else dept_part
-                # UPDATED FORMAT: [Rake] - Reason (Dept)
                 formatted_reason = f"[{rake_name}] - {final_text} ({dept_code})"
                 daily_stats[d_str]['All_Reasons'].add(formatted_reason)
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
         
-        current_year = datetime.now().year
         for t in ['T1', 'T2', 'T3', 'T4']:
-            # Use HIDDEN OBJECTS first!
+            # SMART DATE HANDLING (FIX FOR PAST DATES)
             s_dt = row.get(f"{t}_Start_Obj", pd.NaT)
             e_dt = row.get(f"{t}_End_Obj", pd.NaT)
             
-            # Fallback to string parsing ONLY if objects missing (e.g. simulation rows)
             if pd.isnull(s_dt) or pd.isnull(e_dt):
+                # Fallback: Parse string using ARRIVAL DATE context
                 start_str = str(row.get(f"{t} Start", ""))
                 end_str = str(row.get(f"{t} End", ""))
                 if start_str and end_str:
-                    s_dt = parse_dt_from_str(start_str, current_year)
-                    e_dt = parse_dt_from_str(end_str, current_year)
+                    s_dt = parse_dt_from_str_smart(start_str, arr_dt)
+                    e_dt = parse_dt_from_str_smart(end_str, arr_dt)
             
             if pd.notnull(s_dt) and pd.notnull(e_dt):
                 if e_dt < s_dt: e_dt += timedelta(days=1)
@@ -774,7 +788,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                 curr = s_dt
                 while curr < e_dt:
                     curr_day_str = curr.strftime('%Y-%m-%d')
-                    
                     curr_date = curr.date()
                     in_range = True
                     if start_filter_dt and curr_date < start_filter_dt: in_range = False
@@ -792,18 +805,16 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                                 daily_stats[curr_day_str][f'{tx}_hrs'] = 0.0
                                 daily_stats[curr_day_str][f'{tx}_wag'] = 0.0
                         
+                        daily_stats[curr_day_str][f'{t}_hrs'] += hours
                         if total_dur_sec > 0:
                             fraction = segment_dur_sec / total_dur_sec
                             daily_stats[curr_day_str][f'{t}_wag'] += (total_wagons * fraction)
-                        
-                        daily_stats[curr_day_str][f'{t}_hrs'] += hours
                     
                     curr = segment_end
 
     output_rows = []
     for d, v in sorted(daily_stats.items()):
         reasons_set = v['All_Reasons']
-        # JOIN WITH NEWLINE
         major_reasons_str = "\n".join(sorted(reasons_set)) if reasons_set else "-"
 
         row = {
@@ -937,5 +948,5 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     
                     hist_raw = hist_raw[hist_raw['Demurrage'].apply(has_demurrage)]
                     
-                    hist_raw_clean = hist_raw.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"], errors='ignore')
+                    hist_raw_clean = hist_raw.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']], errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
