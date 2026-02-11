@@ -81,30 +81,6 @@ def format_dt(dt):
     if dt.tzinfo is None: dt = IST.localize(dt)
     return dt.strftime('%d-%H:%M')
 
-def parse_dt_from_str_smart(dt_str, ref_dt_obj):
-    try:
-        if not dt_str: return pd.NaT
-        parts = dt_str.split('-')
-        day = int(parts[0])
-        hm = parts[1].split(':')
-        h, m = int(hm[0]), int(hm[1])
-        
-        if pd.isnull(ref_dt_obj):
-            year_ref = datetime.now().year
-            month_ref = datetime.now().month
-        else:
-            year_ref = ref_dt_obj.year
-            month_ref = ref_dt_obj.month
-            
-        dt = datetime(year_ref, month_ref, day, h, m)
-        if pd.notnull(ref_dt_obj):
-             naive_ref = ref_dt_obj.replace(tzinfo=None)
-             if (dt - naive_ref).days < -20: 
-                 if month_ref == 12: dt = dt.replace(year=year_ref+1, month=1)
-                 else: dt = dt.replace(month=month_ref+1)
-        return IST.localize(dt)
-    except: return pd.NaT
-
 def format_duration_hhmm(delta):
     if pd.isnull(delta): return ""
     total_seconds = int(delta.total_seconds())
@@ -173,8 +149,17 @@ def parse_tippler_cell(cell_value, ref_date):
             start_dt = ref_date.replace(hour=s_h, minute=s_m, second=0, microsecond=0)
             end_dt = ref_date.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
             if end_dt < start_dt: end_dt += timedelta(days=1)
-            if (start_dt - ref_date).total_seconds() < -43200: 
-                 start_dt += timedelta(days=1); end_dt += timedelta(days=1)
+            
+            # --- FUTURE DATE FIX (Within Cell Parsing) ---
+            # If the calculated date is > 90 days in the future relative to today, subtract 1 year.
+            # This handles cases where "02-12" (Dec 2nd) defaults to 2026 but we are in Feb 2026 (so Dec should be 2025).
+            now_dt = datetime.now(IST)
+            if start_dt > now_dt + timedelta(days=90):
+                start_dt = start_dt.replace(year=start_dt.year - 1)
+            if end_dt > now_dt + timedelta(days=90):
+                end_dt = end_dt.replace(year=end_dt.year - 1)
+            # ---------------------------------------------
+            
             return start_dt, end_dt
         except: pass
     return pd.NaT, pd.NaT
@@ -237,6 +222,36 @@ def parse_demurrage_special(cell_val):
         except: pass
     return "00:00"
 
+def parse_dt_from_str_smart(dt_str, ref_dt_obj):
+    try:
+        if not dt_str: return pd.NaT
+        parts = dt_str.split('-')
+        day = int(parts[0])
+        hm = parts[1].split(':')
+        h, m = int(hm[0]), int(hm[1])
+        
+        if pd.isnull(ref_dt_obj):
+            year_ref = datetime.now().year
+            month_ref = datetime.now().month
+        else:
+            year_ref = ref_dt_obj.year
+            month_ref = ref_dt_obj.month
+            
+        dt = datetime(year_ref, month_ref, day, h, m)
+        
+        # --- FUTURE DATE FIX (Logic Simulation) ---
+        now_dt = datetime.now()
+        if dt > now_dt + timedelta(days=90):
+             dt = dt.replace(year=dt.year - 1)
+        elif pd.notnull(ref_dt_obj):
+             # If close to reference date but crosses year boundary logic
+             naive_ref = ref_dt_obj.replace(tzinfo=None)
+             if (dt - naive_ref).days < -300: dt = dt.replace(year=year_ref+1)
+             elif (dt - naive_ref).days > 300: dt = dt.replace(year=year_ref-1)
+             
+        return IST.localize(dt)
+    except: return pd.NaT
+
 # ==========================================
 # 3. GOOGLE SHEET PARSER (MULTI-TAB)
 # ==========================================
@@ -258,6 +273,15 @@ def safe_parse_date(val):
     if pd.isnull(val) or str(val).strip() == "" or str(val).strip().upper() == "U/P": return pd.NaT
     try:
         dt = pd.to_datetime(val, dayfirst=True, errors='coerce') 
+        
+        # --- FUTURE DATE FIX (Main Arrival Date) ---
+        if pd.notnull(dt):
+            now_dt = datetime.now()
+            # If date is > 90 days in future, assume previous year
+            if dt > now_dt + timedelta(days=90):
+                dt = dt.replace(year=dt.year - 1)
+        # -------------------------------------------
+        
         if pd.isnull(dt): return pd.NaT 
         return to_ist(dt)
     except: return pd.NaT
@@ -304,7 +328,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
         
-        # Reason Lookahead
         dept_val = str(row.iloc[11]).strip()
         if dept_val.lower() in ['nan', '', 'none']: dept_val = ""
         
@@ -317,7 +340,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                 if reason_val.lower() not in ['nan', '', 'none']:
                     reason_detail = reason_val
         
-        # STRICT FILTER
         if dept_val and reason_detail:
             full_remarks_blob = f"{dept_val}|{reason_detail}"
         else:
@@ -355,14 +377,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                     tippler_timings[f"{t_name} End"] = format_dt(te)
                     tippler_timings[f"{t_name}_Obj_End"] = te
                     
-                    if pd.notnull(arrival_dt):
-                        diff = (ts - arrival_dt).days
-                        if diff < -300: ts = ts.replace(year=arrival_dt.year + 1)
-                        elif diff > 300: ts = ts.replace(year=arrival_dt.year - 1)
-                        diff_e = (te - arrival_dt).days
-                        if diff_e < -300: te = te.replace(year=arrival_dt.year + 1)
-                        elif diff_e > 300: te = te.replace(year=arrival_dt.year - 1)
-
                     tippler_objs[f"{t_name}_Start_Obj"] = ts
                     tippler_objs[f"{t_name}_End_Obj"] = te
                     
@@ -734,7 +748,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         today_date = datetime.now(IST).date()
         yesterday_date = today_date - timedelta(days=1)
         
-        # TAB 1 VISUAL FILTER: Only Yesterday+
         def keep_row_live(r):
             ad = r['_Arrival_DT'].date()
             if ad >= yesterday_date: return True
@@ -744,11 +757,9 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers'] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']]
         
-        # Tab 1 Data (Filtered)
         actuals_clean_live = df_locked_live.drop(columns=[c for c in cols_to_drop if c in df_locked_live.columns], errors='ignore')
         final_df_display = pd.concat([actuals_clean_live, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean_live
         
-        # Tab 2 Data (Full History) - Keep objects for calculation
         final_df_all = pd.concat([df_locked, df_sim], ignore_index=True)
     else:
         final_df_display = df_sim
@@ -791,7 +802,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             if dept_part:
                 dept_code = classify_reason(dept_part)
                 final_text = reason_part if reason_part else dept_part
-                # UPDATED FORMAT: [Rake] - Reason (Dept)
                 formatted_reason = f"[{rake_name}] - {final_text} ({dept_code})"
                 daily_stats[d_str]['All_Reasons'].add(formatted_reason)
         
@@ -845,7 +855,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
     output_rows = []
     for d, v in sorted(daily_stats.items()):
         reasons_set = v['All_Reasons']
-        # JOIN WITH DOUBLE NEWLINE for spacing
         major_reasons_str = "\n\n".join(sorted(reasons_set)) if reasons_set else "-"
 
         row = {
@@ -927,7 +936,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                 "_Arrival_DT": None, "_Shunt_Ready_DT": None, "_Form_Mins": None, "Date_Str": None, "_raw_wagon_counts": None, "_remarks": None
             }
 
-            # FILTER: ONLY SHOW YESTERDAY ONWARDS
             live_start_date = (datetime.now(IST) - timedelta(days=1)).date()
             unique_dates_live = [d for d in unique_dates if datetime.strptime(d, '%Y-%m-%d').date() >= live_start_date]
 
@@ -941,7 +949,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             st.markdown("### 📊 Daily Performance & Demurrage Forecast")
             st.dataframe(daily_stats_df, hide_index=True)
             
-            # Export Filtered Live Data
             df_export_live = df_final[df_final['Date_Str'].isin(unique_dates_live)]
             st.download_button("📥 Download Final Report", df_export_live.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
 
