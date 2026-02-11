@@ -18,7 +18,7 @@ IST = pytz.timezone('Asia/Kolkata')
 st.sidebar.header("⚙️ Settings")
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
 
-# NOTE: Removed the "Show History" checkbox because we now load everything for the History Tab to work.
+show_history = st.sidebar.checkbox("Show All Historical Data", value=False, help="Check this to see old completed rakes")
 
 st.sidebar.markdown("---")
 sim_params = {}
@@ -235,7 +235,7 @@ def parse_demurrage_special(cell_val):
     return "00:00"
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (NO FILTERING HERE)
+# 3. GOOGLE SHEET PARSER (FETCH ALL + STORE HIDDEN DT OBJECTS)
 # ==========================================
 
 def safe_parse_date(val):
@@ -248,7 +248,6 @@ def safe_parse_date(val):
 
 @st.cache_data(ttl=60)
 def fetch_google_sheet_actuals(url, free_time_hours):
-    # FIXED: No more "yesterday" filtering in this function. We load ALL data.
     try:
         df_gs = pd.read_csv(url, header=None, skiprows=1) 
         if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), (0,0)
@@ -301,6 +300,9 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             active_tipplers_row = []
             explicit_wagon_counts = {}
             
+            # Store REAL Objects
+            tippler_objs = {} 
+
             for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
                 cell_val = row.iloc[idx]
                 if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
@@ -318,11 +320,15 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                         tippler_timings[f"{t_name} Start"] = format_dt(ts)
                         tippler_timings[f"{t_name} End"] = format_dt(te)
                         tippler_timings[f"{t_name}_Obj_End"] = te
+                        
+                        # SAVE REAL DATETIME OBJECTS
+                        tippler_objs[f"{t_name}_Start_Obj"] = ts
+                        tippler_objs[f"{t_name}_End_Obj"] = te
+                        
                         if wc is not None: explicit_wagon_counts[t_name] = wc
 
             is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
-            # Always track max sequence
             seq, rid = parse_last_sequence(rake_name)
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
                 last_seq_tuple = (seq, rid)
@@ -401,6 +407,10 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 '_raw_tipplers': active_tipplers_row,
                 '_remarks': full_remarks_blob
             }
+            # Inject Hidden Timings
+            for t, obj in tippler_objs.items():
+                entry[t] = obj # e.g. T1_Start_Obj
+
             for t in ['T1', 'T2', 'T3', 'T4']:
                 entry[f"{t} Start"] = tippler_timings.get(f"{t} Start", "")
                 entry[f"{t} End"] = tippler_timings.get(f"{t} End", "")
@@ -687,7 +697,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             return False 
         df_locked_visible = df_locked[df_locked.apply(keep_row, axis=1)]
         
-        cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers']
+        cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers'] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']]
         actuals_clean = df_locked_visible.drop(columns=[c for c in cols_to_drop if c in df_locked_visible.columns], errors='ignore')
         
         final_df_display = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
@@ -734,7 +744,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             if dept_part:
                 dept_code = classify_reason(dept_part)
                 final_text = reason_part if reason_part else dept_part
-                # NEW FORMAT: [Rake] - Reason (Dept)
+                # UPDATED FORMAT: [Rake] - Reason (Dept)
                 formatted_reason = f"[{rake_name}] - {final_text} ({dept_code})"
                 daily_stats[d_str]['All_Reasons'].add(formatted_reason)
         
@@ -743,51 +753,57 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         
         current_year = datetime.now().year
         for t in ['T1', 'T2', 'T3', 'T4']:
-            start_str = str(row.get(f"{t} Start", ""))
-            end_str = str(row.get(f"{t} End", ""))
-            if start_str and end_str:
-                s_dt = parse_dt_from_str(start_str, current_year)
-                e_dt = parse_dt_from_str(end_str, current_year)
+            # Use HIDDEN OBJECTS first!
+            s_dt = row.get(f"{t}_Start_Obj", pd.NaT)
+            e_dt = row.get(f"{t}_End_Obj", pd.NaT)
+            
+            # Fallback to string parsing ONLY if objects missing (e.g. simulation rows)
+            if pd.isnull(s_dt) or pd.isnull(e_dt):
+                start_str = str(row.get(f"{t} Start", ""))
+                end_str = str(row.get(f"{t} End", ""))
+                if start_str and end_str:
+                    s_dt = parse_dt_from_str(start_str, current_year)
+                    e_dt = parse_dt_from_str(end_str, current_year)
+            
+            if pd.notnull(s_dt) and pd.notnull(e_dt):
+                if e_dt < s_dt: e_dt += timedelta(days=1)
                 
-                if pd.notnull(s_dt) and pd.notnull(e_dt):
-                    if e_dt < s_dt: e_dt += timedelta(days=1)
+                total_dur_sec = (e_dt - s_dt).total_seconds()
+                total_wagons = wag_map.get(f"{t}_Wagons", 0)
+                
+                curr = s_dt
+                while curr < e_dt:
+                    curr_day_str = curr.strftime('%Y-%m-%d')
                     
-                    total_dur_sec = (e_dt - s_dt).total_seconds()
-                    total_wagons = wag_map.get(f"{t}_Wagons", 0)
+                    curr_date = curr.date()
+                    in_range = True
+                    if start_filter_dt and curr_date < start_filter_dt: in_range = False
+                    if end_filter_dt and curr_date > end_filter_dt: in_range = False
                     
-                    curr = s_dt
-                    while curr < e_dt:
-                        curr_day_str = curr.strftime('%Y-%m-%d')
+                    next_midnight = (curr + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                    segment_end = min(e_dt, next_midnight)
+                    segment_dur_sec = (segment_end - curr).total_seconds()
+                    hours = segment_dur_sec / 3600.0
+                    
+                    if in_range:
+                        if curr_day_str not in daily_stats: 
+                            daily_stats[curr_day_str] = {'Demurrage': 0, 'All_Reasons': set()}
+                            for tx in ['T1', 'T2', 'T3', 'T4']: 
+                                daily_stats[curr_day_str][f'{tx}_hrs'] = 0.0
+                                daily_stats[curr_day_str][f'{tx}_wag'] = 0.0
                         
-                        curr_date = curr.date()
-                        in_range = True
-                        if start_filter_dt and curr_date < start_filter_dt: in_range = False
-                        if end_filter_dt and curr_date > end_filter_dt: in_range = False
+                        if total_dur_sec > 0:
+                            fraction = segment_dur_sec / total_dur_sec
+                            daily_stats[curr_day_str][f'{t}_wag'] += (total_wagons * fraction)
                         
-                        next_midnight = (curr + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-                        segment_end = min(e_dt, next_midnight)
-                        segment_dur_sec = (segment_end - curr).total_seconds()
-                        hours = segment_dur_sec / 3600.0
-                        
-                        if in_range:
-                            if curr_day_str not in daily_stats: 
-                                daily_stats[curr_day_str] = {'Demurrage': 0, 'All_Reasons': set()}
-                                for tx in ['T1', 'T2', 'T3', 'T4']: 
-                                    daily_stats[curr_day_str][f'{tx}_hrs'] = 0.0
-                                    daily_stats[curr_day_str][f'{tx}_wag'] = 0.0
-                            
-                            if total_dur_sec > 0:
-                                fraction = segment_dur_sec / total_dur_sec
-                                daily_stats[curr_day_str][f'{t}_wag'] += (total_wagons * fraction)
-                            
-                            daily_stats[curr_day_str][f'{t}_hrs'] += hours
-                        
-                        curr = segment_end
+                        daily_stats[curr_day_str][f'{t}_hrs'] += hours
+                    
+                    curr = segment_end
 
     output_rows = []
     for d, v in sorted(daily_stats.items()):
         reasons_set = v['All_Reasons']
-        # Join with newline for clear separation
+        # JOIN WITH NEWLINE
         major_reasons_str = "\n".join(sorted(reasons_set)) if reasons_set else "-"
 
         row = {
