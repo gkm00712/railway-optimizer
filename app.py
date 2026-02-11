@@ -219,6 +219,29 @@ def classify_reason(reason_text):
     
     return "Misc"
 
+# --- NEW: Robust Demurrage Parser ---
+def parse_demurrage_special(cell_val):
+    s = str(cell_val).strip().upper()
+    if s in ["", "NAN", "NIL", "-", "NONE"]: return "00:00"
+    
+    # Priority 1: Check for HH:MM format
+    if ":" in s:
+        # Simple validation: looks like digits:digits
+        if re.search(r'\d+:\d+', s):
+            return s
+    
+    # Priority 2: Extract numeral (e.g. "3.5 hrs", "5", "2 hours")
+    match = re.search(r'(\d+(\.\d+)?)', s)
+    if match:
+        try:
+            val = float(match.group(1))
+            hours = int(val)
+            minutes = int((val - hours) * 60)
+            return f"{hours:02d}:{minutes:02d}"
+        except: pass
+        
+    return "00:00"
+
 # ==========================================
 # 3. GOOGLE SHEET PARSER (LOOK-AHEAD LOGIC)
 # ==========================================
@@ -267,7 +290,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
                     if reason_val.lower() not in ['nan', '', 'none']:
                         reason_detail = reason_val
             
-            # STRICT FILTER
             if dept_val and reason_detail:
                 full_remarks_blob = f"{dept_val}|{reason_detail}"
             else:
@@ -289,11 +311,18 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
             for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
                 cell_val = row.iloc[idx]
                 if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
-                    ts, te = parse_tippler_cell(cell_val, arrival_dt)
                     wc = parse_wagon_count_from_cell(cell_val)
-                    if pd.isnull(ts) and pd.notnull(start_dt):
-                        ts = start_dt
-                        te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2)
+                    ts, te = parse_tippler_cell(cell_val, arrival_dt)
+                    
+                    # LOGIC UPDATE: If Time Missing but Wagon Count Exists -> Use Rake Timings
+                    if pd.isnull(ts) and wc is not None:
+                        if pd.notnull(start_dt):
+                            ts = start_dt
+                            te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2)
+                    elif pd.isnull(ts) and pd.notnull(start_dt):
+                        # Fallback for empty cells if logic requires (usually skipped)
+                        pass
+
                     if pd.notnull(ts):
                         active_tipplers_row.append(t_name)
                         tippler_timings[f"{t_name} Start"] = format_dt(ts)
@@ -304,7 +333,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
             is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
             is_visible = True
-            
             seq, rid = parse_last_sequence(rake_name)
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
                 last_seq_tuple = (seq, rid)
@@ -354,12 +382,9 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
                     if pd.notnull(safe_parse_date(row.iloc[7])): 
                         total_dur = safe_parse_date(row.iloc[7]) - arrival_dt
 
-            dem_str = "00:00"
-            raw_dem = row.iloc[10] 
-            if pd.notnull(raw_dem) and str(raw_dem).strip() != "":
-                clean = str(raw_dem).strip()
-                if ":" in clean: dem_str = clean
-                elif clean.replace('.','',1).isdigit(): dem_str = f"{int(float(clean)):02d}:00"
+            # DEMURRAGE PARSING UPDATE
+            raw_dem_val = row.iloc[10]
+            dem_str = parse_demurrage_special(raw_dem_val)
 
             entry = {
                 'Rake': rake_name,
