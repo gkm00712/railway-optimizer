@@ -244,14 +244,11 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
         yesterday_date = today_date - timedelta(days=1)
         last_seq_tuple = (0, 0)
 
-        # ITERATE BY INDEX to check Next Row (i+1)
         for i in range(len(df_gs)):
             row = df_gs.iloc[i]
             
-            val_b = str(row.iloc[1]).strip() # Rake Name
-            val_c = str(row.iloc[2]).strip() # Source
-            
-            # Skip if no Rake Name
+            val_b = str(row.iloc[1]).strip()
+            val_c = str(row.iloc[2]).strip()
             if not val_b or val_b.lower() == 'nan': continue 
             
             source_val = "Unknown" if (not val_c or val_c.lower() == 'nan') else val_c
@@ -259,26 +256,18 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
             if pd.isnull(arrival_dt): continue
             
             # --- START LOOK-AHEAD FOR REASONS ---
-            dept_val = str(row.iloc[11]).strip() # Current Row Col L
+            dept_val = str(row.iloc[11]).strip()
             if dept_val.lower() in ['nan', '', 'none']: dept_val = ""
             
             reason_detail = ""
-            # Check if next row exists and has EMPTY Rake Name (means it's a continuation)
             if i + 1 < len(df_gs):
                 next_row = df_gs.iloc[i + 1]
                 next_rake_name = str(next_row.iloc[1]).strip()
                 if not next_rake_name or next_rake_name.lower() == 'nan':
-                    # It is a continuation row! Grab reason from Col L
                     reason_val = str(next_row.iloc[11]).strip()
                     if reason_val.lower() not in ['nan', '', 'none']:
                         reason_detail = reason_val
             
-            # Fallback: if no continuation row, check if Dept val itself is long
-            if not reason_detail and len(dept_val) > 5: 
-                # Maybe user put everything in one cell
-                pass 
-            
-            # Store structured reason: "DEPT_CODE | SPECIFIC_REASON"
             full_remarks_blob = f"{dept_val}|{reason_detail}" if reason_detail else dept_val
             # ------------------------------------
 
@@ -724,20 +713,21 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
         
         if dem_hrs > 0:
             rem = str(row.get('_remarks', '')).strip()
-            # Split raw string "DEPT|REASON"
+            rake_name = str(row.get('Rake', 'Unknown'))
             if '|' in rem:
                 dept_part, reason_part = rem.split('|', 1)
             else:
                 dept_part, reason_part = rem, ""
             
-            # Classification
             if dept_part:
-                dept_code = classify_reason(dept_part) # Use Code (MM, EMD) as Key
+                dept_code = classify_reason(dept_part)
                 final_text = reason_part if reason_part else dept_part
+                
+                reason_with_rake = f"{final_text} [{rake_name}]"
                 
                 if dept_code not in daily_stats[d_str]['Dept_Reasons']:
                     daily_stats[d_str]['Dept_Reasons'][dept_code] = set()
-                daily_stats[d_str]['Dept_Reasons'][dept_code].add(final_text)
+                daily_stats[d_str]['Dept_Reasons'][dept_code].add(reason_with_rake)
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
