@@ -197,8 +197,25 @@ def parse_col_d_wagon_type(cell_val):
     elif 'N' in s: load_type = 'BOXN'
     return wagons, load_type
 
+def classify_reason(reason_text):
+    if not reason_text: return "Other"
+    txt = reason_text.upper()
+    
+    # Keyword Lists
+    mm_keys = ['MM', 'MECH', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
+    emd_keys = ['EMD', 'ELEC', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
+    cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
+    rs_keys = ['C&W', 'WAGON', 'DOOR', 'COUPL', 'RAKE']
+    
+    if any(k in txt for k in mm_keys): return "MM"
+    if any(k in txt for k in emd_keys): return "EMD"
+    if any(k in txt for k in cni_keys): return "C&I"
+    if any(k in txt for k in rs_keys): return "Rolling Stock"
+    
+    return "Other"
+
 # ==========================================
-# 3. GOOGLE SHEET PARSER (Updated for Col L)
+# 3. GOOGLE SHEET PARSER
 # ==========================================
 
 def safe_parse_date(val):
@@ -289,7 +306,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
                     'Optimization Type': 'Auto-Planned (G-Sheet)',
                     'Extra Shunt (Mins)': 0,
                     'is_gs_unplanned': True,
-                    '_remarks': remarks_val # Store remarks
+                    '_remarks': remarks_val
                 })
                 continue 
 
@@ -353,7 +370,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
                 '_raw_tipplers_data': tippler_timings,
                 '_raw_wagon_counts': wagon_counts_map,
                 '_raw_tipplers': active_tipplers_row,
-                '_remarks': remarks_val # Store remarks
+                '_remarks': remarks_val
             }
             for t in ['T1', 'T2', 'T3', 'T4']:
                 entry[f"{t} Start"] = tippler_timings.get(f"{t} Start", "")
@@ -668,17 +685,21 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
         d_str = arr_dt.strftime('%Y-%m-%d')
         
         if d_str not in daily_stats: 
-            daily_stats[d_str] = {'Demurrage': 0, 'Reasons': set()}
+            daily_stats[d_str] = {'Demurrage': 0, 'Dept_Reasons': {}}
             for t in ['T1', 'T2', 'T3', 'T4']: 
                 daily_stats[d_str][f'{t}_hrs'] = 0.0
                 daily_stats[d_str][f'{t}_wag'] = 0
         
         daily_stats[d_str]['Demurrage'] += dem_hrs
         
-        # Collect reasons
-        rem = str(row.get('_remarks', '')).strip()
-        if rem and rem.lower() != 'nan':
-            daily_stats[d_str]['Reasons'].add(rem)
+        # CATEGORIZE REASON (ONLY IF DEMURRAGE > 0)
+        if dem_hrs > 0:
+            rem = str(row.get('_remarks', '')).strip()
+            if rem and rem.lower() != 'nan':
+                dept = classify_reason(rem)
+                if dept not in daily_stats[d_str]['Dept_Reasons']:
+                    daily_stats[d_str]['Dept_Reasons'][dept] = set()
+                daily_stats[d_str]['Dept_Reasons'][dept].add(rem)
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
@@ -706,7 +727,7 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
                         hours = segment_dur_sec / 3600.0
                         
                         if curr_day_str not in daily_stats: 
-                            daily_stats[curr_day_str] = {'Demurrage': 0, 'Reasons': set()}
+                            daily_stats[curr_day_str] = {'Demurrage': 0, 'Dept_Reasons': {}}
                             for tx in ['T1', 'T2', 'T3', 'T4']: 
                                 daily_stats[curr_day_str][f'{tx}_hrs'] = 0.0
                                 daily_stats[curr_day_str][f'{tx}_wag'] = 0.0
@@ -726,10 +747,16 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
     for d, v in sorted(daily_stats.items()):
         if d < yesterday_str: continue 
         
+        # Format Reasons: "MM: Belt (1); EMD: Power (2)"
+        reasons_list = []
+        for dept, reasons in v['Dept_Reasons'].items():
+            reasons_list.append(f"{dept}: {', '.join(reasons)}")
+        major_reasons_str = "; ".join(reasons_list) if reasons_list else "-"
+
         row = {
             'Date': d, 
             'Demurrage': f"{int(v['Demurrage'])} Hours",
-            'Major Reasons': ", ".join(v['Reasons']) if v['Reasons'] else "-"
+            'Major Reasons': major_reasons_str
         }
         for t in ['T1', 'T2', 'T3', 'T4']:
             rate = 0.0
