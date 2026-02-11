@@ -220,7 +220,7 @@ def classify_reason(reason_text):
     return "Misc"
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (LOOK-AHEAD LOGIC)
+# 3. GOOGLE SHEET PARSER (Strict Reason Filter)
 # ==========================================
 
 def safe_parse_date(val):
@@ -246,7 +246,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
 
         for i in range(len(df_gs)):
             row = df_gs.iloc[i]
-            
             val_b = str(row.iloc[1]).strip()
             val_c = str(row.iloc[2]).strip()
             if not val_b or val_b.lower() == 'nan': continue 
@@ -255,7 +254,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
-            # --- START LOOK-AHEAD FOR REASONS ---
+            # --- STRICT REASON LOGIC ---
             dept_val = str(row.iloc[11]).strip()
             if dept_val.lower() in ['nan', '', 'none']: dept_val = ""
             
@@ -263,13 +262,19 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
             if i + 1 < len(df_gs):
                 next_row = df_gs.iloc[i + 1]
                 next_rake_name = str(next_row.iloc[1]).strip()
+                # Check for continuation row
                 if not next_rake_name or next_rake_name.lower() == 'nan':
                     reason_val = str(next_row.iloc[11]).strip()
                     if reason_val.lower() not in ['nan', '', 'none']:
                         reason_detail = reason_val
             
-            full_remarks_blob = f"{dept_val}|{reason_detail}" if reason_detail else dept_val
-            # ------------------------------------
+            # STRICT FILTER: Only combine if BOTH Dept (Row X) and Reason (Row X+1) exist.
+            # If Reason is missing, we ignore the Department entirely.
+            if dept_val and reason_detail:
+                full_remarks_blob = f"{dept_val}|{reason_detail}"
+            else:
+                full_remarks_blob = ""
+            # ---------------------------
 
             rake_name = val_b
             col_d_val = row.iloc[3]
@@ -301,10 +306,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
             is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
             
             is_visible = True
-            # NOTE: We keep ALL data in "locked_actuals" so History Tab can see it.
-            # Filtering for "Yesterday+" is done ONLY for the Display DF in Tab 1.
             
-            # Update Sequence Logic
             seq, rid = parse_last_sequence(rake_name)
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
                 last_seq_tuple = (seq, rid)
@@ -663,24 +665,21 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     df_sim = pd.DataFrame(assignments)
     
     if not df_locked.empty:
-        # VISUAL FILTER FOR TAB 1 (Only show Yesterday+)
         today_date = datetime.now(IST).date()
         yesterday_date = today_date - timedelta(days=1)
         
-        # Only affect the DISPLAY dataframe for Tab 1
+        # TAB 1 VISUAL FILTER
         def keep_row(r):
             ad = r['_Arrival_DT'].date()
             if ad >= yesterday_date: return True
             return False 
-        
         df_locked_visible = df_locked[df_locked.apply(keep_row, axis=1)]
         
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers']
         actuals_clean = df_locked_visible.drop(columns=[c for c in cols_to_drop if c in df_locked_visible.columns], errors='ignore')
         
         final_df_display = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
-        
-        # IMPORTANT: Keep FULL history in 'final_df_all' for Tab 2
+        # FULL HISTORY FOR TAB 2
         final_df_all = pd.concat([df_locked.drop(columns=cols_to_drop, errors='ignore'), df_sim], ignore_index=True)
     else:
         final_df_display = df_sim
@@ -701,7 +700,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         if arr_dt.tzinfo is None: arr_dt = IST.localize(arr_dt)
         d_str = arr_dt.strftime('%Y-%m-%d')
         
-        # APPLY FILTERS HERE
         if start_filter_dt and arr_dt.date() < start_filter_dt: continue
         if end_filter_dt and arr_dt.date() > end_filter_dt: continue
 
@@ -750,7 +748,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                     while curr < e_dt:
                         curr_day_str = curr.strftime('%Y-%m-%d')
                         
-                        # Only count machine hours if date falls within filter range
                         curr_date = curr.date()
                         in_range = True
                         if start_filter_dt and curr_date < start_filter_dt: in_range = False
@@ -899,6 +896,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     if isinstance(dr, tuple) and len(dr) == 2: start_f, end_f = dr
             
             if start_f and end_f:
+                # Use FULL history dataframe, filtering by the selected dates
                 hist_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_f, end_filter_dt=end_f)
                 st.markdown(f"**Performance Summary ({start_f} to {end_f})**")
                 st.dataframe(hist_stats, hide_index=True, use_container_width=True)
@@ -908,7 +906,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     mask = (st.session_state.sim_full_result['_Arrival_DT'].dt.date >= start_f) & (st.session_state.sim_full_result['_Arrival_DT'].dt.date <= end_f)
                     hist_raw = st.session_state.sim_full_result[mask].copy()
                     
-                    # FILTER: Show only Demurrage > 0
+                    # DEMURRAGE FILTER
                     def has_demurrage(val):
                         s = str(val).strip()
                         return s != "00:00" and s != "0"
