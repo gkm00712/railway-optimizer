@@ -702,7 +702,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         if end_filter_dt and arr_dt.date() > end_filter_dt: continue
 
         if d_str not in daily_stats: 
-            daily_stats[d_str] = {'Demurrage': 0, 'Dept_Reasons': {}}
+            daily_stats[d_str] = {'Demurrage': 0, 'All_Reasons': set()}
             for t in ['T1', 'T2', 'T3', 'T4']: 
                 daily_stats[d_str][f'{t}_hrs'] = 0.0
                 daily_stats[d_str][f'{t}_wag'] = 0.0
@@ -720,10 +720,9 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             if dept_part:
                 dept_code = classify_reason(dept_part)
                 final_text = reason_part if reason_part else dept_part
-                reason_with_rake = f"[{rake_name}] - {final_text}"
-                if dept_code not in daily_stats[d_str]['Dept_Reasons']:
-                    daily_stats[d_str]['Dept_Reasons'][dept_code] = set()
-                daily_stats[d_str]['Dept_Reasons'][dept_code].add(reason_with_rake)
+                # NEW FORMAT: [Rake] - Reason (Dept)
+                formatted_reason = f"[{rake_name}] - {final_text} ({dept_code})"
+                daily_stats[d_str]['All_Reasons'].add(formatted_reason)
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
@@ -758,7 +757,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                         
                         if in_range:
                             if curr_day_str not in daily_stats: 
-                                daily_stats[curr_day_str] = {'Demurrage': 0, 'Dept_Reasons': {}}
+                                daily_stats[curr_day_str] = {'Demurrage': 0, 'All_Reasons': set()}
                                 for tx in ['T1', 'T2', 'T3', 'T4']: 
                                     daily_stats[curr_day_str][f'{tx}_hrs'] = 0.0
                                     daily_stats[curr_day_str][f'{tx}_wag'] = 0.0
@@ -773,10 +772,9 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
 
     output_rows = []
     for d, v in sorted(daily_stats.items()):
-        reasons_list = []
-        for dept, reasons in v['Dept_Reasons'].items():
-            reasons_list.append(f"{dept}: {', '.join(reasons)}")
-        major_reasons_str = "  ;  ".join(reasons_list) if reasons_list else "-"
+        reasons_set = v['All_Reasons']
+        # Join with newline for clear separation
+        major_reasons_str = "\n".join(sorted(reasons_set)) if reasons_set else "-"
 
         row = {
             'Date': d, 
