@@ -198,7 +198,7 @@ def parse_col_d_wagon_type(cell_val):
     return wagons, load_type
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER
+# 3. GOOGLE SHEET PARSER (Updated for Col L)
 # ==========================================
 
 def safe_parse_date(val):
@@ -230,6 +230,10 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
             source_val = "Unknown" if (not val_c or val_c.lower() == 'nan') else val_c
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
+            
+            # --- CAPTURE COLUMN L (Index 11) ---
+            remarks_val = str(row.iloc[11]).strip()
+            if remarks_val.lower() in ['nan', '', 'none']: remarks_val = ""
             
             rake_name = val_b
             col_d_val = row.iloc[3]
@@ -284,7 +288,8 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
                     '_Form_Mins': 0,
                     'Optimization Type': 'Auto-Planned (G-Sheet)',
                     'Extra Shunt (Mins)': 0,
-                    'is_gs_unplanned': True 
+                    'is_gs_unplanned': True,
+                    '_remarks': remarks_val # Store remarks
                 })
                 continue 
 
@@ -347,7 +352,8 @@ def fetch_google_sheet_actuals(url, free_time_hours, show_full_history):
                 '_raw_end_dt': end_dt,
                 '_raw_tipplers_data': tippler_timings,
                 '_raw_wagon_counts': wagon_counts_map,
-                '_raw_tipplers': active_tipplers_row
+                '_raw_tipplers': active_tipplers_row,
+                '_remarks': remarks_val # Store remarks
             }
             for t in ['T1', 'T2', 'T3', 'T4']:
                 entry[f"{t} Start"] = tippler_timings.get(f"{t} Start", "")
@@ -557,7 +563,8 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                 'Wait (Tippler)': "",
                 'Total Duration': "",
                 'Demurrage': "00:00",
-                '_raw_wagon_counts': {}
+                '_raw_wagon_counts': {},
+                '_remarks': ""
             }
             for t in ['T1', 'T2', 'T3', 'T4']:
                  row_data[f"{t} Start"] = ""; row_data[f"{t} End"] = ""; row_data[f"{t} Idle"] = ""
@@ -612,7 +619,8 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             'Wait (Tippler)': format_duration_hhmm(best_start - best_ready),
             'Total Duration': format_duration_hhmm(tot_dur_final),
             'Demurrage': dem_str,
-            '_raw_wagon_counts': best_wag
+            '_raw_wagon_counts': best_wag,
+            '_remarks': ""
         }
         for t in ['T1', 'T2', 'T3', 'T4']:
              row_data[f"{t} Start"] = format_dt(best_timings.get(f"{t}_Start", pd.NaT))
@@ -626,7 +634,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         today_date = datetime.now(IST).date()
         yesterday_date = today_date - timedelta(days=1)
         
-        # VISUAL FILTER (Dependent on Toggle)
         if show_history_flag:
             df_locked_visible = df_locked
         else:
@@ -661,12 +668,17 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
         d_str = arr_dt.strftime('%Y-%m-%d')
         
         if d_str not in daily_stats: 
-            daily_stats[d_str] = {'Demurrage': 0}
+            daily_stats[d_str] = {'Demurrage': 0, 'Reasons': set()}
             for t in ['T1', 'T2', 'T3', 'T4']: 
                 daily_stats[d_str][f'{t}_hrs'] = 0.0
                 daily_stats[d_str][f'{t}_wag'] = 0
         
         daily_stats[d_str]['Demurrage'] += dem_hrs
+        
+        # Collect reasons
+        rem = str(row.get('_remarks', '')).strip()
+        if rem and rem.lower() != 'nan':
+            daily_stats[d_str]['Reasons'].add(rem)
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
@@ -694,7 +706,7 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
                         hours = segment_dur_sec / 3600.0
                         
                         if curr_day_str not in daily_stats: 
-                            daily_stats[curr_day_str] = {'Demurrage': 0}
+                            daily_stats[curr_day_str] = {'Demurrage': 0, 'Reasons': set()}
                             for tx in ['T1', 'T2', 'T3', 'T4']: 
                                 daily_stats[curr_day_str][f'{tx}_hrs'] = 0.0
                                 daily_stats[curr_day_str][f'{tx}_wag'] = 0.0
@@ -706,16 +718,19 @@ def recalculate_cascade_reactive(df_all, free_time_hours):
                         daily_stats[curr_day_str][f'{t}_hrs'] += hours
                         curr = segment_end
 
-    # FILTER: Only show stats from Yesterday onwards
+    # Filter for Yesterday 00:01 onwards
     yesterday_date = datetime.now(IST).date() - timedelta(days=1)
     yesterday_str = yesterday_date.strftime('%Y-%m-%d')
     
     output_rows = []
     for d, v in sorted(daily_stats.items()):
-        # Filter Logic Here
         if d < yesterday_str: continue 
         
-        row = {'Date': d, 'Demurrage': f"{int(v['Demurrage'])} Hours"}
+        row = {
+            'Date': d, 
+            'Demurrage': f"{int(v['Demurrage'])} Hours",
+            'Major Reasons': ", ".join(v['Reasons']) if v['Reasons'] else "-"
+        }
         for t in ['T1', 'T2', 'T3', 'T4']:
             rate = 0.0
             if v[f'{t}_hrs'] > 0.1: rate = v[f'{t}_wag'] / v[f'{t}_hrs']
@@ -734,6 +749,14 @@ def highlight_bobr(row):
 # ==========================================
 
 uploaded_file = st.file_uploader("Upload FOIS CSV File (Plan)", type=["csv"])
+
+curr_params_hash = str(sim_params)
+params_changed = False
+if 'last_params_hash' not in st.session_state:
+    st.session_state.last_params_hash = curr_params_hash
+elif st.session_state.last_params_hash != curr_params_hash:
+    params_changed = True
+    st.session_state.last_params_hash = curr_params_hash
 
 input_changed = False
 if uploaded_file and ('last_file_id' not in st.session_state or st.session_state.last_file_id != uploaded_file.file_id):
@@ -784,7 +807,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             "Tippler Start Time": st.column_config.TextColumn("Start (dd-HH:MM)"),
             "Finish Unload": st.column_config.TextColumn("Finish (dd-HH:MM)"),
             "Extra Shunt (Mins)": st.column_config.NumberColumn("Ext. Shunt", step=5),
-            "_Arrival_DT": None, "_Shunt_Ready_DT": None, "_Form_Mins": None, "Date_Str": None, "_raw_wagon_counts": None
+            "_Arrival_DT": None, "_Shunt_Ready_DT": None, "_Form_Mins": None, "Date_Str": None, "_raw_wagon_counts": None, "_remarks": None
         }
 
         for d in unique_dates:
@@ -802,4 +825,4 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
         st.markdown("### 📊 Daily Performance & Demurrage Forecast")
         st.dataframe(daily_stats_df, hide_index=True)
         
-        st.download_button("📥 Download Final Report", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
+        st.download_button("📥 Download Final Report", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
