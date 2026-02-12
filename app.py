@@ -173,8 +173,13 @@ def parse_tippler_cell(cell_value, ref_date):
             start_dt = ref_date.replace(hour=s_h, minute=s_m, second=0, microsecond=0)
             end_dt = ref_date.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
             if end_dt < start_dt: end_dt += timedelta(days=1)
-            if (start_dt - ref_date).total_seconds() < -43200: 
-                 start_dt += timedelta(days=1); end_dt += timedelta(days=1)
+            
+            now_dt = datetime.now(IST)
+            if start_dt > now_dt + timedelta(days=90):
+                start_dt = start_dt.replace(year=start_dt.year - 1)
+            if end_dt > now_dt + timedelta(days=90):
+                end_dt = end_dt.replace(year=end_dt.year - 1)
+            
             return start_dt, end_dt
         except: pass
     return pd.NaT, pd.NaT
@@ -204,7 +209,6 @@ def parse_col_d_wagon_type(cell_val):
 def classify_reason(reason_text):
     if not reason_text: return "Misc"
     txt = reason_text.upper()
-    
     mm_keys = ['MM', 'MECH', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
     emd_keys = ['EMD', 'ELEC', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
     cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
@@ -220,7 +224,6 @@ def classify_reason(reason_text):
     if any(k in txt for k in mgr_keys): return "MGR"
     if any(k in txt for k in chem_keys): return "Chemistry"
     if any(k in txt for k in opr_keys): return "OPR"
-    
     return "Misc"
 
 def parse_demurrage_special(cell_val):
@@ -306,32 +309,45 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
         
-        # --- CAPTURE ALL REASONS (Multi-Row Logic) ---
-        reasons_list = []
+        # --- ROBUST REASON CAPTURE ---
+        rows_content = []
+        val = str(row.iloc[11]).strip()
+        if val and val.lower() not in ['nan', '', 'none']: rows_content.append(val)
         
-        # 1. Check Current Row (Col L - Index 11)
-        curr_l = str(row.iloc[11]).strip()
-        if curr_l and curr_l.lower() not in ['nan', 'none', '']:
-            reasons_list.append(curr_l)
-        
-        # 2. Look Ahead until next Rake
         j = i + 1
         while j < len(df_gs):
-            next_row = df_gs.iloc[j]
-            next_rake = str(next_row.iloc[1]).strip()
-            
-            # If next row has a Rake Name, break
-            if next_rake and next_rake.lower() != 'nan':
-                break
-            
-            # Continuation row -> grab Col L
-            sub_l = str(next_row.iloc[11]).strip()
-            if sub_l and sub_l.lower() not in ['nan', 'none', '']:
-                reasons_list.append(sub_l)
-            j += 1
+             next_row = df_gs.iloc[j]
+             if pd.notnull(next_row.iloc[1]): break 
+             val_sub = str(next_row.iloc[11]).strip()
+             if val_sub and val_sub.lower() not in ['nan', '', 'none']: rows_content.append(val_sub)
+             j += 1
+             
+        department_found = "Misc"
+        clean_reasons = []
         
-        full_remarks_blob = " | ".join(reasons_list)
-        # ---------------------------------------------
+        # Strict Ignore List for "Department Only" rows
+        dept_codes_strict = ['MM', 'EMD', 'C&I', 'C&W', 'MGR', 'CHEM', 'OPR', 'OPER', 'MECH', 'ELEC']
+        
+        for text in rows_content:
+            is_dept_code = False
+            txt_upper = text.upper().replace(".","").replace(" ","")
+            if txt_upper in dept_codes_strict or len(text) < 4:
+                is_dept_code = True
+                cat = classify_reason(text)
+                if cat != "Misc": department_found = cat
+            
+            if not is_dept_code:
+                clean_reasons.append(text)
+                # Infer department from the reason text itself
+                cat_reason = classify_reason(text)
+                if cat_reason != "Misc": department_found = cat_reason
+        
+        if clean_reasons:
+            full_reason_text = " | ".join(clean_reasons)
+            full_remarks_blob = f"{department_found}|{full_reason_text}"
+        else:
+            full_remarks_blob = "" 
+        # -----------------------------
 
         rake_name = val_b
         col_d_val = row.iloc[3]
