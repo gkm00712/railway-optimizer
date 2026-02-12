@@ -81,17 +81,6 @@ def format_dt(dt):
     if dt.tzinfo is None: dt = IST.localize(dt)
     return dt.strftime('%d-%H:%M')
 
-def parse_dt_from_str(dt_str, year_ref):
-    try:
-        if not dt_str: return pd.NaT
-        parts = dt_str.split('-')
-        day = int(parts[0])
-        hm = parts[1].split(':')
-        h, m = int(hm[0]), int(hm[1])
-        dt = datetime(year_ref, datetime.now().month, day, h, m)
-        return IST.localize(dt)
-    except: return pd.NaT
-
 def format_duration_hhmm(delta):
     if pd.isnull(delta): return ""
     total_seconds = int(delta.total_seconds())
@@ -192,20 +181,26 @@ def parse_col_d_wagon_type(cell_val):
     elif 'N' in s: load_type = 'BOXN'
     return wagons, load_type
 
-def parse_demurrage_special(cell_val):
+# --- DIRECT NUMERIC PARSER FOR COLUMN K ---
+def parse_demurrage_column_k(cell_val):
     s = str(cell_val).strip().upper()
     if s in ["", "NAN", "NIL", "-", "NONE"]: return "00:00"
+    
+    # If cell contains colon, assume it's already HH:MM
     if ":" in s:
-        if re.search(r'\d+:\d+', s): return s
+        return s
+    
+    # If it's a number (int or float), convert to HH:MM
+    # e.g., 5.5 -> 05:30
     match = re.search(r'(\d+(\.\d+)?)', s)
     if match:
         try:
             val = float(match.group(1))
-            if val > 240 and "HR" not in s: return "00:00"
             hours = int(val)
             minutes = int((val - hours) * 60)
             return f"{hours:02d}:{minutes:02d}"
         except: pass
+        
     return "00:00"
 
 def parse_dt_from_str_smart(dt_str, ref_dt_obj):
@@ -290,39 +285,26 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
     unplanned_actuals = [] 
     last_seq_tuple = (0, 0)
     
+    # We no longer need grouping for reasons, so we process row by row
+    # skipping only completely duplicate entries
     processed_indices = set()
 
     for i in range(len(df_gs)):
         if i in processed_indices: continue
         
         row = df_gs.iloc[i]
-        val_b = str(row.iloc[1]).strip()
+        val_b = str(row.iloc[1]).strip() # Rake Name
         if not val_b or val_b.lower() == 'nan': continue
         
         processed_indices.add(i)
         
-        val_c = str(row.iloc[2]).strip()
+        val_c = str(row.iloc[2]).strip() # Source
         source_val = "Unknown" if (not val_c or val_c.lower() == 'nan') else val_c
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
-        
-        # Look ahead for grouping (to consume continuation rows if any)
-        j = i + 1
-        while j < len(df_gs):
-             next_row = df_gs.iloc[j]
-             next_rake_name = str(next_row.iloc[1]).strip()
-             is_continuation = False
-             if not next_rake_name or next_rake_name.lower() == 'nan':
-                 is_continuation = True
-             elif next_rake_name == val_b:
-                 is_continuation = True
-             if not is_continuation:
-                 break
-             processed_indices.add(j)
-             j += 1
 
         rake_name = val_b
-        col_d_val = row.iloc[3]
+        col_d_val = row.iloc[3] # Load Type/Wagons
         wagons, load_type = parse_col_d_wagon_type(col_d_val)
 
         start_dt = safe_parse_date(row.iloc[5])
@@ -336,6 +318,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         
         total_wagons_unloaded = 0
 
+        # Process Tipplers
         for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
             cell_val = row.iloc[idx]
             if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
@@ -423,8 +406,9 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                 if pd.notnull(safe_parse_date(row.iloc[7])): 
                     total_dur = safe_parse_date(row.iloc[7]) - arrival_dt
 
-        raw_dem_val = row.iloc[10]
-        dem_str = parse_demurrage_special(raw_dem_val)
+        # --- DEMURRAGE PARSING (Column K / Index 10) ---
+        raw_dem_val = row.iloc[10] 
+        dem_str = parse_demurrage_column_k(raw_dem_val) # Uses new numeric logic
 
         entry = {
             'Rake': rake_name,
@@ -660,7 +644,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                 'Total Duration': "",
                 'Demurrage': "00:00",
                 '_raw_wagon_counts': {},
-                '_remarks': ""
             }
             for t in ['T1', 'T2', 'T3', 'T4']:
                  row_data[f"{t} Start"] = ""; row_data[f"{t} End"] = ""; row_data[f"{t} Idle"] = ""
@@ -716,7 +699,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             'Total Duration': format_duration_hhmm(tot_dur_final),
             'Demurrage': dem_str,
             '_raw_wagon_counts': best_wag,
-            '_remarks': rake.get('_remarks', "")
         }
         for t in ['T1', 'T2', 'T3', 'T4']:
              row_data[f"{t} Start"] = format_dt(best_timings.get(f"{t}_Start", pd.NaT))
@@ -730,7 +712,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         today_date = datetime.now(IST).date()
         yesterday_date = today_date - timedelta(days=1)
         
-        # TAB 1 VISUAL FILTER: Only Yesterday+
+        # TAB 1 VISUAL FILTER
         def keep_row_live(r):
             ad = r['_Arrival_DT'].date()
             if ad >= yesterday_date: return True
@@ -740,11 +722,9 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers'] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']]
         
-        # Tab 1 Data (Filtered)
         actuals_clean_live = df_locked_live.drop(columns=[c for c in cols_to_drop if c in df_locked_live.columns], errors='ignore')
         final_df_display = pd.concat([actuals_clean_live, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean_live
         
-        # Tab 2 Data (Full History) - Keep objects for calculation
         final_df_all = pd.concat([df_locked, df_sim], ignore_index=True)
     else:
         final_df_display = df_sim
@@ -900,10 +880,9 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                 "Tippler Start Time": st.column_config.TextColumn("Start (dd-HH:MM)"),
                 "Finish Unload": st.column_config.TextColumn("Finish (dd-HH:MM)"),
                 "Extra Shunt (Mins)": st.column_config.NumberColumn("Ext. Shunt", step=5),
-                "_Arrival_DT": None, "_Shunt_Ready_DT": None, "_Form_Mins": None, "Date_Str": None, "_raw_wagon_counts": None, "_remarks": None
+                "_Arrival_DT": None, "_Shunt_Ready_DT": None, "_Form_Mins": None, "Date_Str": None, "_raw_wagon_counts": None, 
             }
 
-            # FILTER: ONLY SHOW YESTERDAY ONWARDS
             live_start_date = (datetime.now(IST) - timedelta(days=1)).date()
             unique_dates_live = [d for d in unique_dates if datetime.strptime(d, '%Y-%m-%d').date() >= live_start_date]
 
@@ -917,9 +896,8 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             st.markdown("### 📊 Daily Performance & Demurrage Forecast")
             st.dataframe(daily_stats_df, hide_index=True)
             
-            # Export Filtered Live Data
             df_export_live = df_final[df_final['Date_Str'].isin(unique_dates_live)]
-            st.download_button("📥 Download Final Report", df_export_live.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
+            st.download_button("📥 Download Final Report", df_export_live.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
 
         with tab_hist:
             st.subheader("🔍 Past Performance Analysis")
@@ -960,5 +938,5 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     
                     hist_raw = hist_raw[hist_raw['Demurrage'].apply(has_demurrage)]
                     
-                    hist_raw_clean = hist_raw.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']], errors='ignore')
+                    hist_raw_clean = hist_raw.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']], errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
