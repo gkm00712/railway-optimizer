@@ -196,7 +196,6 @@ def classify_reason(reason_text):
     if not reason_text: return "Misc"
     txt = reason_text.upper()
     
-    # DEPARTMENT KEYWORDS
     mm_keys = ['MM', 'MECH', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
     emd_keys = ['EMD', 'ELEC', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
     cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
@@ -205,7 +204,7 @@ def classify_reason(reason_text):
     chem_keys = ['CHEM', 'LAB', 'QUALITY', 'SAMPLE', 'ASH', 'MOISTURE']
     opr_keys = ['OPR', 'OPER', 'CREW', 'SHIFT', 'MANPOWER', 'BUNKER', 'FULL', 'WAIT']
     
-    # SPECIFIC COAL ISSUES
+    # EXPANDED CATEGORIES
     coal_keys = ['STICKY', 'WET', 'RAIN', 'STONE', 'BOULDER', 'SLATE', 'QUALITY', 'SIZING', 'JAM', 'LUMP']
     traffic_keys = ['TRAFFIC', 'LINE', 'PATH', 'SIGNAL', 'CROSSING']
 
@@ -218,7 +217,6 @@ def classify_reason(reason_text):
     if any(k in txt for k in opr_keys): return "OPR"
     if any(k in txt for k in coal_keys): return "Coal Quality"
     if any(k in txt for k in traffic_keys): return "Traffic"
-    
     return "Misc"
 
 def parse_demurrage_special(cell_val):
@@ -318,42 +316,54 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
     locked_actuals = []
     unplanned_actuals = [] 
     last_seq_tuple = (0, 0)
+    
+    # Track processed indices to handle duplicate/continuation grouping
+    processed_indices = set()
 
     for i in range(len(df_gs)):
+        if i in processed_indices: continue
+        
         row = df_gs.iloc[i]
-        
         val_b = str(row.iloc[1]).strip()
-        val_c = str(row.iloc[2]).strip()
-        if not val_b or val_b.lower() == 'nan': continue 
         
+        # If row has no rake name, it's likely a blank/continuation we missed, skip
+        if not val_b or val_b.lower() == 'nan': continue
+        
+        # Mark as processed
+        processed_indices.add(i)
+        
+        val_c = str(row.iloc[2]).strip()
         source_val = "Unknown" if (not val_c or val_c.lower() == 'nan') else val_c
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
         
-        # --- SMART REASON CAPTURE (UPDATED) ---
+        # --- SMART REASON CAPTURE (GROUPING) ---
         raw_rows_text = []
-        # Current Row
         val = str(row.iloc[11]).strip()
         if val and val.lower() not in ['nan', '', 'none']: raw_rows_text.append(val)
         
-        # Look ahead for continuation rows
         j = i + 1
         while j < len(df_gs):
              next_row = df_gs.iloc[j]
-             # Stop if we hit a new Rake Name in col B (Index 1)
              next_rake_name = str(next_row.iloc[1]).strip()
-             if next_rake_name and next_rake_name.lower() != 'nan': 
-                 break 
              
-             # Otherwise it's a continuation row
+             # LOGIC: Continue IF next row name is Empty OR Same as current
+             is_continuation = False
+             if not next_rake_name or next_rake_name.lower() == 'nan':
+                 is_continuation = True
+             elif next_rake_name == val_b:
+                 is_continuation = True
+             
+             if not is_continuation:
+                 break
+                 
+             # It is a continuation row, so consume it
+             processed_indices.add(j)
              val_sub = str(next_row.iloc[11]).strip()
-             if val_sub and val_sub.lower() not in ['nan', '', 'none']: 
-                 raw_rows_text.append(val_sub)
+             if val_sub and val_sub.lower() not in ['nan', '', 'none']: raw_rows_text.append(val_sub)
              j += 1
         
-        # Store as raw list joined by pipe for processing later
         if raw_rows_text:
-            # Deduplicate preserving order
             seen = set()
             unique_rows = [x for x in raw_rows_text if not (x in seen or seen.add(x))]
             full_remarks_blob = " | ".join(unique_rows)
