@@ -785,9 +785,11 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers'] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']]
         
+        # Tab 1 Data (Filtered)
         actuals_clean_live = df_locked_live.drop(columns=[c for c in cols_to_drop if c in df_locked_live.columns], errors='ignore')
         final_df_display = pd.concat([actuals_clean_live, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean_live
         
+        # Tab 2 Data (Full History) - Keep objects for calculation
         final_df_all = pd.concat([df_locked, df_sim], ignore_index=True)
     else:
         final_df_display = df_sim
@@ -907,7 +909,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
     output_rows = []
     for d, v in sorted(daily_stats.items()):
         reasons_set = v['All_Reasons']
-        # JOIN WITH DOUBLE NEWLINE
+        # JOIN WITH DOUBLE NEWLINE for spacing
         major_reasons_str = "\n\n".join(sorted(reasons_set)) if reasons_set else "-"
 
         row = {
