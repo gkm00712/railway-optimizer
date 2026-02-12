@@ -81,14 +81,27 @@ def format_dt(dt):
     if dt.tzinfo is None: dt = IST.localize(dt)
     return dt.strftime('%d-%H:%M')
 
-def parse_dt_from_str(dt_str, year_ref):
+def parse_dt_from_str_smart(dt_str, ref_dt_obj):
     try:
         if not dt_str: return pd.NaT
         parts = dt_str.split('-')
         day = int(parts[0])
         hm = parts[1].split(':')
         h, m = int(hm[0]), int(hm[1])
-        dt = datetime(year_ref, datetime.now().month, day, h, m)
+        
+        if pd.isnull(ref_dt_obj):
+            year_ref = datetime.now().year
+            month_ref = datetime.now().month
+        else:
+            year_ref = ref_dt_obj.year
+            month_ref = ref_dt_obj.month
+            
+        dt = datetime(year_ref, month_ref, day, h, m)
+        if pd.notnull(ref_dt_obj):
+             naive_ref = ref_dt_obj.replace(tzinfo=None)
+             if (dt - naive_ref).days < -20: 
+                 if month_ref == 12: dt = dt.replace(year=year_ref+1, month=1)
+                 else: dt = dt.replace(month=month_ref+1)
         return IST.localize(dt)
     except: return pd.NaT
 
@@ -163,8 +176,10 @@ def parse_tippler_cell(cell_value, ref_date):
             
             # FUTURE DATE FIX
             now_dt = datetime.now(IST)
-            if start_dt > now_dt + timedelta(days=90): start_dt = start_dt.replace(year=start_dt.year - 1)
-            if end_dt > now_dt + timedelta(days=90): end_dt = end_dt.replace(year=end_dt.year - 1)
+            if start_dt > now_dt + timedelta(days=90):
+                start_dt = start_dt.replace(year=start_dt.year - 1)
+            if end_dt > now_dt + timedelta(days=90):
+                end_dt = end_dt.replace(year=end_dt.year - 1)
             
             return start_dt, end_dt
         except: pass
@@ -195,6 +210,7 @@ def parse_col_d_wagon_type(cell_val):
 def classify_reason(reason_text):
     if not reason_text: return "Misc"
     txt = reason_text.upper()
+    
     mm_keys = ['MM', 'MECH', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
     emd_keys = ['EMD', 'ELEC', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
     cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
@@ -202,6 +218,10 @@ def classify_reason(reason_text):
     mgr_keys = ['MGR', 'TRACK', 'LOCO', 'DERAIL', 'SLEEPER']
     chem_keys = ['CHEM', 'LAB', 'QUALITY', 'SAMPLE', 'ASH', 'MOISTURE']
     opr_keys = ['OPR', 'OPER', 'CREW', 'SHIFT', 'MANPOWER', 'BUNKER', 'FULL', 'WAIT']
+    
+    # NEW CATEGORIES FOR BETTER MATCHING
+    coal_keys = ['STICKY', 'WET', 'RAIN', 'STONE', 'BOULDER', 'SLATE', 'QUALITY', 'SIZING', 'JAM']
+    traffic_keys = ['TRAFFIC', 'LINE', 'PATH', 'SIGNAL', 'CROSSING']
 
     if any(k in txt for k in mm_keys): return "MM"
     if any(k in txt for k in emd_keys): return "EMD"
@@ -210,6 +230,9 @@ def classify_reason(reason_text):
     if any(k in txt for k in mgr_keys): return "MGR"
     if any(k in txt for k in chem_keys): return "Chemistry"
     if any(k in txt for k in opr_keys): return "OPR"
+    if any(k in txt for k in coal_keys): return "Coal Quality"
+    if any(k in txt for k in traffic_keys): return "Traffic"
+    
     return "Misc"
 
 def parse_demurrage_special(cell_val):
@@ -322,7 +345,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         if pd.isnull(arrival_dt): continue
         
         # --- SMART REASON CAPTURE ---
-        # 1. Collect all rows for this rake
         rows_content = []
         val = str(row.iloc[11]).strip()
         if val and val.lower() not in ['nan', '', 'none']: rows_content.append(val)
@@ -335,32 +357,31 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
              if val_sub and val_sub.lower() not in ['nan', '', 'none']: rows_content.append(val_sub)
              j += 1
              
-        # 2. Smartly Determine Dept & Clean Text
-        # "Strict Filter": Don't include text if it is JUST a department code
         department_found = "Misc"
         clean_reasons = []
         
-        # List of codes to ignore in text body
-        codes_to_ignore = ['MM', 'MECH', 'EMD', 'ELEC', 'C&I', 'C&W', 'MGR', 'CHEM', 'OPR']
+        # Purely functional codes to hide from text description
+        codes_to_hide = ['MM', 'MECH', 'EMD', 'ELEC', 'C&I', 'C&W', 'MGR', 'CHEM', 'OPR']
         
         for text in rows_content:
-            # Check if this line is purely a code
-            is_code = False
-            clean_t = text.upper().replace(".","").strip()
-            if clean_t in codes_to_ignore:
-                is_code = True
+            is_pure_code = False
+            txt_upper = text.upper().replace(".","").strip()
             
-            # Detect dept from this line
+            # Check if this line is JUST a code
+            if txt_upper in codes_to_hide:
+                is_pure_code = True
+            
+            # Detect department from content
             cat = classify_reason(text)
             if cat != "Misc": department_found = cat
             
-            # If not just a code, keep as description
-            if not is_code:
+            # If it's valid text (not just a code), keep it
+            # Also allow short words if they carry meaning (Wet, Jam)
+            if not is_pure_code:
                 clean_reasons.append(text)
         
         if clean_reasons:
             joined_text = " + ".join(clean_reasons)
-            # Store as "Dept|ReasonText" for later formatting
             full_remarks_blob = f"{department_found}|{joined_text}"
         else:
             full_remarks_blob = ""
