@@ -81,27 +81,14 @@ def format_dt(dt):
     if dt.tzinfo is None: dt = IST.localize(dt)
     return dt.strftime('%d-%H:%M')
 
-def parse_dt_from_str_smart(dt_str, ref_dt_obj):
+def parse_dt_from_str(dt_str, year_ref):
     try:
         if not dt_str: return pd.NaT
         parts = dt_str.split('-')
         day = int(parts[0])
         hm = parts[1].split(':')
         h, m = int(hm[0]), int(hm[1])
-        
-        if pd.isnull(ref_dt_obj):
-            year_ref = datetime.now().year
-            month_ref = datetime.now().month
-        else:
-            year_ref = ref_dt_obj.year
-            month_ref = ref_dt_obj.month
-            
-        dt = datetime(year_ref, month_ref, day, h, m)
-        if pd.notnull(ref_dt_obj):
-             naive_ref = ref_dt_obj.replace(tzinfo=None)
-             if (dt - naive_ref).days < -20: 
-                 if month_ref == 12: dt = dt.replace(year=year_ref+1, month=1)
-                 else: dt = dt.replace(month=month_ref+1)
+        dt = datetime(year_ref, datetime.now().month, day, h, m)
         return IST.localize(dt)
     except: return pd.NaT
 
@@ -174,11 +161,10 @@ def parse_tippler_cell(cell_value, ref_date):
             end_dt = ref_date.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
             if end_dt < start_dt: end_dt += timedelta(days=1)
             
+            # FUTURE DATE FIX
             now_dt = datetime.now(IST)
-            if start_dt > now_dt + timedelta(days=90):
-                start_dt = start_dt.replace(year=start_dt.year - 1)
-            if end_dt > now_dt + timedelta(days=90):
-                end_dt = end_dt.replace(year=end_dt.year - 1)
+            if start_dt > now_dt + timedelta(days=90): start_dt = start_dt.replace(year=start_dt.year - 1)
+            if end_dt > now_dt + timedelta(days=90): end_dt = end_dt.replace(year=end_dt.year - 1)
             
             return start_dt, end_dt
         except: pass
@@ -242,6 +228,29 @@ def parse_demurrage_special(cell_val):
         except: pass
     return "00:00"
 
+def parse_dt_from_str_smart(dt_str, ref_dt_obj):
+    try:
+        if not dt_str: return pd.NaT
+        parts = dt_str.split('-')
+        day = int(parts[0])
+        hm = parts[1].split(':')
+        h, m = int(hm[0]), int(hm[1])
+        
+        if pd.isnull(ref_dt_obj):
+            year_ref = datetime.now().year
+            month_ref = datetime.now().month
+        else:
+            year_ref = ref_dt_obj.year
+            month_ref = ref_dt_obj.month
+            
+        dt = datetime(year_ref, month_ref, day, h, m)
+        if pd.notnull(ref_dt_obj):
+             naive_ref = ref_dt_obj.replace(tzinfo=None)
+             if (dt - naive_ref).days < -300: dt = dt.replace(year=year_ref+1)
+             elif (dt - naive_ref).days > 300: dt = dt.replace(year=year_ref-1)
+        return IST.localize(dt)
+    except: return pd.NaT
+
 # ==========================================
 # 3. GOOGLE SHEET PARSER (MULTI-TAB)
 # ==========================================
@@ -263,6 +272,9 @@ def safe_parse_date(val):
     if pd.isnull(val) or str(val).strip() == "" or str(val).strip().upper() == "U/P": return pd.NaT
     try:
         dt = pd.to_datetime(val, dayfirst=True, errors='coerce') 
+        if pd.notnull(dt):
+            now_dt = datetime.now()
+            if dt > now_dt + timedelta(days=90): dt = dt.replace(year=dt.year - 1)
         if pd.isnull(dt): return pd.NaT 
         return to_ist(dt)
     except: return pd.NaT
@@ -309,7 +321,8 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
         
-        # --- ROBUST REASON CAPTURE ---
+        # --- SMART REASON CAPTURE ---
+        # 1. Collect all rows for this rake
         rows_content = []
         val = str(row.iloc[11]).strip()
         if val and val.lower() not in ['nan', '', 'none']: rows_content.append(val)
@@ -317,36 +330,40 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         j = i + 1
         while j < len(df_gs):
              next_row = df_gs.iloc[j]
-             if pd.notnull(next_row.iloc[1]): break 
+             if pd.notnull(next_row.iloc[1]): break # Stop at next rake
              val_sub = str(next_row.iloc[11]).strip()
              if val_sub and val_sub.lower() not in ['nan', '', 'none']: rows_content.append(val_sub)
              j += 1
              
+        # 2. Smartly Determine Dept & Clean Text
+        # "Strict Filter": Don't include text if it is JUST a department code
         department_found = "Misc"
         clean_reasons = []
         
-        # Strict Ignore List for "Department Only" rows
-        dept_codes_strict = ['MM', 'EMD', 'C&I', 'C&W', 'MGR', 'CHEM', 'OPR', 'OPER', 'MECH', 'ELEC']
+        # List of codes to ignore in text body
+        codes_to_ignore = ['MM', 'MECH', 'EMD', 'ELEC', 'C&I', 'C&W', 'MGR', 'CHEM', 'OPR']
         
         for text in rows_content:
-            is_dept_code = False
-            txt_upper = text.upper().replace(".","").replace(" ","")
-            if txt_upper in dept_codes_strict or len(text) < 4:
-                is_dept_code = True
-                cat = classify_reason(text)
-                if cat != "Misc": department_found = cat
+            # Check if this line is purely a code
+            is_code = False
+            clean_t = text.upper().replace(".","").strip()
+            if clean_t in codes_to_ignore:
+                is_code = True
             
-            if not is_dept_code:
+            # Detect dept from this line
+            cat = classify_reason(text)
+            if cat != "Misc": department_found = cat
+            
+            # If not just a code, keep as description
+            if not is_code:
                 clean_reasons.append(text)
-                # Infer department from the reason text itself
-                cat_reason = classify_reason(text)
-                if cat_reason != "Misc": department_found = cat_reason
         
         if clean_reasons:
-            full_reason_text = " | ".join(clean_reasons)
-            full_remarks_blob = f"{department_found}|{full_reason_text}"
+            joined_text = " + ".join(clean_reasons)
+            # Store as "Dept|ReasonText" for later formatting
+            full_remarks_blob = f"{department_found}|{joined_text}"
         else:
-            full_remarks_blob = "" 
+            full_remarks_blob = ""
         # -----------------------------
 
         rake_name = val_b
