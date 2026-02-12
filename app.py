@@ -217,6 +217,7 @@ def classify_reason(reason_text):
     if any(k in txt for k in opr_keys): return "OPR"
     if any(k in txt for k in coal_keys): return "Coal Quality"
     if any(k in txt for k in traffic_keys): return "Traffic"
+    
     return "Misc"
 
 def parse_demurrage_special(cell_val):
@@ -317,7 +318,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
     unplanned_actuals = [] 
     last_seq_tuple = (0, 0)
     
-    # Track processed indices to handle duplicate/continuation grouping
+    # Track processed indices to avoid duplicates
     processed_indices = set()
 
     for i in range(len(df_gs)):
@@ -326,10 +327,9 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         row = df_gs.iloc[i]
         val_b = str(row.iloc[1]).strip()
         
-        # If row has no rake name, it's likely a blank/continuation we missed, skip
+        # Skip empty rake names
         if not val_b or val_b.lower() == 'nan': continue
         
-        # Mark as processed
         processed_indices.add(i)
         
         val_c = str(row.iloc[2]).strip()
@@ -347,7 +347,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
              next_row = df_gs.iloc[j]
              next_rake_name = str(next_row.iloc[1]).strip()
              
-             # LOGIC: Continue IF next row name is Empty OR Same as current
+             # Group if next rake name is empty or same
              is_continuation = False
              if not next_rake_name or next_rake_name.lower() == 'nan':
                  is_continuation = True
@@ -356,17 +356,16 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
              
              if not is_continuation:
                  break
-                 
-             # It is a continuation row, so consume it
+             
+             # Consume row
              processed_indices.add(j)
              val_sub = str(next_row.iloc[11]).strip()
              if val_sub and val_sub.lower() not in ['nan', '', 'none']: raw_rows_text.append(val_sub)
              j += 1
         
         if raw_rows_text:
-            seen = set()
-            unique_rows = [x for x in raw_rows_text if not (x in seen or seen.add(x))]
-            full_remarks_blob = " | ".join(unique_rows)
+            # Join with distinct separator for tokenizer
+            full_remarks_blob = " | ".join(raw_rows_text)
         else:
             full_remarks_blob = ""
         # -----------------------------
@@ -832,36 +831,36 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             rem = str(row.get('_remarks', '')).strip()
             rake_name = str(row.get('Rake', 'Unknown'))
             
-            # --- SMART DISPLAY LOGIC ---
-            parts = rem.split('|')
-            dept_found = "Misc"
-            clean_reasons = []
+            # --- TOKENIZER LOGIC ---
+            # 1. Split raw blob by pipe
+            raw_parts = [x.strip() for x in rem.split('|') if x.strip()]
             
-            # STRICT CODES (Hidden from text)
-            codes_to_hide = ['MM', 'MECH', 'EMD', 'ELEC', 'C&I', 'C&W', 'MGR', 'CHEM', 'OPR', 'OPER', 'TRAFFIC', 'COMML', 'OTHER']
+            # 2. Identification
+            dept = "Misc"
+            clean_parts = []
             
-            for p in parts:
-                clean_p = p.strip()
-                if not clean_p: continue
+            # Codes that signify Department but should NOT be in the Description
+            dept_codes = ['MM', 'MECH', 'EMD', 'ELEC', 'C&I', 'C&W', 'MGR', 'CHEM', 'OPR', 'OPER', 'TRAFFIC', 'COMML', 'OTHER']
+            
+            for part in raw_parts:
+                # Is it purely a code?
+                is_code = part.upper().replace('.','').replace('/','').strip() in dept_codes
                 
-                # Check if it's a known code
-                is_code = clean_p.upper().replace('.','').replace('/','') in codes_to_hide
+                # Detect Dept (from code OR from text content)
+                cat = classify_reason(part)
+                if cat != "Misc": dept = cat
                 
-                # Detect dept from content (even if it's not a code)
-                cat = classify_reason(clean_p)
-                if cat != "Misc": dept_found = cat
-                
-                # Only keep text if it is NOT just a code
+                # If it's NOT just a code, keep it as description
                 if not is_code:
-                    clean_reasons.append(clean_p)
+                    clean_parts.append(part)
             
-            # Reconstruct
-            # If we filtered everything (e.g. only "MM" was there), use the raw parts as fallback
-            if not clean_reasons and parts:
-                clean_reasons = [p.strip() for p in parts if p.strip()]
+            # 3. Reconstruct
+            # If everything was filtered out (e.g. only "MM" existed), fallback to raw
+            if not clean_parts and raw_parts:
+                clean_parts = raw_parts
             
-            reason_text = " + ".join(clean_reasons)
-            formatted_reason = f"[{rake_name}] - {reason_text} ({dept_found})"
+            reason_text = " + ".join(clean_parts)
+            formatted_reason = f"[{rake_name}] - {reason_text} ({dept})"
             daily_stats[d_str]['All_Reasons'].add(formatted_reason)
             # ---------------------------
         
