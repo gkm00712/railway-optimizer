@@ -19,8 +19,6 @@ st.sidebar.header("⚙️ Settings")
 st.sidebar.info("ℹ️ Multi-Tab Mode active. Fetching data from sheets like 'Dec-25', 'Jan-26'...")
 gs_url = st.sidebar.text_input("Google Sheet URL", value="https://docs.google.com/spreadsheets/d/1NgeRXtNez1Ifs7UtQVa_dOgmEP_pj4TI/edit?pli=1&gid=1051078038#gid=1051078038")
 
-# Removed "Show History" checkbox (System now auto-loads history for the History Tab)
-
 st.sidebar.markdown("---")
 sim_params = {}
 sim_params['rt1'] = st.sidebar.number_input("Tippler 1 Rate", value=6.0, step=0.5)
@@ -194,33 +192,6 @@ def parse_col_d_wagon_type(cell_val):
     elif 'N' in s: load_type = 'BOXN'
     return wagons, load_type
 
-def classify_reason(reason_text):
-    if not reason_text: return "Misc"
-    txt = reason_text.upper()
-    
-    mm_keys = ['MM', 'MECH', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
-    emd_keys = ['EMD', 'ELEC', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
-    cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
-    rs_keys = ['C&W', 'WAGON', 'DOOR', 'COUPL', 'RAKE']
-    mgr_keys = ['MGR', 'TRACK', 'LOCO', 'DERAIL', 'SLEEPER']
-    chem_keys = ['CHEM', 'LAB', 'QUALITY', 'SAMPLE', 'ASH', 'MOISTURE']
-    opr_keys = ['OPR', 'OPER', 'CREW', 'SHIFT', 'MANPOWER', 'BUNKER', 'FULL', 'WAIT']
-    
-    # EXPANDED CATEGORIES
-    coal_keys = ['STICKY', 'WET', 'RAIN', 'STONE', 'BOULDER', 'SLATE', 'QUALITY', 'SIZING', 'JAM', 'LUMP']
-    traffic_keys = ['TRAFFIC', 'LINE', 'PATH', 'SIGNAL', 'CROSSING', 'BUNCHING', 'CONGESTION', 'LATE']
-
-    if any(k in txt for k in mm_keys): return "MM"
-    if any(k in txt for k in emd_keys): return "EMD"
-    if any(k in txt for k in cni_keys): return "C&I"
-    if any(k in txt for k in rs_keys): return "Rolling Stock"
-    if any(k in txt for k in mgr_keys): return "MGR"
-    if any(k in txt for k in chem_keys): return "Chemistry"
-    if any(k in txt for k in opr_keys): return "OPR"
-    if any(k in txt for k in coal_keys): return "Coal Quality"
-    if any(k in txt for k in traffic_keys): return "Traffic"
-    return "Misc"
-
 def parse_demurrage_special(cell_val):
     s = str(cell_val).strip().upper()
     if s in ["", "NAN", "NIL", "-", "NONE"]: return "00:00"
@@ -326,8 +297,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         
         row = df_gs.iloc[i]
         val_b = str(row.iloc[1]).strip()
-        
-        # Skip empty rake names
         if not val_b or val_b.lower() == 'nan': continue
         
         processed_indices.add(i)
@@ -337,32 +306,20 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
         
-        # --- SMART TOKENIZER REASON CAPTURE (UPDATED) ---
-        raw_rows_text = []
-        val = str(row.iloc[11]).strip()
-        if val and val.lower() not in ['nan', '', 'none']: raw_rows_text.append(val)
-        
+        # Look ahead for grouping (to consume continuation rows if any)
         j = i + 1
         while j < len(df_gs):
              next_row = df_gs.iloc[j]
              next_rake_name = str(next_row.iloc[1]).strip()
-             
              is_continuation = False
              if not next_rake_name or next_rake_name.lower() == 'nan':
                  is_continuation = True
              elif next_rake_name == val_b:
                  is_continuation = True
-             
              if not is_continuation:
                  break
-             
              processed_indices.add(j)
-             val_sub = str(next_row.iloc[11]).strip()
-             if val_sub and val_sub.lower() not in ['nan', '', 'none']: raw_rows_text.append(val_sub)
              j += 1
-        
-        full_raw_text = " | ".join(raw_rows_text)
-        # -----------------------------
 
         rake_name = val_b
         col_d_val = row.iloc[3]
@@ -433,8 +390,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                 '_Form_Mins': 0,
                 'Optimization Type': 'Auto-Planned (G-Sheet)',
                 'Extra Shunt (Mins)': 0,
-                'is_gs_unplanned': True,
-                '_remarks': full_raw_text
+                'is_gs_unplanned': True
             })
             continue 
 
@@ -493,8 +449,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
             '_raw_end_dt': end_dt,
             '_raw_tipplers_data': tippler_timings,
             '_raw_wagon_counts': wagon_counts_map,
-            '_raw_tipplers': active_tipplers_row,
-            '_remarks': full_raw_text
+            '_raw_tipplers': active_tipplers_row
         }
         for t, obj in tippler_objs.items():
             entry[t] = obj
@@ -814,50 +769,12 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         if end_filter_dt and arr_dt.date() > end_filter_dt: continue
 
         if d_str not in daily_stats: 
-            daily_stats[d_str] = {'Demurrage': 0, 'All_Reasons': set()}
+            daily_stats[d_str] = {'Demurrage': 0}
             for t in ['T1', 'T2', 'T3', 'T4']: 
                 daily_stats[d_str][f'{t}_hrs'] = 0.0
                 daily_stats[d_str][f'{t}_wag'] = 0.0
         
         daily_stats[d_str]['Demurrage'] += dem_hrs
-        
-        if dem_hrs > 0:
-            rem = str(row.get('_remarks', '')).strip()
-            rake_name = str(row.get('Rake', 'Unknown'))
-            
-            # --- TOKENIZER LOGIC ---
-            # 1. Split raw blob by logical delimiters (pipe, slash, newline)
-            raw_parts = re.split(r'[|\n/]+', rem)
-            raw_parts = [x.strip() for x in raw_parts if x.strip()]
-            
-            # 2. Identification
-            dept = "Misc"
-            clean_parts = []
-            
-            # Codes that signify Department but should NOT be in the Description
-            dept_codes = ['MM', 'MECH', 'EMD', 'ELEC', 'C&I', 'C&W', 'MGR', 'CHEM', 'OPR', 'OPER', 'TRAFFIC', 'COMML', 'OTHER']
-            
-            for part in raw_parts:
-                # Is it purely a code?
-                is_code = part.upper().replace('.','').replace('/','').strip() in dept_codes
-                
-                # Detect Dept (from code OR from text content)
-                cat = classify_reason(part)
-                if cat != "Misc": dept = cat
-                
-                # If it's NOT just a code, keep it as description
-                if not is_code:
-                    clean_parts.append(part)
-            
-            # 3. Reconstruct
-            # If everything was filtered out (e.g. only "MM" existed), fallback to raw
-            if not clean_parts and raw_parts:
-                clean_parts = raw_parts
-            
-            reason_text = " + ".join(clean_parts)
-            formatted_reason = f"[{rake_name}] - {reason_text} ({dept})"
-            daily_stats[d_str]['All_Reasons'].add(formatted_reason)
-            # ---------------------------
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
@@ -894,7 +811,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                     
                     if in_range:
                         if curr_day_str not in daily_stats: 
-                            daily_stats[curr_day_str] = {'Demurrage': 0, 'All_Reasons': set()}
+                            daily_stats[curr_day_str] = {'Demurrage': 0}
                             for tx in ['T1', 'T2', 'T3', 'T4']: 
                                 daily_stats[curr_day_str][f'{tx}_hrs'] = 0.0
                                 daily_stats[curr_day_str][f'{tx}_wag'] = 0.0
@@ -908,14 +825,9 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
 
     output_rows = []
     for d, v in sorted(daily_stats.items()):
-        reasons_set = v['All_Reasons']
-        # JOIN WITH DOUBLE NEWLINE for spacing
-        major_reasons_str = "\n\n".join(sorted(reasons_set)) if reasons_set else "-"
-
         row = {
             'Date': d, 
             'Demurrage': f"{int(v['Demurrage'])} Hours",
-            'Major Reasons': major_reasons_str
         }
         for t in ['T1', 'T2', 'T3', 'T4']:
             rate = 0.0
