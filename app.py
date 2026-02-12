@@ -196,6 +196,7 @@ def classify_reason(reason_text):
     if not reason_text: return "Misc"
     txt = reason_text.upper()
     
+    # DEPARTMENT KEYWORDS
     mm_keys = ['MM', 'MECH', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
     emd_keys = ['EMD', 'ELEC', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
     cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
@@ -204,7 +205,7 @@ def classify_reason(reason_text):
     chem_keys = ['CHEM', 'LAB', 'QUALITY', 'SAMPLE', 'ASH', 'MOISTURE']
     opr_keys = ['OPR', 'OPER', 'CREW', 'SHIFT', 'MANPOWER', 'BUNKER', 'FULL', 'WAIT']
     
-    # EXPANDED CATEGORIES
+    # SPECIFIC COAL ISSUES
     coal_keys = ['STICKY', 'WET', 'RAIN', 'STONE', 'BOULDER', 'SLATE', 'QUALITY', 'SIZING', 'JAM', 'LUMP']
     traffic_keys = ['TRAFFIC', 'LINE', 'PATH', 'SIGNAL', 'CROSSING']
 
@@ -329,21 +330,30 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
         
-        # --- SMART REASON CAPTURE (Capture all rows first) ---
+        # --- SMART REASON CAPTURE (UPDATED) ---
         raw_rows_text = []
+        # Current Row
         val = str(row.iloc[11]).strip()
         if val and val.lower() not in ['nan', '', 'none']: raw_rows_text.append(val)
         
+        # Look ahead for continuation rows
         j = i + 1
         while j < len(df_gs):
              next_row = df_gs.iloc[j]
-             if pd.notnull(next_row.iloc[1]): break 
+             # Stop if we hit a new Rake Name in col B (Index 1)
+             next_rake_name = str(next_row.iloc[1]).strip()
+             if next_rake_name and next_rake_name.lower() != 'nan': 
+                 break 
+             
+             # Otherwise it's a continuation row
              val_sub = str(next_row.iloc[11]).strip()
-             if val_sub and val_sub.lower() not in ['nan', '', 'none']: raw_rows_text.append(val_sub)
+             if val_sub and val_sub.lower() not in ['nan', '', 'none']: 
+                 raw_rows_text.append(val_sub)
              j += 1
         
-        # Store distinct text parts separated by |
+        # Store as raw list joined by pipe for processing later
         if raw_rows_text:
+            # Deduplicate preserving order
             seen = set()
             unique_rows = [x for x in raw_rows_text if not (x in seen or seen.add(x))]
             full_remarks_blob = " | ".join(unique_rows)
@@ -772,9 +782,11 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         
         cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers'] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']]
         
+        # Tab 1 Data (Filtered)
         actuals_clean_live = df_locked_live.drop(columns=[c for c in cols_to_drop if c in df_locked_live.columns], errors='ignore')
         final_df_display = pd.concat([actuals_clean_live, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean_live
         
+        # Tab 2 Data (Full History) - Keep objects for calculation
         final_df_all = pd.concat([df_locked, df_sim], ignore_index=True)
     else:
         final_df_display = df_sim
@@ -816,7 +828,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             clean_reasons = []
             
             # STRICT CODES (Hidden from text)
-            codes_to_hide = ['MM', 'MECH', 'EMD', 'ELEC', 'C&I', 'C&W', 'MGR', 'CHEM', 'OPR', 'OPER', 'TRAFFIC', 'COMML']
+            codes_to_hide = ['MM', 'MECH', 'EMD', 'ELEC', 'C&I', 'C&W', 'MGR', 'CHEM', 'OPR', 'OPER', 'TRAFFIC', 'COMML', 'OTHER']
             
             for p in parts:
                 clean_p = p.strip()
@@ -975,7 +987,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                 "_Arrival_DT": None, "_Shunt_Ready_DT": None, "_Form_Mins": None, "Date_Str": None, "_raw_wagon_counts": None, "_remarks": None
             }
 
-            # FILTER: ONLY SHOW YESTERDAY ONWARDS
             live_start_date = (datetime.now(IST) - timedelta(days=1)).date()
             unique_dates_live = [d for d in unique_dates if datetime.strptime(d, '%Y-%m-%d').date() >= live_start_date]
 
@@ -989,7 +1000,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             st.markdown("### 📊 Daily Performance & Demurrage Forecast")
             st.dataframe(daily_stats_df, hide_index=True)
             
-            # Export Filtered Live Data
             df_export_live = df_final[df_final['Date_Str'].isin(unique_dates_live)]
             st.download_button("📥 Download Final Report", df_export_live.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
 
