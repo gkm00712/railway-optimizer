@@ -206,7 +206,7 @@ def classify_reason(reason_text):
     
     # EXPANDED CATEGORIES
     coal_keys = ['STICKY', 'WET', 'RAIN', 'STONE', 'BOULDER', 'SLATE', 'QUALITY', 'SIZING', 'JAM', 'LUMP']
-    traffic_keys = ['TRAFFIC', 'LINE', 'PATH', 'SIGNAL', 'CROSSING']
+    traffic_keys = ['TRAFFIC', 'LINE', 'PATH', 'SIGNAL', 'CROSSING', 'BUNCHING', 'CONGESTION', 'LATE']
 
     if any(k in txt for k in mm_keys): return "MM"
     if any(k in txt for k in emd_keys): return "EMD"
@@ -217,7 +217,6 @@ def classify_reason(reason_text):
     if any(k in txt for k in opr_keys): return "OPR"
     if any(k in txt for k in coal_keys): return "Coal Quality"
     if any(k in txt for k in traffic_keys): return "Traffic"
-    
     return "Misc"
 
 def parse_demurrage_special(cell_val):
@@ -318,7 +317,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
     unplanned_actuals = [] 
     last_seq_tuple = (0, 0)
     
-    # Track processed indices to avoid duplicates
     processed_indices = set()
 
     for i in range(len(df_gs)):
@@ -326,8 +324,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         
         row = df_gs.iloc[i]
         val_b = str(row.iloc[1]).strip()
-        
-        # Skip empty rake names
         if not val_b or val_b.lower() == 'nan': continue
         
         processed_indices.add(i)
@@ -337,7 +333,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
         
-        # --- SMART REASON CAPTURE (GROUPING) ---
+        # --- SMART TOKENIZER REASON CAPTURE ---
         raw_rows_text = []
         val = str(row.iloc[11]).strip()
         if val and val.lower() not in ['nan', '', 'none']: raw_rows_text.append(val)
@@ -347,7 +343,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
              next_row = df_gs.iloc[j]
              next_rake_name = str(next_row.iloc[1]).strip()
              
-             # Group if next rake name is empty or same
              is_continuation = False
              if not next_rake_name or next_rake_name.lower() == 'nan':
                  is_continuation = True
@@ -357,17 +352,13 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
              if not is_continuation:
                  break
              
-             # Consume row
              processed_indices.add(j)
              val_sub = str(next_row.iloc[11]).strip()
              if val_sub and val_sub.lower() not in ['nan', '', 'none']: raw_rows_text.append(val_sub)
              j += 1
         
-        if raw_rows_text:
-            # Join with distinct separator for tokenizer
-            full_remarks_blob = " | ".join(raw_rows_text)
-        else:
-            full_remarks_blob = ""
+        # JOIN ALL TEXT WITH A SAFE DELIMITER
+        full_raw_text = " | ".join(raw_rows_text)
         # -----------------------------
 
         rake_name = val_b
@@ -440,7 +431,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                 'Optimization Type': 'Auto-Planned (G-Sheet)',
                 'Extra Shunt (Mins)': 0,
                 'is_gs_unplanned': True,
-                '_remarks': full_remarks_blob
+                '_remarks': full_raw_text # Keep raw text
             })
             continue 
 
@@ -500,7 +491,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
             '_raw_tipplers_data': tippler_timings,
             '_raw_wagon_counts': wagon_counts_map,
             '_raw_tipplers': active_tipplers_row,
-            '_remarks': full_remarks_blob
+            '_remarks': full_raw_text
         }
         for t, obj in tippler_objs.items():
             entry[t] = obj
@@ -832,8 +823,9 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             rake_name = str(row.get('Rake', 'Unknown'))
             
             # --- TOKENIZER LOGIC ---
-            # 1. Split raw blob by pipe
-            raw_parts = [x.strip() for x in rem.split('|') if x.strip()]
+            # 1. Split raw blob by logical delimiters (pipe, slash, newline)
+            raw_parts = re.split(r'[|\n/]+', rem)
+            raw_parts = [x.strip() for x in raw_parts if x.strip()]
             
             # 2. Identification
             dept = "Misc"
