@@ -81,27 +81,14 @@ def format_dt(dt):
     if dt.tzinfo is None: dt = IST.localize(dt)
     return dt.strftime('%d-%H:%M')
 
-def parse_dt_from_str_smart(dt_str, ref_dt_obj):
+def parse_dt_from_str(dt_str, year_ref):
     try:
         if not dt_str: return pd.NaT
         parts = dt_str.split('-')
         day = int(parts[0])
         hm = parts[1].split(':')
         h, m = int(hm[0]), int(hm[1])
-        
-        if pd.isnull(ref_dt_obj):
-            year_ref = datetime.now().year
-            month_ref = datetime.now().month
-        else:
-            year_ref = ref_dt_obj.year
-            month_ref = ref_dt_obj.month
-            
-        dt = datetime(year_ref, month_ref, day, h, m)
-        if pd.notnull(ref_dt_obj):
-             naive_ref = ref_dt_obj.replace(tzinfo=None)
-             if (dt - naive_ref).days < -20: 
-                 if month_ref == 12: dt = dt.replace(year=year_ref+1, month=1)
-                 else: dt = dt.replace(month=month_ref+1)
+        dt = datetime(year_ref, datetime.now().month, day, h, m)
         return IST.localize(dt)
     except: return pd.NaT
 
@@ -176,10 +163,8 @@ def parse_tippler_cell(cell_value, ref_date):
             
             # FUTURE DATE FIX
             now_dt = datetime.now(IST)
-            if start_dt > now_dt + timedelta(days=90):
-                start_dt = start_dt.replace(year=start_dt.year - 1)
-            if end_dt > now_dt + timedelta(days=90):
-                end_dt = end_dt.replace(year=end_dt.year - 1)
+            if start_dt > now_dt + timedelta(days=90): start_dt = start_dt.replace(year=start_dt.year - 1)
+            if end_dt > now_dt + timedelta(days=90): end_dt = end_dt.replace(year=end_dt.year - 1)
             
             return start_dt, end_dt
         except: pass
@@ -210,6 +195,7 @@ def parse_col_d_wagon_type(cell_val):
 def classify_reason(reason_text):
     if not reason_text: return "Misc"
     txt = reason_text.upper()
+    
     mm_keys = ['MM', 'MECH', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
     emd_keys = ['EMD', 'ELEC', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
     cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
@@ -231,6 +217,7 @@ def classify_reason(reason_text):
     if any(k in txt for k in opr_keys): return "OPR"
     if any(k in txt for k in coal_keys): return "Coal Quality"
     if any(k in txt for k in traffic_keys): return "Traffic"
+    
     return "Misc"
 
 def parse_demurrage_special(cell_val):
@@ -248,6 +235,29 @@ def parse_demurrage_special(cell_val):
             return f"{hours:02d}:{minutes:02d}"
         except: pass
     return "00:00"
+
+def parse_dt_from_str_smart(dt_str, ref_dt_obj):
+    try:
+        if not dt_str: return pd.NaT
+        parts = dt_str.split('-')
+        day = int(parts[0])
+        hm = parts[1].split(':')
+        h, m = int(hm[0]), int(hm[1])
+        
+        if pd.isnull(ref_dt_obj):
+            year_ref = datetime.now().year
+            month_ref = datetime.now().month
+        else:
+            year_ref = ref_dt_obj.year
+            month_ref = ref_dt_obj.month
+            
+        dt = datetime(year_ref, month_ref, day, h, m)
+        if pd.notnull(ref_dt_obj):
+             naive_ref = ref_dt_obj.replace(tzinfo=None)
+             if (dt - naive_ref).days < -300: dt = dt.replace(year=year_ref+1)
+             elif (dt - naive_ref).days > 300: dt = dt.replace(year=year_ref-1)
+        return IST.localize(dt)
+    except: return pd.NaT
 
 # ==========================================
 # 3. GOOGLE SHEET PARSER (MULTI-TAB)
@@ -319,7 +329,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
         
-        # --- SMART REASON CAPTURE (UPDATED) ---
+        # --- SMART REASON CAPTURE (Capture all rows first) ---
         raw_rows_text = []
         val = str(row.iloc[11]).strip()
         if val and val.lower() not in ['nan', '', 'none']: raw_rows_text.append(val)
@@ -332,9 +342,8 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
              if val_sub and val_sub.lower() not in ['nan', '', 'none']: raw_rows_text.append(val_sub)
              j += 1
         
-        # Join all text simply with pipes for now. Logic moved to display.
+        # Store distinct text parts separated by |
         if raw_rows_text:
-            # Filter duplicates while preserving order
             seen = set()
             unique_rows = [x for x in raw_rows_text if not (x in seen or seen.add(x))]
             full_remarks_blob = " | ".join(unique_rows)
@@ -753,7 +762,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         today_date = datetime.now(IST).date()
         yesterday_date = today_date - timedelta(days=1)
         
-        # TAB 1 VISUAL FILTER
+        # TAB 1 VISUAL FILTER: Only Yesterday+
         def keep_row_live(r):
             ad = r['_Arrival_DT'].date()
             if ad >= yesterday_date: return True
@@ -801,39 +810,38 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             rem = str(row.get('_remarks', '')).strip()
             rake_name = str(row.get('Rake', 'Unknown'))
             
-            # --- DISPLAY REASON LOGIC ---
-            # 1. Parse Blob "Dept|Text"
+            # --- SMART DISPLAY LOGIC ---
             parts = rem.split('|')
-            # 2. Extract Dept from start
-            dept = "Misc"
+            dept_found = "Misc"
             clean_reasons = []
             
-            # Define exact codes to remove from "Reason Text"
-            strict_codes = ['MM', 'C&W', 'EMD', 'OPR', 'OPER', 'MECH', 'ELEC', 'C&I', 'CHEM', 'MGR']
+            # STRICT CODES (Hidden from text)
+            codes_to_hide = ['MM', 'MECH', 'EMD', 'ELEC', 'C&I', 'C&W', 'MGR', 'CHEM', 'OPR', 'OPER', 'TRAFFIC', 'COMML']
             
             for p in parts:
                 clean_p = p.strip()
                 if not clean_p: continue
                 
-                # Check Dept
+                # Check if it's a known code
+                is_code = clean_p.upper().replace('.','').replace('/','') in codes_to_hide
+                
+                # Detect dept from content (even if it's not a code)
                 cat = classify_reason(clean_p)
-                if cat != "Misc": dept = cat
+                if cat != "Misc": dept_found = cat
                 
-                # Check if it's strictly a code
-                is_strict_code = clean_p.upper().replace('.', '') in strict_codes
-                
-                # Keep text only if it's NOT just a code
-                if not is_strict_code:
+                # Only keep text if it is NOT just a code
+                if not is_code:
                     clean_reasons.append(clean_p)
             
-            # If everything was filtered out, revert to raw text
+            # Reconstruct
+            # If we filtered everything (e.g. only "MM" was there), use the raw parts as fallback
             if not clean_reasons and parts:
-                clean_reasons = [p for p in parts if p.strip()]
+                clean_reasons = [p.strip() for p in parts if p.strip()]
             
             reason_text = " + ".join(clean_reasons)
-            formatted_reason = f"[{rake_name}] - {reason_text} ({dept})"
+            formatted_reason = f"[{rake_name}] - {reason_text} ({dept_found})"
             daily_stats[d_str]['All_Reasons'].add(formatted_reason)
-            # -----------------------------
+            # ---------------------------
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
@@ -885,7 +893,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
     output_rows = []
     for d, v in sorted(daily_stats.items()):
         reasons_set = v['All_Reasons']
-        # JOIN WITH DOUBLE NEWLINE for spacing
+        # JOIN WITH DOUBLE NEWLINE
         major_reasons_str = "\n\n".join(sorted(reasons_set)) if reasons_set else "-"
 
         row = {
@@ -967,6 +975,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                 "_Arrival_DT": None, "_Shunt_Ready_DT": None, "_Form_Mins": None, "Date_Str": None, "_raw_wagon_counts": None, "_remarks": None
             }
 
+            # FILTER: ONLY SHOW YESTERDAY ONWARDS
             live_start_date = (datetime.now(IST) - timedelta(days=1)).date()
             unique_dates_live = [d for d in unique_dates if datetime.strptime(d, '%Y-%m-%d').date() >= live_start_date]
 
@@ -980,6 +989,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             st.markdown("### 📊 Daily Performance & Demurrage Forecast")
             st.dataframe(daily_stats_df, hide_index=True)
             
+            # Export Filtered Live Data
             df_export_live = df_final[df_final['Date_Str'].isin(unique_dates_live)]
             st.download_button("📥 Download Final Report", df_export_live.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
 
