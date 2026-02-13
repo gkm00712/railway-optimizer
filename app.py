@@ -86,6 +86,29 @@ def format_dt(dt):
     if dt.tzinfo is None: dt = IST.localize(dt)
     return dt.strftime('%d-%H:%M')
 
+def parse_dt_from_str_smart(dt_str, ref_dt_obj):
+    try:
+        if not dt_str: return pd.NaT
+        parts = dt_str.split('-')
+        day = int(parts[0])
+        hm = parts[1].split(':')
+        h, m = int(hm[0]), int(hm[1])
+        
+        if pd.isnull(ref_dt_obj):
+            year_ref = datetime.now().year
+            month_ref = datetime.now().month
+        else:
+            year_ref = ref_dt_obj.year
+            month_ref = ref_dt_obj.month
+            
+        dt = datetime(year_ref, month_ref, day, h, m)
+        if pd.notnull(ref_dt_obj):
+             naive_ref = ref_dt_obj.replace(tzinfo=None)
+             if (dt - naive_ref).days < -300: dt = dt.replace(year=year_ref+1)
+             elif (dt - naive_ref).days > 300: dt = dt.replace(year=year_ref-1)
+        return IST.localize(dt)
+    except: return pd.NaT
+
 def format_duration_hhmm(delta):
     if pd.isnull(delta): return ""
     total_seconds = int(delta.total_seconds())
@@ -264,11 +287,11 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         
         row = df_gs.iloc[i]
         val_b = str(row.iloc[1]).strip()
+        val_c = str(row.iloc[2]).strip()
         if not val_b or val_b.lower() == 'nan': continue 
         
         processed_indices.add(i)
         
-        val_c = str(row.iloc[2]).strip()
         source_val = "Unknown" if (not val_c or val_c.lower() == 'nan') else val_c
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
@@ -300,6 +323,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         active_tipplers_row = []
         explicit_wagon_counts = {}
         tippler_objs = {}
+        
         total_wagons_unloaded = 0
 
         for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
@@ -345,13 +369,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
             last_seq_tuple = (seq, rid)
 
         if is_pending:
-            # GHOST RAKE FILTER: Ignore incomplete rakes older than 5 days
-            now_dt = datetime.now(IST)
-            if pd.notnull(arrival_dt):
-                days_old = (now_dt - arrival_dt).days
-                if days_old > 5:
-                    continue # Safely skip this old broken data
-
             rem_wagons = wagons - total_wagons_unloaded
             unplanned_actuals.append({
                 'Rake': rake_name,  
@@ -536,7 +553,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         if wagon_col: df['wagon_count'] = df[wagon_col].apply(parse_wagons)
         else: df['wagon_count'] = 58 
         
-        # EXTRACT RAKE NAME FROM CSV IF AVAILABLE
         rake_col = find_column(df, ['RAKE', 'RAKE NAME', 'RAKE NO', 'TRAIN'])
         src_col = find_column(df, ['STTS FROM', 'STTN FROM', 'FROM_STN', 'SRC', 'SOURCE', 'FROM'])
         arvl_col = find_column(df, ['EXPD ARVLTIME', 'ARRIVAL TIME', 'EXPECTED ARRIVAL'])
@@ -621,7 +637,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         is_gs = rake.get('is_gs_unplanned', False)
         is_pending_actual = rake.get('is_pending_actual', False)
         
-        # PREVENT RENAMING G-SHEET RAKES
         if is_gs:
             display_name = orig_name if orig_name else "Unknown G-Sheet Rake"
             s, i = parse_last_sequence(display_name)
