@@ -16,8 +16,7 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("⚙️ Settings")
-st.sidebar.info("ℹ️ Multi-Tab Mode active. Fetching data from sheets like 'Dec-25', 'Jan-26'...")
-gs_url = st.sidebar.text_input("Google Sheet URL", value="https://docs.google.com/spreadsheets/d/1NgeRXtNez1Ifs7UtQVa_dOgmEP_pj4TI/edit?pli=1&gid=1051078038#gid=1051078038")
+gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
 
 st.sidebar.markdown("---")
 sim_params = {}
@@ -57,6 +56,14 @@ if st.session_state.downtimes:
         st.session_state.downtimes = []
         st.rerun()
 sim_params['downtimes'] = st.session_state.downtimes
+
+curr_params_hash = str(sim_params)
+params_changed = False
+if 'last_params_hash' not in st.session_state:
+    st.session_state.last_params_hash = curr_params_hash
+elif st.session_state.last_params_hash != curr_params_hash:
+    params_changed = True
+    st.session_state.last_params_hash = curr_params_hash
 
 # ==========================================
 # 2. HELPER FUNCTIONS
@@ -150,7 +157,6 @@ def parse_tippler_cell(cell_value, ref_date):
             end_dt = ref_date.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
             if end_dt < start_dt: end_dt += timedelta(days=1)
             
-            # FUTURE DATE FIX
             now_dt = datetime.now(IST)
             if start_dt > now_dt + timedelta(days=90): start_dt = start_dt.replace(year=start_dt.year - 1)
             if end_dt > now_dt + timedelta(days=90): end_dt = end_dt.replace(year=end_dt.year - 1)
@@ -181,17 +187,10 @@ def parse_col_d_wagon_type(cell_val):
     elif 'N' in s: load_type = 'BOXN'
     return wagons, load_type
 
-# --- DIRECT NUMERIC PARSER FOR COLUMN K ---
 def parse_demurrage_column_k(cell_val):
     s = str(cell_val).strip().upper()
     if s in ["", "NAN", "NIL", "-", "NONE"]: return "00:00"
-    
-    # If cell contains colon, assume it's already HH:MM
-    if ":" in s:
-        return s
-    
-    # If it's a number (int or float), convert to HH:MM
-    # e.g., 5.5 -> 05:30
+    if ":" in s: return s
     match = re.search(r'(\d+(\.\d+)?)', s)
     if match:
         try:
@@ -200,48 +199,7 @@ def parse_demurrage_column_k(cell_val):
             minutes = int((val - hours) * 60)
             return f"{hours:02d}:{minutes:02d}"
         except: pass
-        
     return "00:00"
-
-def parse_dt_from_str_smart(dt_str, ref_dt_obj):
-    try:
-        if not dt_str: return pd.NaT
-        parts = dt_str.split('-')
-        day = int(parts[0])
-        hm = parts[1].split(':')
-        h, m = int(hm[0]), int(hm[1])
-        
-        if pd.isnull(ref_dt_obj):
-            year_ref = datetime.now().year
-            month_ref = datetime.now().month
-        else:
-            year_ref = ref_dt_obj.year
-            month_ref = ref_dt_obj.month
-            
-        dt = datetime(year_ref, month_ref, day, h, m)
-        if pd.notnull(ref_dt_obj):
-             naive_ref = ref_dt_obj.replace(tzinfo=None)
-             if (dt - naive_ref).days < -300: dt = dt.replace(year=year_ref+1)
-             elif (dt - naive_ref).days > 300: dt = dt.replace(year=year_ref-1)
-        return IST.localize(dt)
-    except: return pd.NaT
-
-# ==========================================
-# 3. GOOGLE SHEET PARSER (MULTI-TAB)
-# ==========================================
-
-def get_sheet_gid_url(spreadsheet_id, sheet_name):
-    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
-
-def generate_month_sheet_names():
-    names = []
-    curr = datetime.now()
-    for _ in range(13):
-        name = curr.strftime("%b-%y") 
-        names.append(name)
-        first = curr.replace(day=1)
-        curr = first - timedelta(days=1)
-    return names
 
 def safe_parse_date(val):
     if pd.isnull(val) or str(val).strip() == "" or str(val).strip().upper() == "U/P": return pd.NaT
@@ -254,198 +212,184 @@ def safe_parse_date(val):
         return to_ist(dt)
     except: return pd.NaT
 
+# ==========================================
+# 3. GOOGLE SHEET PARSER 
+# ==========================================
+
 @st.cache_data(ttl=60)
-def fetch_google_sheet_actuals_multitab(url, free_time_hours):
-    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
-    if not match:
-        sheet_urls = [url]
-    else:
-        spreadsheet_id = match.group(1)
-        target_sheets = generate_month_sheet_names()
-        sheet_urls = [f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv"] 
-        for name in target_sheets:
-            sheet_urls.append(get_sheet_gid_url(spreadsheet_id, name))
+def fetch_google_sheet_actuals(url, free_time_hours):
+    try:
+        df_gs = pd.read_csv(url, header=None, skiprows=1) 
+        if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), (0,0)
 
-    all_dfs = []
-    for s_url in sheet_urls:
-        try:
-            df_temp = pd.read_csv(s_url, header=None, skiprows=1)
-            if len(df_temp.columns) >= 18:
-                all_dfs.append(df_temp)
-        except Exception:
-            continue
+        locked_actuals = []
+        unplanned_actuals = [] 
+        last_seq_tuple = (0, 0)
+
+        for i in range(len(df_gs)):
+            row = df_gs.iloc[i]
+            val_b = str(row.iloc[1]).strip()
+            val_c = str(row.iloc[2]).strip()
+            if not val_b or val_b.lower() == 'nan': continue 
             
-    if not all_dfs:
-        return pd.DataFrame(), pd.DataFrame(), (0,0)
-    
-    df_gs = pd.concat(all_dfs, ignore_index=True)
-    df_gs = df_gs.drop_duplicates(subset=[1, 4], keep='first').reset_index(drop=True)
+            source_val = "Unknown" if (not val_c or val_c.lower() == 'nan') else val_c
+            arrival_dt = safe_parse_date(row.iloc[4]) 
+            if pd.isnull(arrival_dt): continue
 
-    locked_actuals = []
-    unplanned_actuals = [] 
-    last_seq_tuple = (0, 0)
-    
-    # We no longer need grouping for reasons, so we process row by row
-    # skipping only completely duplicate entries
-    processed_indices = set()
+            rake_name = val_b
+            col_d_val = row.iloc[3]
+            wagons, load_type = parse_col_d_wagon_type(col_d_val)
 
-    for i in range(len(df_gs)):
-        if i in processed_indices: continue
-        
-        row = df_gs.iloc[i]
-        val_b = str(row.iloc[1]).strip() # Rake Name
-        if not val_b or val_b.lower() == 'nan': continue
-        
-        processed_indices.add(i)
-        
-        val_c = str(row.iloc[2]).strip() # Source
-        source_val = "Unknown" if (not val_c or val_c.lower() == 'nan') else val_c
-        arrival_dt = safe_parse_date(row.iloc[4]) 
-        if pd.isnull(arrival_dt): continue
+            start_dt = safe_parse_date(row.iloc[5])
+            end_dt = safe_parse_date(row.iloc[6])
+            if pd.isnull(start_dt): start_dt = arrival_dt 
+            
+            tippler_timings = {}
+            active_tipplers_row = []
+            explicit_wagon_counts = {}
+            tippler_objs = {}
+            
+            total_wagons_unloaded = 0
 
-        rake_name = val_b
-        col_d_val = row.iloc[3] # Load Type/Wagons
-        wagons, load_type = parse_col_d_wagon_type(col_d_val)
-
-        start_dt = safe_parse_date(row.iloc[5])
-        end_dt = safe_parse_date(row.iloc[6])
-        if pd.isnull(start_dt): start_dt = arrival_dt 
-        
-        tippler_timings = {}
-        active_tipplers_row = []
-        explicit_wagon_counts = {}
-        tippler_objs = {}
-        
-        total_wagons_unloaded = 0
-
-        # Process Tipplers
-        for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
-            cell_val = row.iloc[idx]
-            if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
-                wc = parse_wagon_count_from_cell(cell_val)
-                ts, te = parse_tippler_cell(cell_val, arrival_dt)
-                
-                if pd.isnull(ts) and wc is not None:
-                    if pd.notnull(start_dt):
-                        ts = start_dt
-                        te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2)
-                
-                if pd.notnull(ts):
-                    active_tipplers_row.append(t_name)
-                    tippler_timings[f"{t_name} Start"] = format_dt(ts)
-                    tippler_timings[f"{t_name} End"] = format_dt(te)
-                    tippler_timings[f"{t_name}_Obj_End"] = te
+            for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
+                cell_val = row.iloc[idx]
+                if pd.notnull(cell_val) and str(cell_val).strip() not in ["", "nan"]:
+                    wc = parse_wagon_count_from_cell(cell_val)
+                    ts, te = parse_tippler_cell(cell_val, arrival_dt)
                     
-                    if pd.notnull(arrival_dt):
-                        diff = (ts - arrival_dt).days
-                        if diff < -300: ts = ts.replace(year=arrival_dt.year + 1)
-                        elif diff > 300: ts = ts.replace(year=arrival_dt.year - 1)
-                        diff_e = (te - arrival_dt).days
-                        if diff_e < -300: te = te.replace(year=arrival_dt.year + 1)
-                        elif diff_e > 300: te = te.replace(year=arrival_dt.year - 1)
-
-                    tippler_objs[f"{t_name}_Start_Obj"] = ts
-                    tippler_objs[f"{t_name}_End_Obj"] = te
+                    if pd.isnull(ts) and wc is not None:
+                        if pd.notnull(start_dt):
+                            ts = start_dt
+                            te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2)
                     
-                    if wc is not None: 
-                        explicit_wagon_counts[t_name] = wc
-                        total_wagons_unloaded += wc
+                    if pd.notnull(ts):
+                        active_tipplers_row.append(t_name)
+                        tippler_timings[f"{t_name} Start"] = format_dt(ts)
+                        tippler_timings[f"{t_name} End"] = format_dt(te)
+                        tippler_timings[f"{t_name}_Obj_End"] = te
+                        
+                        if pd.notnull(arrival_dt):
+                            diff = (ts - arrival_dt).days
+                            if diff < -300: ts = ts.replace(year=arrival_dt.year + 1)
+                            elif diff > 300: ts = ts.replace(year=arrival_dt.year - 1)
+                            diff_e = (te - arrival_dt).days
+                            if diff_e < -300: te = te.replace(year=arrival_dt.year + 1)
+                            elif diff_e > 300: te = te.replace(year=arrival_dt.year - 1)
 
-        is_bobr = 'BOBR' in str(load_type).upper()
-        is_pending = False
-        if not is_bobr:
-            if total_wagons_unloaded < wagons:
-                is_pending = True
-        
-        seq, rid = parse_last_sequence(rake_name)
-        if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
-            last_seq_tuple = (seq, rid)
+                        tippler_objs[f"{t_name}_Start_Obj"] = ts
+                        tippler_objs[f"{t_name}_End_Obj"] = te
+                        
+                        if wc is not None: 
+                            explicit_wagon_counts[t_name] = wc
+                            total_wagons_unloaded += wc
 
-        if is_pending:
-            rem_wagons = wagons - total_wagons_unloaded
-            unplanned_actuals.append({
-                'Rake': rake_name,  
+            is_bobr = 'BOBR' in str(load_type).upper()
+            is_pending = False
+            if not is_bobr:
+                if total_wagons_unloaded < wagons:
+                    is_pending = True
+            
+            seq, rid = parse_last_sequence(rake_name)
+            if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
+                last_seq_tuple = (seq, rid)
+
+            if is_pending:
+                rem_wagons = wagons - total_wagons_unloaded
+                unplanned_actuals.append({
+                    'Rake': rake_name,  
+                    'Coal Source': source_val,
+                    'Load Type': load_type,
+                    'Wagons': wagons, # Show original total in dashboard
+                    '_rem_wagons': rem_wagons if rem_wagons > 0 else wagons, # Pass remaining for simulation math
+                    'Status': 'Pending (G-Sheet)',
+                    '_Arrival_DT': arrival_dt,
+                    '_Form_Mins': 0,
+                    'Optimization Type': 'Auto-Planned (G-Sheet)',
+                    'Extra Shunt (Mins)': 0,
+                    'is_gs_unplanned': True,
+                    'is_pending_actual': True # Tag to calculate demurrage based on NOW
+                })
+                continue 
+
+            t_str_list = []
+            wagon_counts_map = {}
+            if explicit_wagon_counts:
+                for t in active_tipplers_row:
+                    cnt = explicit_wagon_counts.get(t, 0)
+                    t_str_list.append(f"{t} ({cnt})")
+                    wagon_counts_map[f"{t}_Wagons"] = cnt
+            elif len(active_tipplers_row) > 0:
+                share = wagons // len(active_tipplers_row)
+                rem = wagons % len(active_tipplers_row)
+                for i, t in enumerate(active_tipplers_row):
+                    cnt = share + (1 if i < rem else 0)
+                    t_str_list.append(f"{t} ({cnt})")
+                    wagon_counts_map[f"{t}_Wagons"] = cnt
+            
+            used_tipplers_str = ", ".join(t_str_list)
+
+            raw_dur = row.iloc[8]
+            total_dur = timedelta(0)
+            release_dt = safe_parse_date(row.iloc[7])
+            
+            if pd.notnull(raw_dur):
+                try:
+                    if ":" in str(raw_dur):
+                        parts = str(raw_dur).split(":")
+                        total_dur = timedelta(hours=int(parts[0]), minutes=int(parts[1]))
+                    else: total_dur = timedelta(days=float(raw_dur))
+                except:
+                    pass
+                    
+            if total_dur.total_seconds() == 0 and pd.notnull(release_dt) and pd.notnull(arrival_dt):
+                total_dur = release_dt - arrival_dt
+
+            raw_dem_val = row.iloc[10]
+            dem_str = parse_demurrage_column_k(raw_dem_val)
+            
+            # Auto-calculate fallback for completed rakes if not specified in Google Sheet
+            if dem_str == "00:00" and total_dur.total_seconds() > 0:
+                dem_str, _ = calculate_rounded_demurrage(total_dur, free_time_hours)
+
+            entry = {
+                'Rake': rake_name,
                 'Coal Source': source_val,
                 'Load Type': load_type,
-                'Wagons': rem_wagons if rem_wagons > 0 else wagons,
-                'Status': 'Pending (G-Sheet)',
+                'Wagons': wagons,
+                'Status': 'ACTUAL',
                 '_Arrival_DT': arrival_dt,
+                '_Shunt_Ready_DT': start_dt,
                 '_Form_Mins': 0,
-                'Optimization Type': 'Auto-Planned (G-Sheet)',
+                'Optimization Type': 'Actual (G-Sheet)',
                 'Extra Shunt (Mins)': 0,
-                'is_gs_unplanned': True
-            })
-            continue 
+                'Line Allotted': 'N/A',
+                'Line Entry Time': format_dt(arrival_dt),
+                'Shunting Complete': format_dt(start_dt),
+                'Tippler Start Time': format_dt(start_dt),
+                'Finish Unload': format_dt(end_dt),
+                'Tipplers Used': used_tipplers_str,
+                'Wait (Tippler)': format_duration_hhmm(start_dt - arrival_dt) if pd.notnull(start_dt) else "",
+                'Total Duration': format_duration_hhmm(total_dur),
+                'Demurrage': dem_str,
+                '_raw_end_dt': end_dt,
+                '_raw_tipplers_data': tippler_timings,
+                '_raw_wagon_counts': wagon_counts_map,
+                '_raw_tipplers': active_tipplers_row
+            }
+            for t, obj in tippler_objs.items():
+                entry[t] = obj
 
-        t_str_list = []
-        wagon_counts_map = {}
-        if explicit_wagon_counts:
-            for t in active_tipplers_row:
-                cnt = explicit_wagon_counts.get(t, 0)
-                t_str_list.append(f"{t} ({cnt})")
-                wagon_counts_map[f"{t}_Wagons"] = cnt
-        elif len(active_tipplers_row) > 0:
-            share = wagons // len(active_tipplers_row)
-            rem = wagons % len(active_tipplers_row)
-            for i, t in enumerate(active_tipplers_row):
-                cnt = share + (1 if i < rem else 0)
-                t_str_list.append(f"{t} ({cnt})")
-                wagon_counts_map[f"{t}_Wagons"] = cnt
-        
-        used_tipplers_str = ", ".join(t_str_list)
+            for t in ['T1', 'T2', 'T3', 'T4']:
+                entry[f"{t} Start"] = tippler_timings.get(f"{t} Start", "")
+                entry[f"{t} End"] = tippler_timings.get(f"{t} End", "")
+                entry[f"{t} Idle"] = ""
+            
+            locked_actuals.append(entry)
 
-        raw_dur = row.iloc[8]
-        total_dur = timedelta(0)
-        if pd.notnull(raw_dur):
-            try:
-                if ":" in str(raw_dur):
-                    parts = str(raw_dur).split(":")
-                    total_dur = timedelta(hours=int(parts[0]), minutes=int(parts[1]))
-                else: total_dur = timedelta(days=float(raw_dur))
-            except:
-                if pd.notnull(safe_parse_date(row.iloc[7])): 
-                    total_dur = safe_parse_date(row.iloc[7]) - arrival_dt
+        return pd.DataFrame(locked_actuals), pd.DataFrame(unplanned_actuals), last_seq_tuple
 
-        # --- DEMURRAGE PARSING (Column K / Index 10) ---
-        raw_dem_val = row.iloc[10] 
-        dem_str = parse_demurrage_column_k(raw_dem_val) # Uses new numeric logic
-
-        entry = {
-            'Rake': rake_name,
-            'Coal Source': source_val,
-            'Load Type': load_type,
-            'Wagons': wagons,
-            'Status': 'ACTUAL',
-            '_Arrival_DT': arrival_dt,
-            '_Shunt_Ready_DT': start_dt,
-            '_Form_Mins': 0,
-            'Optimization Type': 'Actual (G-Sheet)',
-            'Extra Shunt (Mins)': 0,
-            'Line Allotted': 'N/A',
-            'Line Entry Time': format_dt(arrival_dt),
-            'Shunting Complete': format_dt(start_dt),
-            'Tippler Start Time': format_dt(start_dt),
-            'Finish Unload': format_dt(end_dt),
-            'Tipplers Used': used_tipplers_str,
-            'Wait (Tippler)': format_duration_hhmm(start_dt - arrival_dt) if pd.notnull(start_dt) else "",
-            'Total Duration': format_duration_hhmm(total_dur),
-            'Demurrage': dem_str,
-            '_raw_end_dt': end_dt,
-            '_raw_tipplers_data': tippler_timings,
-            '_raw_wagon_counts': wagon_counts_map,
-            '_raw_tipplers': active_tipplers_row
-        }
-        for t, obj in tippler_objs.items():
-            entry[t] = obj
-
-        for t in ['T1', 'T2', 'T3', 'T4']:
-            entry[f"{t} Start"] = tippler_timings.get(f"{t} Start", "")
-            entry[f"{t} End"] = tippler_timings.get(f"{t} End", "")
-            entry[f"{t} Idle"] = ""
-        
-        locked_actuals.append(entry)
-
-    return pd.DataFrame(locked_actuals), pd.DataFrame(unplanned_actuals), last_seq_tuple
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame(), (0,0)
 
 # ==========================================
 # 4. CORE SIMULATION LOGIC
@@ -610,6 +554,8 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     for _, rake in plan_df.iterrows():
         orig_name = str(rake.get('Rake', ''))
         is_gs = rake.get('is_gs_unplanned', False)
+        is_pending_actual = rake.get('is_pending_actual', False)
+        wagons_to_sim = rake.get('_rem_wagons', rake['Wagons'])
         
         if is_gs and '/' in orig_name:
             display_name = orig_name
@@ -650,15 +596,24 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             assignments.append(row_data)
             continue
 
-        entry_A = get_line_entry_time('Group_Lines_8_10', rake['_Arrival_DT'], line_groups)
-        ready_A = entry_A + timedelta(minutes=s_a)
-        fin_A, used_A, start_A, tim_A, _, wag_A = calculate_generic_finish(
-            rake['Wagons'], ['T1', 'T2'], ready_A, tippler_state, downtimes, rates, w_batch, w_delay)
+        if is_pending_actual:
+            # Force simulation to start from NOW for remaining wagons
+            now_time = datetime.now(IST).replace(second=0, microsecond=0)
+            entry_A = max(rake['_Arrival_DT'], now_time)
+            ready_A = entry_A
+            entry_B = entry_A
+            ready_B = entry_A
+        else:
+            entry_A = get_line_entry_time('Group_Lines_8_10', rake['_Arrival_DT'], line_groups)
+            ready_A = entry_A + timedelta(minutes=s_a)
+            entry_B = get_line_entry_time('Group_Line_11', rake['_Arrival_DT'], line_groups)
+            ready_B = entry_B + timedelta(minutes=s_b)
         
-        entry_B = get_line_entry_time('Group_Line_11', rake['_Arrival_DT'], line_groups)
-        ready_B = entry_B + timedelta(minutes=s_b)
+        fin_A, used_A, start_A, tim_A, _, wag_A = calculate_generic_finish(
+            wagons_to_sim, ['T1', 'T2'], ready_A, tippler_state, downtimes, rates, w_batch, w_delay)
+        
         fin_B, used_B, start_B, tim_B, _, wag_B = calculate_generic_finish(
-            rake['Wagons'], ['T3', 'T4'], ready_B, tippler_state, downtimes, rates, w_batch, w_delay)
+            wagons_to_sim, ['T3', 'T4'], ready_B, tippler_state, downtimes, rates, w_batch, w_delay)
         
         if fin_B < fin_A:
             best_fin, best_used, best_start, best_timings, best_entry, best_ready = fin_B, used_B, start_B, tim_B, entry_B, ready_B
@@ -669,12 +624,17 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             best_grp, best_line, best_wag = 'Group_Lines_8_10', '8/9/10', wag_A
             best_type = "Standard"
 
+        if is_pending_actual:
+            best_type = "Live Pending (Projected)"
+
         for k, v in best_timings.items():
             if 'End' in k: tippler_state[k.split('_')[0]] = v
         if best_grp == 'Group_Lines_8_10':
              line_groups['Group_Lines_8_10']['line_free_times'].append(best_entry + timedelta(minutes=50))
 
         release_time = best_fin + timedelta(minutes=f_a)
+        
+        # Calculation from Original Arrival Date = Accurate projected Demurrage
         tot_dur_final = release_time - rake['_Arrival_DT']
         dem_str, _ = calculate_rounded_demurrage(tot_dur_final, ft_hours)
 
@@ -682,7 +642,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             'Rake': display_name,
             'Coal Source': rake['Coal Source'],
             'Load Type': rake['Load Type'],
-            'Wagons': rake['Wagons'],
+            'Wagons': rake['Wagons'], # Keeps original wagon count in view
             'Status': rake['Status'],
             '_Arrival_DT': rake['_Arrival_DT'],
             '_Shunt_Ready_DT': best_ready,
@@ -713,19 +673,19 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         yesterday_date = today_date - timedelta(days=1)
         
         # TAB 1 VISUAL FILTER
-        def keep_row_live(r):
+        def keep_row(r):
             ad = r['_Arrival_DT'].date()
             if ad >= yesterday_date: return True
             return False 
         
-        df_locked_live = df_locked[df_locked.apply(keep_row_live, axis=1)]
+        df_locked_visible = df_locked[df_locked.apply(keep_row, axis=1)]
         
-        cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers'] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']]
+        cols_to_drop = ['_raw_tipplers_data', '_raw_end_dt', '_raw_tipplers']
+        actuals_clean = df_locked_visible.drop(columns=[c for c in cols_to_drop if c in df_locked_visible.columns], errors='ignore')
         
-        actuals_clean_live = df_locked_live.drop(columns=[c for c in cols_to_drop if c in df_locked_live.columns], errors='ignore')
-        final_df_display = pd.concat([actuals_clean_live, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean_live
-        
-        final_df_all = pd.concat([df_locked, df_sim], ignore_index=True)
+        final_df_display = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
+        # FULL HISTORY FOR TAB 2
+        final_df_all = pd.concat([df_locked.drop(columns=cols_to_drop, errors='ignore'), df_sim], ignore_index=True)
     else:
         final_df_display = df_sim
         final_df_all = df_sim
@@ -839,7 +799,7 @@ if gs_url and ('last_gs_url' not in st.session_state or st.session_state.last_gs
 if input_changed or 'raw_data_cached' not in st.session_state:
     actuals_df, unplanned_df, last_seq = pd.DataFrame(), pd.DataFrame(), (0,0)
     if gs_url:
-        actuals_df, unplanned_df, last_seq = fetch_google_sheet_actuals_multitab(gs_url, sim_params['ft'])
+        actuals_df, unplanned_df, last_seq = fetch_google_sheet_actuals(gs_url, sim_params['ft'])
     st.session_state.actuals_df = actuals_df
     st.session_state.unplanned_df = unplanned_df
     st.session_state.last_seq = last_seq
