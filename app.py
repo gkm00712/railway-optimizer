@@ -18,8 +18,6 @@ IST = pytz.timezone('Asia/Kolkata')
 st.sidebar.header("⚙️ Settings")
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
 
-show_history = st.sidebar.checkbox("Show All Historical Data", value=False, help="Check this to see old completed rakes")
-
 st.sidebar.markdown("---")
 sim_params = {}
 sim_params['rt1'] = st.sidebar.number_input("Tippler 1 Rate", value=6.0, step=0.5)
@@ -59,14 +57,6 @@ if st.session_state.downtimes:
         st.rerun()
 sim_params['downtimes'] = st.session_state.downtimes
 
-curr_params_hash = str(sim_params)
-params_changed = False
-if 'last_params_hash' not in st.session_state:
-    st.session_state.last_params_hash = curr_params_hash
-elif st.session_state.last_params_hash != curr_params_hash:
-    params_changed = True
-    st.session_state.last_params_hash = curr_params_hash
-
 # ==========================================
 # 2. HELPER FUNCTIONS
 # ==========================================
@@ -77,13 +67,13 @@ def to_ist(dt):
     return dt.astimezone(IST)
 
 def parse_wagons(val):
+    if pd.isnull(val): return 58
     try:
         val_str = str(val).strip()
         if '+' in val_str:
-            val_str = val_str.split('+')[0]
+            val_str = val_str.split('+')[0] 
         match = re.search(r'(\d{2})', val_str)
-        if match:
-            return int(match.group(1))
+        if match: return int(match.group(1))
         return int(float(val_str))
     except: return 58
 
@@ -232,6 +222,7 @@ def safe_parse_date(val):
     if pd.isnull(val) or str(val).strip() in ["", "U/P", "NAN", "NONE"]: return pd.NaT
     try:
         val_str = str(val).strip()
+        # Strictly catch the user's specific format 13.02.2026/16:35
         match = re.search(r'(\d{1,2})[\./-](\d{1,2})[\./-](\d{2,4})[\s/]+(\d{1,2})[:\.](\d{2})', val_str)
         if match:
             d, m, y, hr, mn = map(int, match.groups())
@@ -252,7 +243,7 @@ def safe_parse_date(val):
     except: return pd.NaT
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (MULTI-TAB)
+# 3. GOOGLE SHEET PARSER 
 # ==========================================
 
 def get_sheet_gid_url(spreadsheet_id, sheet_name):
@@ -314,6 +305,7 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
         
+        # Look ahead to skip continuation rows
         j = i + 1
         while j < len(df_gs):
              next_row = df_gs.iloc[j]
@@ -386,15 +378,11 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
             last_seq_tuple = (seq, rid)
 
         if is_pending:
-            # GHOST RAKE & FUTURE DATE FILTER LOGIC
             now_dt = datetime.now(IST)
-            
             if pd.notnull(arrival_dt):
                 days_old = (now_dt - arrival_dt).days
-                if days_old > 5:
-                    continue # Skip ghost rakes
+                if days_old > 5: continue 
                 
-                # Check if it's a Future Expected Rake or actually sitting pending
                 if arrival_dt > now_dt:
                     opt_type = 'Forecast (G-Sheet)'
                     is_pending_flag = False
@@ -605,16 +593,26 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             
             df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt')
 
+            # PREVENT DUPLICATES (Match by Time OR Exact Rake Name)
             existing_times = set()
-            if not df_locked.empty: existing_times.update(df_locked['_Arrival_DT'].dt.floor('min'))
-            if not df_unplanned.empty: existing_times.update(df_unplanned['_Arrival_DT'].dt.floor('min'))
+            existing_rakes = set()
+            if not df_locked.empty: 
+                existing_times.update(df_locked['_Arrival_DT'].dt.floor('min'))
+                existing_rakes.update(df_locked['Rake'].astype(str).str.strip().str.upper())
+            if not df_unplanned.empty: 
+                existing_times.update(df_unplanned['_Arrival_DT'].dt.floor('min'))
+                existing_rakes.update(df_unplanned['Rake'].astype(str).str.strip().str.upper())
 
             for _, row in df.iterrows():
-                if row['arrival_dt'].floor('min') in existing_times: continue 
-                l_type = row.get(load_col, 'BOXN') if load_col else 'BOXN'
-                csv_rake_name = str(row[rake_col]).strip() if rake_col else ""
-                if csv_rake_name.lower() == 'nan': csv_rake_name = ""
+                csv_rake_name = str(row.get(rake_col, '')).strip().upper() if rake_col else ""
                 
+                # Check for Duplicates
+                if csv_rake_name and csv_rake_name != 'NAN' and csv_rake_name in existing_rakes:
+                    continue
+                if row['arrival_dt'].floor('min') in existing_times: 
+                    continue 
+
+                l_type = row.get(load_col, 'BOXN') if load_col else 'BOXN'
                 to_plan.append({
                     'Rake': csv_rake_name,
                     'Coal Source': row.get(src_col, '') if src_col else '',
@@ -623,7 +621,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                     'Status': row.get(stts_code_col, 'N/A') if stts_code_col else 'N/A',
                     '_Arrival_DT': row['arrival_dt'],
                     '_Form_Mins': 0,
-                    'Optimization Type': 'Forecast (CSV)',
+                    'Optimization Type': 'Forecast (CSV)', 
                     'Extra Shunt (Mins)': 0,
                     'is_csv': True 
                 })
@@ -749,7 +747,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             best_grp, best_line, best_wag = 'Group_Lines_8_10', '8/9/10', wag_A
             best_type = "Standard"
 
-        # Apply specific logic labels
+        # Apply specific logic labels accurately
         if is_pending_actual:
             best_type = "Live Pending (Projected)"
         elif is_gs and not is_pending_actual and rake.get('Optimization Type') == 'Forecast (G-Sheet)':
