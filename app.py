@@ -223,9 +223,26 @@ def parse_demurrage_column_k(cell_val):
     return "00:00"
 
 def safe_parse_date(val):
-    if pd.isnull(val) or str(val).strip() == "" or str(val).strip().upper() == "U/P": return pd.NaT
+    if pd.isnull(val) or str(val).strip() in ["", "U/P", "NAN", "NONE"]: return pd.NaT
     try:
-        dt = pd.to_datetime(val, dayfirst=True, errors='coerce') 
+        val_str = str(val).strip()
+        
+        # STRICT REGEX MATCHER FOR: 13.02.2026/16:35 or 13-02-2026 16:35
+        # Prevents pandas from guessing incorrectly.
+        match = re.search(r'(\d{1,2})[\./-](\d{1,2})[\./-](\d{2,4})[\s/]+(\d{1,2})[:\.](\d{2})', val_str)
+        if match:
+            d, m, y, hr, mn = map(int, match.groups())
+            if y < 100: y += 2000 # handle '26' -> '2026'
+            dt = datetime(y, m, d, hr, mn)
+            # Ensure it doesn't jump forward wrongly
+            now_dt = datetime.now()
+            if (dt - now_dt).days > 90: dt = dt.replace(year=dt.year - 1)
+            return IST.localize(dt)
+
+        # Fallback
+        val_str = val_str.replace('/', ' ')
+        val_str = " ".join(val_str.split())
+        dt = pd.to_datetime(val_str, dayfirst=True, errors='coerce') 
         if pd.notnull(dt):
             now_dt = datetime.now()
             if dt > now_dt + timedelta(days=90): dt = dt.replace(year=dt.year - 1)
@@ -369,6 +386,21 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
             last_seq_tuple = (seq, rid)
 
         if is_pending:
+            # GHOST RAKE FILTER: Ignore incomplete rakes older than 5 days
+            now_dt = datetime.now(IST)
+            if pd.notnull(arrival_dt):
+                days_old = (now_dt - arrival_dt).days
+                if days_old > 5:
+                    continue 
+
+            # FORECAST vs PENDING LOGIC
+            if pd.notnull(arrival_dt) and arrival_dt > now_dt:
+                opt_type = 'Forecast (G-Sheet)'
+                is_pending_flag = False
+            else:
+                opt_type = 'Live Pending (Projected)'
+                is_pending_flag = True
+
             rem_wagons = wagons - total_wagons_unloaded
             unplanned_actuals.append({
                 'Rake': rake_name,  
@@ -379,10 +411,10 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                 'Status': 'Pending (G-Sheet)',
                 '_Arrival_DT': arrival_dt,
                 '_Form_Mins': 0,
-                'Optimization Type': 'Auto-Planned (G-Sheet)',
+                'Optimization Type': opt_type,
                 'Extra Shunt (Mins)': 0,
                 'is_gs_unplanned': True,
-                'is_pending_actual': True 
+                'is_pending_actual': is_pending_flag 
             })
             continue 
 
@@ -587,7 +619,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                     'Status': row.get(stts_code_col, 'N/A') if stts_code_col else 'N/A',
                     '_Arrival_DT': row['arrival_dt'],
                     '_Form_Mins': 0,
-                    'Optimization Type': 'Forecast',
+                    'Optimization Type': 'Forecast (CSV)', # Tagged precisely
                     'Extra Shunt (Mins)': 0,
                     'is_csv': True 
                 })
@@ -713,8 +745,13 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             best_grp, best_line, best_wag = 'Group_Lines_8_10', '8/9/10', wag_A
             best_type = "Standard"
 
+        # Apply specific logic labels
         if is_pending_actual:
             best_type = "Live Pending (Projected)"
+        elif is_gs and not is_pending_actual and rake.get('Optimization Type') == 'Forecast (G-Sheet)':
+            best_type = "Forecast (G-Sheet)"
+        elif not is_gs:
+            best_type = "Forecast (CSV)"
 
         for k, v in best_timings.items():
             if 'End' in k: tippler_state[k.split('_')[0]] = v
