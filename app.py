@@ -222,24 +222,18 @@ def safe_parse_date(val):
     if pd.isnull(val) or str(val).strip() in ["", "U/P", "NAN", "NONE"]: return pd.NaT
     try:
         val_str = str(val).strip()
-        # Strictly catch the user's specific format 13.02.2026/16:35
+        # STRICT MATCHER FOR 13.02.2026/16:35 to prevent Python guessing incorrectly
         match = re.search(r'(\d{1,2})[\./-](\d{1,2})[\./-](\d{2,4})[\s/]+(\d{1,2})[:\.](\d{2})', val_str)
         if match:
             d, m, y, hr, mn = map(int, match.groups())
             if y < 100: y += 2000 
             dt = datetime(y, m, d, hr, mn)
-            now_dt = datetime.now()
-            if (dt - now_dt).days > 90: dt = dt.replace(year=dt.year - 1)
             return IST.localize(dt)
 
         val_str = val_str.replace('/', ' ')
         val_str = " ".join(val_str.split())
         dt = pd.to_datetime(val_str, dayfirst=True, errors='coerce') 
-        if pd.notnull(dt):
-            now_dt = datetime.now()
-            if dt > now_dt + timedelta(days=90): dt = dt.replace(year=dt.year - 1)
-        if pd.isnull(dt): return pd.NaT 
-        return to_ist(dt)
+        if pd.notnull(dt): return to_ist(dt)
     except: return pd.NaT
 
 # ==========================================
@@ -324,9 +318,8 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         col_d_val = row.iloc[3]
         wagons, load_type = parse_col_d_wagon_type(col_d_val)
 
-        start_dt = safe_parse_date(row.iloc[5])
+        start_dt = safe_parse_date(row.iloc[5]) # Placement Time
         end_dt = safe_parse_date(row.iloc[6])
-        if pd.isnull(start_dt): start_dt = arrival_dt 
         
         tippler_timings = {}
         active_tipplers_row = []
@@ -341,25 +334,12 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
                 wc = parse_wagon_count_from_cell(cell_val)
                 ts, te = parse_tippler_cell(cell_val, arrival_dt)
                 
-                if pd.isnull(ts) and wc is not None:
-                    if pd.notnull(start_dt):
-                        ts = start_dt
-                        te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2)
-                
                 if pd.notnull(ts):
                     active_tipplers_row.append(t_name)
                     tippler_timings[f"{t_name} Start"] = format_dt(ts)
                     tippler_timings[f"{t_name} End"] = format_dt(te)
                     tippler_timings[f"{t_name}_Obj_End"] = te
                     
-                    if pd.notnull(arrival_dt):
-                        diff = (ts - arrival_dt).days
-                        if diff < -300: ts = ts.replace(year=arrival_dt.year + 1)
-                        elif diff > 300: ts = ts.replace(year=arrival_dt.year - 1)
-                        diff_e = (te - arrival_dt).days
-                        if diff_e < -300: te = te.replace(year=arrival_dt.year + 1)
-                        elif diff_e > 300: te = te.replace(year=arrival_dt.year - 1)
-
                     tippler_objs[f"{t_name}_Start_Obj"] = ts
                     tippler_objs[f"{t_name}_End_Obj"] = te
                     
@@ -378,35 +358,24 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
             last_seq_tuple = (seq, rid)
 
         if is_pending:
-            now_dt = datetime.now(IST)
-            if pd.notnull(arrival_dt):
-                days_old = (now_dt - arrival_dt).days
-                if days_old > 5: continue 
-                
-                if arrival_dt > now_dt:
-                    opt_type = 'Forecast (G-Sheet)'
-                    is_pending_flag = False
-                else:
-                    opt_type = 'Live Pending (Projected)'
-                    is_pending_flag = True
-            else:
-                opt_type = 'Live Pending (Projected)'
-                is_pending_flag = True
-
             rem_wagons = wagons - total_wagons_unloaded
+            if rem_wagons <= 0: rem_wagons = wagons # Failsafe against bad math
+            
             unplanned_actuals.append({
                 'Rake': rake_name,  
                 'Coal Source': source_val,
                 'Load Type': load_type,
                 'Wagons': wagons, 
-                '_rem_wagons': rem_wagons if rem_wagons > 0 else wagons, 
+                '_rem_wagons': rem_wagons, 
                 'Status': 'Pending (G-Sheet)',
                 '_Arrival_DT': arrival_dt,
+                '_Shunt_Ready_DT': start_dt, # Passes the Exact Placement time!
+                '_active_tipplers': active_tipplers_row, # Locks the tippler!
                 '_Form_Mins': 0,
-                'Optimization Type': opt_type,
+                'Optimization Type': 'Live Pending (Projected)',
                 'Extra Shunt (Mins)': 0,
                 'is_gs_unplanned': True,
-                'is_pending_actual': is_pending_flag 
+                'is_pending_actual': True 
             })
             continue 
 
@@ -593,7 +562,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             
             df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt')
 
-            # PREVENT DUPLICATES (Match by Time OR Exact Rake Name)
             existing_times = set()
             existing_rakes = set()
             if not df_locked.empty: 
@@ -606,7 +574,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             for _, row in df.iterrows():
                 csv_rake_name = str(row.get(rake_col, '')).strip().upper() if rake_col else ""
                 
-                # Check for Duplicates
                 if csv_rake_name and csv_rake_name != 'NAN' and csv_rake_name in existing_rakes:
                     continue
                 if row['arrival_dt'].floor('min') in existing_times: 
@@ -686,9 +653,9 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         raw_wag = rake.get('_rem_wagons', rake['Wagons'])
         try:
             wagons_to_sim = int(float(raw_wag))
-            if math.isnan(wagons_to_sim): wagons_to_sim = 0
+            if math.isnan(wagons_to_sim) or wagons_to_sim <= 0: wagons_to_sim = 58
         except:
-            wagons_to_sim = 0
+            wagons_to_sim = 58
         
         is_bobr = 'BOBR' in str(rake['Load Type']).upper()
 
@@ -721,11 +688,21 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             continue
 
         if is_pending_actual:
-            now_time = datetime.now(IST).replace(second=0, microsecond=0)
-            entry_A = max(rake['_Arrival_DT'], now_time)
-            ready_A = entry_A
-            entry_B = entry_A
-            ready_B = entry_A
+            actual_placement = rake.get('_Shunt_Ready_DT', pd.NaT)
+            
+            if pd.notnull(actual_placement):
+                # USE EXACT TIME ENTERED IN GOOGLE SHEET
+                entry_A = actual_placement
+                ready_A = actual_placement
+                entry_B = actual_placement
+                ready_B = actual_placement
+            else:
+                # Fallback to current time if no placement was typed
+                now_time = datetime.now(IST).replace(second=0, microsecond=0)
+                entry_A = max(rake['_Arrival_DT'], now_time)
+                ready_A = entry_A
+                entry_B = entry_A
+                ready_B = entry_A
         else:
             entry_A = get_line_entry_time('Group_Lines_8_10', rake['_Arrival_DT'], line_groups)
             ready_A = entry_A + timedelta(minutes=s_a)
@@ -738,22 +715,26 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         fin_B, used_B, start_B, tim_B, _, wag_B = calculate_generic_finish(
             wagons_to_sim, ['T3', 'T4'], ready_B, tippler_state, downtimes, rates, w_batch, w_delay)
         
-        if fin_B < fin_A:
-            best_fin, best_used, best_start, best_timings, best_entry, best_ready = fin_B, used_B, start_B, tim_B, entry_B, ready_B
-            best_grp, best_line, best_wag = 'Group_Line_11', '11', wag_B
-            best_type = "Standard (Fast)"
-        else:
+        # TIPPLER LOCK: Force to T3/T4 if user already started data entry there
+        active_t = rake.get('_active_tipplers', [])
+        force_A = any(t in ['T1', 'T2'] for t in active_t)
+        force_B = any(t in ['T3', 'T4'] for t in active_t)
+
+        if force_A:
             best_fin, best_used, best_start, best_timings, best_entry, best_ready = fin_A, used_A, start_A, tim_A, entry_A, ready_A
             best_grp, best_line, best_wag = 'Group_Lines_8_10', '8/9/10', wag_A
-            best_type = "Standard"
-
-        # Apply specific logic labels accurately
-        if is_pending_actual:
-            best_type = "Live Pending (Projected)"
-        elif is_gs and not is_pending_actual and rake.get('Optimization Type') == 'Forecast (G-Sheet)':
-            best_type = "Forecast (G-Sheet)"
-        elif not is_gs:
-            best_type = "Forecast (CSV)"
+        elif force_B:
+            best_fin, best_used, best_start, best_timings, best_entry, best_ready = fin_B, used_B, start_B, tim_B, entry_B, ready_B
+            best_grp, best_line, best_wag = 'Group_Line_11', '11', wag_B
+        else:
+            if fin_B < fin_A:
+                best_fin, best_used, best_start, best_timings, best_entry, best_ready = fin_B, used_B, start_B, tim_B, entry_B, ready_B
+                best_grp, best_line, best_wag = 'Group_Line_11', '11', wag_B
+            else:
+                best_fin, best_used, best_start, best_timings, best_entry, best_ready = fin_A, used_A, start_A, tim_A, entry_A, ready_A
+                best_grp, best_line, best_wag = 'Group_Lines_8_10', '8/9/10', wag_A
+        
+        best_type = rake.get('Optimization Type', 'Standard')
 
         for k, v in best_timings.items():
             if 'End' in k: tippler_state[k.split('_')[0]] = v
