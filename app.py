@@ -73,14 +73,10 @@ def parse_wagons(val):
     try:
         val_str = str(val).strip()
         if '+' in val_str:
-            val_str = val_str.split('+')[0] # Only take what is before the +
-        
-        # Grab double digits
+            val_str = val_str.split('+')[0] 
         match = re.search(r'(\d{2})', val_str)
         if match:
             return int(match.group(1))
-            
-        # Fallback to general digit conversion
         return int(float(val_str))
     except: 
         return 58
@@ -159,7 +155,6 @@ def parse_tippler_cell(cell_value, ref_date):
             end_dt = ref_date.replace(hour=e_h, minute=e_m, second=0, microsecond=0)
             if end_dt < start_dt: end_dt += timedelta(days=1)
             
-            # FUTURE DATE FIX
             now_dt = datetime.now(IST)
             if start_dt > now_dt + timedelta(days=90): start_dt = start_dt.replace(year=start_dt.year - 1)
             if end_dt > now_dt + timedelta(days=90): end_dt = end_dt.replace(year=end_dt.year - 1)
@@ -178,18 +173,14 @@ def parse_wagon_count_from_cell(cell_value):
     return None
 
 def parse_col_d_wagon_type(cell_val):
-    """Parses wagon count and type specifically for Google Sheets Actuals (Column D)"""
     wagons = 58 
     load_type = 'BOXN' 
     if pd.isnull(cell_val): return wagons, load_type
     s = str(cell_val).strip().upper()
-    
-    # Grab exact 2 digit number
     match_num = re.search(r'(\d{2})', s)
     if match_num:
         try: wagons = int(match_num.group(1))
         except: pass
-        
     if 'R' in s: load_type = 'BOBR'
     elif 'N' in s: load_type = 'BOXN'
     return wagons, load_type
@@ -266,16 +257,36 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
     locked_actuals = []
     unplanned_actuals = [] 
     last_seq_tuple = (0, 0)
+    processed_indices = set()
 
     for i in range(len(df_gs)):
+        if i in processed_indices: continue
+        
         row = df_gs.iloc[i]
         val_b = str(row.iloc[1]).strip()
-        val_c = str(row.iloc[2]).strip()
         if not val_b or val_b.lower() == 'nan': continue 
         
+        processed_indices.add(i)
+        
+        val_c = str(row.iloc[2]).strip()
         source_val = "Unknown" if (not val_c or val_c.lower() == 'nan') else val_c
         arrival_dt = safe_parse_date(row.iloc[4]) 
         if pd.isnull(arrival_dt): continue
+        
+        # Look ahead to skip continuation rows
+        j = i + 1
+        while j < len(df_gs):
+             next_row = df_gs.iloc[j]
+             next_rake_name = str(next_row.iloc[1]).strip()
+             is_continuation = False
+             if not next_rake_name or next_rake_name.lower() == 'nan':
+                 is_continuation = True
+             elif next_rake_name == val_b:
+                 is_continuation = True
+             if not is_continuation:
+                 break
+             processed_indices.add(j)
+             j += 1
 
         rake_name = val_b
         col_d_val = row.iloc[3]
@@ -289,7 +300,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
         active_tipplers_row = []
         explicit_wagon_counts = {}
         tippler_objs = {}
-        
         total_wagons_unloaded = 0
 
         for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
@@ -335,6 +345,13 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
             last_seq_tuple = (seq, rid)
 
         if is_pending:
+            # GHOST RAKE FILTER: Ignore incomplete rakes older than 5 days
+            now_dt = datetime.now(IST)
+            if pd.notnull(arrival_dt):
+                days_old = (now_dt - arrival_dt).days
+                if days_old > 5:
+                    continue # Safely skip this old broken data
+
             rem_wagons = wagons - total_wagons_unloaded
             unplanned_actuals.append({
                 'Rake': rake_name,  
@@ -434,7 +451,6 @@ def fetch_google_sheet_actuals_multitab(url, free_time_hours):
 
 def calculate_generic_finish(wagons, target_tipplers, ready_time, tippler_state, downtime_list, 
                            rates, wagons_first_batch, inter_tippler_delay):
-    # SAFESHIELD: Enforce valid integer logic so timedelta cannot crash
     try:
         wagons = int(float(wagons))
         if math.isnan(wagons) or wagons <= 0: return ready_time, "", ready_time, {}, timedelta(0), {}
@@ -519,6 +535,9 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         wagon_col = find_column(df, ['TOTL UNTS', 'WAGONS', 'UNITS', 'TOTAL UNITS'])
         if wagon_col: df['wagon_count'] = df[wagon_col].apply(parse_wagons)
         else: df['wagon_count'] = 58 
+        
+        # EXTRACT RAKE NAME FROM CSV IF AVAILABLE
+        rake_col = find_column(df, ['RAKE', 'RAKE NAME', 'RAKE NO', 'TRAIN'])
         src_col = find_column(df, ['STTS FROM', 'STTN FROM', 'FROM_STN', 'SRC', 'SOURCE', 'FROM'])
         arvl_col = find_column(df, ['EXPD ARVLTIME', 'ARRIVAL TIME', 'EXPECTED ARRIVAL'])
         stts_time_col = find_column(df, ['STTS TIME'])
@@ -541,7 +560,11 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             for _, row in df.iterrows():
                 if row['arrival_dt'].floor('min') in existing_times: continue 
                 l_type = row.get(load_col, 'BOXN') if load_col else 'BOXN'
+                csv_rake_name = str(row[rake_col]).strip() if rake_col else ""
+                if csv_rake_name.lower() == 'nan': csv_rake_name = ""
+                
                 to_plan.append({
+                    'Rake': csv_rake_name,
                     'Coal Source': row.get(src_col, '') if src_col else '',
                     'Load Type': l_type,
                     'Wagons': row['wagon_count'],
@@ -594,26 +617,29 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     assignments = []
 
     for _, rake in plan_df.iterrows():
-        orig_name = str(rake.get('Rake', ''))
+        orig_name = str(rake.get('Rake', '')).strip()
         is_gs = rake.get('is_gs_unplanned', False)
         is_pending_actual = rake.get('is_pending_actual', False)
         
-        # Enforce valid numbers for wagons calculation
+        # PREVENT RENAMING G-SHEET RAKES
+        if is_gs:
+            display_name = orig_name if orig_name else "Unknown G-Sheet Rake"
+            s, i = parse_last_sequence(display_name)
+            if s > 0: curr_seq, curr_id = s, i
+        else:
+            if orig_name and orig_name.lower() != 'nan':
+                display_name = orig_name
+            else:
+                curr_seq += 1
+                curr_id += 1
+                display_name = f"{curr_seq}/{curr_id}"
+
         raw_wag = rake.get('_rem_wagons', rake['Wagons'])
         try:
             wagons_to_sim = int(float(raw_wag))
             if math.isnan(wagons_to_sim): wagons_to_sim = 0
         except:
             wagons_to_sim = 0
-        
-        if is_gs and '/' in orig_name:
-            display_name = orig_name
-            s, i = parse_last_sequence(display_name)
-            if s > 0: curr_seq, curr_id = s, i
-        else:
-            curr_seq += 1
-            curr_id += 1
-            display_name = f"{curr_seq}/{curr_id}"
         
         is_bobr = 'BOBR' in str(rake['Load Type']).upper()
 
