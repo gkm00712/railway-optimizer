@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 from datetime import timedelta, datetime
@@ -236,7 +235,7 @@ def parse_demurrage_special(cell_val):
     return "00:00"
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (FETCH ALL + STORE HIDDEN DT OBJECTS)
+# 3. GOOGLE SHEET PARSER
 # ==========================================
 
 def safe_parse_date(val):
@@ -584,10 +583,24 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     curr_id = last_seq_tuple[1]
     assignments = []
 
+    # ==========================================
+    # PRE-SCAN FOR RESERVED RAKE NUMBERS
+    # ==========================================
+    reserved_sequences = set()
+    for _, rake in plan_df.iterrows():
+        if rake.get('is_gs_unplanned', False) and '/' in str(rake.get('Rake', '')):
+            s, i = parse_last_sequence(str(rake.get('Rake', '')))
+            if s > 0:
+                reserved_sequences.add((s, i))
+    # ==========================================
+
     for _, rake in plan_df.iterrows():
         orig_name = str(rake.get('Rake', ''))
         is_gs = rake.get('is_gs_unplanned', False)
         
+        # ==========================================
+        # UPDATED: COLLISION-AWARE NAMING LOGIC
+        # ==========================================
         if is_gs and '/' in orig_name:
             display_name = orig_name
             s, i = parse_last_sequence(display_name)
@@ -595,7 +608,13 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         else:
             curr_seq += 1
             curr_id += 1
+            
+            # The look-ahead check
+            while (curr_seq, curr_id) in reserved_sequences:
+                curr_id += 1
+                
             display_name = f"{curr_seq}/{curr_id}"
+        # ==========================================
         
         is_bobr = 'BOBR' in str(rake['Load Type']).upper()
 
