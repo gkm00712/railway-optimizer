@@ -574,7 +574,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                             if t in used_list and end_val > tippler_state[t]:
                                 tippler_state[t] = end_val
 
-    line_groups = {
+   line_groups = {
         'Group_Lines_8_10': {'capacity': 2, 'clearance_mins': 50, 'line_free_times': []},
         'Group_Line_11': {'capacity': 1, 'clearance_mins': 100, 'line_free_times': []}
     }
@@ -583,10 +583,24 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     curr_id = last_seq_tuple[1]
     assignments = []
 
+    # ==========================================
+    # NEW: PRE-SCAN FOR RESERVED RAKE NUMBERS
+    # ==========================================
+    reserved_sequences = set()
     for _, rake in plan_df.iterrows():
+        if rake.get('is_gs_unplanned', False) and '/' in str(rake.get('Rake', '')):
+            s, i = parse_last_sequence(str(rake.get('Rake', '')))
+            if s > 0:
+                reserved_sequences.add((s, i))
+    # ==========================================
+
+  for _, rake in plan_df.iterrows():
         orig_name = str(rake.get('Rake', ''))
         is_gs = rake.get('is_gs_unplanned', False)
         
+        # ==========================================
+        # UPDATED: COLLISION-AWARE NAMING LOGIC
+        # ==========================================
         if is_gs and '/' in orig_name:
             display_name = orig_name
             s, i = parse_last_sequence(display_name)
@@ -594,12 +608,15 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         else:
             curr_seq += 1
             curr_id += 1
+            
+            # The look-ahead check
+            while (curr_seq, curr_id) in reserved_sequences:
+                curr_id += 1
+                
             display_name = f"{curr_seq}/{curr_id}"
+        # ==========================================
         
         is_bobr = 'BOBR' in str(rake['Load Type']).upper()
-
-        if is_bobr:
-            row_data = {
                 'Rake': display_name,
                 'Coal Source': rake['Coal Source'],
                 'Load Type': rake['Load Type'],
@@ -939,3 +956,4 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     
                     hist_raw_clean = hist_raw.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"], errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
+
