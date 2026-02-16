@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. PAGE CONFIGURATION & INPUTS
 # ==========================================
-st.set_page_config(page_title="Railway Logic Optimizer (IST)", layout="wide")
+st.set_page_config(page_title="Railway Logic Optimizer (IST)", layout="wide", page_icon="🚆")
 st.title("🚂 BOXN & BOBR Rake Logistics Dashboard (IST)")
 
 IST = pytz.timezone('Asia/Kolkata')
@@ -959,3 +959,4 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     
                     hist_raw_clean = hist_raw.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"], errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
+
