@@ -331,15 +331,15 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             if curr_header and curr_lines:
                 parsed_blocks.append((curr_header, " ".join(curr_lines)))
 
-            # Build the grouped string: [Rake Name] - Dept: Reason \n\n Dept2: Reason2
+            # Build the grouped string: [Rake Name] - Dept: Reason, Dept2: Reason2
             if parsed_blocks:
                 dept_strings = []
                 for dept, r_text in parsed_blocks:
                     std_dept = classify_reason(dept) if dept not in known_depts else classify_reason(dept)
                     dept_strings.append(f"{std_dept}: {r_text}")
                 
-                # Double newline creates the gap between departments of the same rake
-                full_remarks_blob = f"[{rake_name}] - " + "\n\n".join(dept_strings)
+                # A comma and a space creates a clean, continuous sentence
+                full_remarks_blob = f"[{rake_name}] - " + ", ".join(dept_strings)
             else:
                 full_remarks_blob = ""
             # ==========================================
@@ -990,6 +990,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
+
 
 
 
