@@ -9,7 +9,7 @@ import re
 # ==========================================
 # 1. PAGE CONFIGURATION & INPUTS
 # ==========================================
-st.set_page_config(page_title="Railway Logic Optimizer (IST)", layout="wide", page_icon="🚆")
+st.set_page_config(page_title="Railway Logic Optimizer (IST)", layout="wide")
 st.title("🚂 BOXN & BOBR Rake Logistics Dashboard (IST)")
 
 IST = pytz.timezone('Asia/Kolkata')
@@ -18,10 +18,13 @@ IST = pytz.timezone('Asia/Kolkata')
 st.sidebar.header("⚙️ Settings")
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
 
-show_history = st.sidebar.checkbox("Show All Historical Data", value=False, help="Check this to see old completed rakes")
+st.sidebar.markdown("---")
+st.sidebar.subheader("📅 Data Limits (Tab 2)")
+history_start_date = st.sidebar.date_input("Load History From", value=datetime(2026, 1, 1).date())
 
 st.sidebar.markdown("---")
 sim_params = {}
+sim_params['history_start'] = history_start_date
 sim_params['rt1'] = st.sidebar.number_input("Tippler 1 Rate", value=6.0, step=0.5)
 sim_params['rt2'] = st.sidebar.number_input("Tippler 2 Rate", value=6.0, step=0.5)
 sim_params['rt3'] = st.sidebar.number_input("Tippler 3 Rate", value=9.0, step=0.5)
@@ -90,15 +93,23 @@ def format_dt(dt):
     if dt.tzinfo is None: dt = IST.localize(dt)
     return dt.strftime('%d-%H:%M')
 
-def parse_dt_from_str(dt_str, year_ref):
+def parse_dt_from_str(dt_str, ref_dt):
     try:
         if not dt_str: return pd.NaT
         parts = dt_str.split('-')
         day = int(parts[0])
         hm = parts[1].split(':')
         h, m = int(hm[0]), int(hm[1])
-        dt = datetime(year_ref, datetime.now().month, day, h, m)
-        return IST.localize(dt)
+        
+        dt = datetime(ref_dt.year, ref_dt.month, day, h, m)
+        dt = IST.localize(dt)
+        
+        if (dt - ref_dt).days < -10:
+            if ref_dt.month == 12:
+                dt = dt.replace(year=ref_dt.year + 1, month=1)
+            else:
+                dt = dt.replace(month=ref_dt.month + 1)
+        return dt
     except: return pd.NaT
 
 def format_duration_hhmm(delta):
@@ -247,7 +258,7 @@ def safe_parse_date(val):
     except: return pd.NaT
 
 @st.cache_data(ttl=60)
-def fetch_google_sheet_actuals(url, free_time_hours):
+def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
     try:
         df_gs = pd.read_csv(url, header=None, skiprows=1) 
         if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), (0,0)
@@ -255,8 +266,7 @@ def fetch_google_sheet_actuals(url, free_time_hours):
         locked_actuals = []
         unplanned_actuals = [] 
         
-        today_date = datetime.now(IST).date()
-        yesterday_date = today_date - timedelta(days=1)
+        dynamic_cutoff = IST.localize(datetime.combine(cutoff_date_input, datetime.min.time()))
         last_seq_tuple = (0, 0)
 
         for i in range(len(df_gs)):
@@ -269,7 +279,9 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
-            # --- START LOOK-AHEAD FOR REASONS ---
+            if arrival_dt < dynamic_cutoff:
+                continue 
+            
             dept_val = str(row.iloc[11]).strip()
             if dept_val.lower() in ['nan', '', 'none']: dept_val = ""
             
@@ -286,7 +298,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 full_remarks_blob = f"{dept_val}|{reason_detail}"
             else:
                 full_remarks_blob = ""
-            # ---------------------------
 
             rake_name = val_b
             col_d_val = row.iloc[3]
@@ -300,7 +311,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
             active_tipplers_row = []
             explicit_wagon_counts = {}
             
-            # Store REAL Objects
             tippler_objs = {} 
 
             for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
@@ -312,8 +322,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                         if pd.notnull(start_dt):
                             ts = start_dt
                             te = end_dt if pd.notnull(end_dt) else start_dt + timedelta(hours=2)
-                    elif pd.isnull(ts) and pd.notnull(start_dt):
-                        pass
 
                     if pd.notnull(ts):
                         active_tipplers_row.append(t_name)
@@ -321,7 +329,6 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                         tippler_timings[f"{t_name} End"] = format_dt(te)
                         tippler_timings[f"{t_name}_Obj_End"] = te
                         
-                        # SAVE REAL DATETIME OBJECTS
                         tippler_objs[f"{t_name}_Start_Obj"] = ts
                         tippler_objs[f"{t_name}_End_Obj"] = te
                         
@@ -407,9 +414,8 @@ def fetch_google_sheet_actuals(url, free_time_hours):
                 '_raw_tipplers': active_tipplers_row,
                 '_remarks': full_remarks_blob
             }
-            # Inject Hidden Timings
             for t, obj in tippler_objs.items():
-                entry[t] = obj # e.g. T1_Start_Obj
+                entry[t] = obj 
 
             for t in ['T1', 'T2', 'T3', 'T4']:
                 entry[f"{t} Start"] = tippler_timings.get(f"{t} Start", "")
@@ -522,7 +528,10 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             else:
                 df['arrival_dt'] = df['exp_arrival_dt']
             
-            df = df.dropna(subset=['arrival_dt']).sort_values('arrival_dt')
+            csv_cutoff_date = params.get('history_start', datetime(2026, 1, 1).date())
+            dynamic_csv_cutoff = IST.localize(datetime.combine(csv_cutoff_date, datetime.min.time()))
+            df = df.dropna(subset=['arrival_dt'])
+            df = df[df['arrival_dt'] >= dynamic_csv_cutoff].sort_values('arrival_dt')
 
             existing_times = set()
             if not df_locked.empty: existing_times.update(df_locked['_Arrival_DT'].dt.floor('min'))
@@ -583,24 +592,17 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     curr_id = last_seq_tuple[1]
     assignments = []
 
-    # ==========================================
-    # PRE-SCAN FOR RESERVED RAKE NUMBERS
-    # ==========================================
     reserved_sequences = set()
     for _, rake in plan_df.iterrows():
         if rake.get('is_gs_unplanned', False) and '/' in str(rake.get('Rake', '')):
             s, i = parse_last_sequence(str(rake.get('Rake', '')))
             if s > 0:
                 reserved_sequences.add((s, i))
-    # ==========================================
 
     for _, rake in plan_df.iterrows():
         orig_name = str(rake.get('Rake', ''))
         is_gs = rake.get('is_gs_unplanned', False)
         
-        # ==========================================
-        # UPDATED: COLLISION-AWARE NAMING LOGIC
-        # ==========================================
         if is_gs and '/' in orig_name:
             display_name = orig_name
             s, i = parse_last_sequence(display_name)
@@ -608,13 +610,9 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         else:
             curr_seq += 1
             curr_id += 1
-            
-            # The look-ahead check
             while (curr_seq, curr_id) in reserved_sequences:
                 curr_id += 1
-                
             display_name = f"{curr_seq}/{curr_id}"
-        # ==========================================
         
         is_bobr = 'BOBR' in str(rake['Load Type']).upper()
 
@@ -722,7 +720,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         
         final_df_display = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
         # FULL HISTORY FOR TAB 2
-        final_df_all = pd.concat([df_locked.drop(columns=cols_to_drop, errors='ignore'), df_sim], ignore_index=True)
+        final_df_all = pd.concat([df_locked, df_sim], ignore_index=True)
     else:
         final_df_display = df_sim
         final_df_all = df_sim
@@ -764,26 +762,22 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             if dept_part:
                 dept_code = classify_reason(dept_part)
                 final_text = reason_part if reason_part else dept_part
-                # UPDATED FORMAT: [Rake] - Reason (Dept)
                 formatted_reason = f"[{rake_name}] - {final_text} ({dept_code})"
                 daily_stats[d_str]['All_Reasons'].add(formatted_reason)
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
         
-        current_year = datetime.now().year
         for t in ['T1', 'T2', 'T3', 'T4']:
-            # Use HIDDEN OBJECTS first!
             s_dt = row.get(f"{t}_Start_Obj", pd.NaT)
             e_dt = row.get(f"{t}_End_Obj", pd.NaT)
             
-            # Fallback to string parsing ONLY if objects missing (e.g. simulation rows)
             if pd.isnull(s_dt) or pd.isnull(e_dt):
                 start_str = str(row.get(f"{t} Start", ""))
                 end_str = str(row.get(f"{t} End", ""))
                 if start_str and end_str:
-                    s_dt = parse_dt_from_str(start_str, current_year)
-                    e_dt = parse_dt_from_str(end_str, current_year)
+                    s_dt = parse_dt_from_str(start_str, arr_dt)
+                    e_dt = parse_dt_from_str(end_str, arr_dt)
             
             if pd.notnull(s_dt) and pd.notnull(e_dt):
                 if e_dt < s_dt: e_dt += timedelta(days=1)
@@ -823,7 +817,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
     output_rows = []
     for d, v in sorted(daily_stats.items()):
         reasons_set = v['All_Reasons']
-        # JOIN WITH NEWLINE
         major_reasons_str = "\n".join(sorted(reasons_set)) if reasons_set else "-"
 
         row = {
@@ -861,7 +854,7 @@ if gs_url and ('last_gs_url' not in st.session_state or st.session_state.last_gs
 if input_changed or 'raw_data_cached' not in st.session_state:
     actuals_df, unplanned_df, last_seq = pd.DataFrame(), pd.DataFrame(), (0,0)
     if gs_url:
-        actuals_df, unplanned_df, last_seq = fetch_google_sheet_actuals(gs_url, sim_params['ft'])
+        actuals_df, unplanned_df, last_seq = fetch_google_sheet_actuals(gs_url, sim_params['ft'], history_start_date)
     st.session_state.actuals_df = actuals_df
     st.session_state.unplanned_df = unplanned_df
     st.session_state.last_seq = last_seq
@@ -957,6 +950,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     
                     hist_raw = hist_raw[hist_raw['Demurrage'].apply(has_demurrage)]
                     
-                    hist_raw_clean = hist_raw.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"], errors='ignore')
+                    cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
+                    hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
-
