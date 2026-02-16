@@ -282,13 +282,17 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             if arrival_dt < dynamic_cutoff:
                 continue 
             
+            rake_name = val_b
+            col_d_val = row.iloc[3]
+            wagons, load_type = parse_col_d_wagon_type(col_d_val)
+
             # ==========================================
             # UPDATED: DYNAMIC DEMURRAGE REASON PARSER
             # ==========================================
-            reasons_list = []
+            raw_texts = []
             curr_reason = str(row.iloc[11]).strip()
-            if curr_reason and curr_reason.lower() not in ['nan', 'none']:
-                reasons_list.append(curr_reason)
+            if curr_reason and curr_reason.lower() not in ['nan', 'none', '']:
+                raw_texts.append(curr_reason)
                 
             # Scan down column L until a new rake appears in Column B
             j = i + 1
@@ -299,20 +303,38 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                 
                 next_reason = str(df_gs.iloc[j, 11]).strip()
                 if next_reason and next_reason.lower() not in ['nan', 'none', '']:
-                    reasons_list.append(next_reason)
+                    raw_texts.append(next_reason)
                 j += 1
-                
-            if len(reasons_list) > 0:
-                dept_val = reasons_list[0]
-                reason_detail = " ".join(reasons_list[1:]) if len(reasons_list) > 1 else ""
-                full_remarks_blob = f"{dept_val}|{reason_detail}" if reason_detail else dept_val
-            else:
-                full_remarks_blob = ""
-            # ==========================================
 
-            rake_name = val_b
-            col_d_val = row.iloc[3]
-            wagons, load_type = parse_col_d_wagon_type(col_d_val)
+            parsed_blocks = []
+            curr_header = None
+            curr_lines = []
+            
+            known_depts = ['MM', 'MECH', 'MECHANICAL', 'C&I', 'CNI', 'EMD', 'ELEC', 'ELECTRICAL', 'C&W', 'WAGON', 'MGR', 'CHEM', 'CHEMISTRY', 'OPR', 'OPER', 'OPERATIONS']
+            
+            for text in raw_texts:
+                t_upper = text.strip().upper()
+                
+                if t_upper in known_depts:
+                    if curr_header and curr_lines:
+                        parsed_blocks.append((curr_header, " ".join(curr_lines)))
+                    curr_header = t_upper
+                    curr_lines = []
+                else:
+                    if curr_header is None:
+                        curr_header = classify_reason(text)
+                    curr_lines.append(text.strip())
+                    
+            # Capture the last block
+            if curr_header and curr_lines:
+                parsed_blocks.append((curr_header, " ".join(curr_lines)))
+
+            # Format the output into a crisp list of strings for this rake
+            remarks_list = []
+            for dept, r_text in parsed_blocks:
+                std_dept = classify_reason(dept) if dept not in known_depts else classify_reason(dept)
+                remarks_list.append(f"[{rake_name}] - {std_dept}: {r_text}")
+            # ==========================================
 
             start_dt = safe_parse_date(row.iloc[5])
             end_dt = safe_parse_date(row.iloc[6])
@@ -363,7 +385,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                     'Optimization Type': 'Auto-Planned (G-Sheet)',
                     'Extra Shunt (Mins)': 0,
                     'is_gs_unplanned': True,
-                    '_remarks': full_remarks_blob
+                    '_remarks': remarks_list
                 })
                 continue 
 
@@ -423,7 +445,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                 '_raw_tipplers_data': tippler_timings,
                 '_raw_wagon_counts': wagon_counts_map,
                 '_raw_tipplers': active_tipplers_row,
-                '_remarks': full_remarks_blob
+                '_remarks': remarks_list
             }
             for t, obj in tippler_objs.items():
                 entry[t] = obj 
@@ -560,7 +582,8 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                     '_Form_Mins': 0,
                     'Optimization Type': 'Forecast',
                     'Extra Shunt (Mins)': 0,
-                    'is_csv': True 
+                    'is_csv': True,
+                    '_remarks': [] 
                 })
 
     plan_df = pd.DataFrame(to_plan)
@@ -614,24 +637,18 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         orig_name = str(rake.get('Rake', ''))
         is_gs = rake.get('is_gs_unplanned', False)
         
-        # ==========================================
-        # UPDATED: BACKLOG & COLLISION NAMING LOGIC
-        # ==========================================
         if is_gs and '/' in orig_name:
             display_name = orig_name
             s, i = parse_last_sequence(display_name)
-            # Push counters to absolute maximums, ensuring they NEVER decrement
             if s > curr_seq or (s == curr_seq and i > curr_id):
                 curr_seq, curr_id = s, i
         else:
             curr_seq += 1
             curr_id += 1
-            # Force uniqueness if somehow reserved
             while (curr_seq, curr_id) in reserved_sequences:
                 curr_id += 1
             display_name = f"{curr_seq}/{curr_id}"
             reserved_sequences.add((curr_seq, curr_id))
-        # ==========================================
         
         is_bobr = 'BOBR' in str(rake['Load Type']).upper()
 
@@ -657,7 +674,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                 'Total Duration': "",
                 'Demurrage': "00:00",
                 '_raw_wagon_counts': {},
-                '_remarks': ""
+                '_remarks': []
             }
             for t in ['T1', 'T2', 'T3', 'T4']:
                  row_data[f"{t} Start"] = ""; row_data[f"{t} End"] = ""; row_data[f"{t} Idle"] = ""
@@ -713,7 +730,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             'Total Duration': format_duration_hhmm(tot_dur_final),
             'Demurrage': dem_str,
             '_raw_wagon_counts': best_wag,
-            '_remarks': rake.get('_remarks', "")
+            '_remarks': rake.get('_remarks', [])
         }
         for t in ['T1', 'T2', 'T3', 'T4']:
              row_data[f"{t} Start"] = format_dt(best_timings.get(f"{t}_Start", pd.NaT))
@@ -771,18 +788,12 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         daily_stats[d_str]['Demurrage'] += dem_hrs
         
         if dem_hrs > 0:
-            rem = str(row.get('_remarks', '')).strip()
-            rake_name = str(row.get('Rake', 'Unknown'))
-            if '|' in rem:
-                dept_part, reason_part = rem.split('|', 1)
-            else:
-                dept_part, reason_part = rem, ""
-            
-            if dept_part:
-                dept_code = classify_reason(dept_part)
-                final_text = reason_part if reason_part else dept_part
-                formatted_reason = f"[{rake_name}] - {final_text} ({dept_code})"
-                daily_stats[d_str]['All_Reasons'].add(formatted_reason)
+            rems = row.get('_remarks', [])
+            if isinstance(rems, list):
+                for r in rems:
+                    daily_stats[d_str]['All_Reasons'].add(r)
+            elif isinstance(rems, str) and rems.strip():
+                daily_stats[d_str]['All_Reasons'].add(rems.strip())
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
@@ -836,7 +847,9 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
     output_rows = []
     for d, v in sorted(daily_stats.items()):
         reasons_set = v['All_Reasons']
-        major_reasons_str = "\n".join(sorted(reasons_set)) if reasons_set else "-"
+        
+        # This double-newline join creates the physical visual gap between reasons
+        major_reasons_str = "\n\n".join(sorted(reasons_set)) if reasons_set else "-"
 
         row = {
             'Date': d, 
