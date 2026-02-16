@@ -282,22 +282,33 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             if arrival_dt < dynamic_cutoff:
                 continue 
             
-            dept_val = str(row.iloc[11]).strip()
-            if dept_val.lower() in ['nan', '', 'none']: dept_val = ""
-            
-            reason_detail = ""
-            if i + 1 < len(df_gs):
-                next_row = df_gs.iloc[i + 1]
-                next_rake_name = str(next_row.iloc[1]).strip()
-                if not next_rake_name or next_rake_name.lower() == 'nan':
-                    reason_val = str(next_row.iloc[11]).strip()
-                    if reason_val.lower() not in ['nan', '', 'none']:
-                        reason_detail = reason_val
-            
-            if dept_val and reason_detail:
-                full_remarks_blob = f"{dept_val}|{reason_detail}"
+            # ==========================================
+            # UPDATED: DYNAMIC DEMURRAGE REASON PARSER
+            # ==========================================
+            reasons_list = []
+            curr_reason = str(row.iloc[11]).strip()
+            if curr_reason and curr_reason.lower() not in ['nan', 'none']:
+                reasons_list.append(curr_reason)
+                
+            # Scan down column L until a new rake appears in Column B
+            j = i + 1
+            while j < len(df_gs):
+                next_rake_name = str(df_gs.iloc[j, 1]).strip()
+                if next_rake_name and next_rake_name.lower() not in ['nan', 'none', '']:
+                    break
+                
+                next_reason = str(df_gs.iloc[j, 11]).strip()
+                if next_reason and next_reason.lower() not in ['nan', 'none', '']:
+                    reasons_list.append(next_reason)
+                j += 1
+                
+            if len(reasons_list) > 0:
+                dept_val = reasons_list[0]
+                reason_detail = " ".join(reasons_list[1:]) if len(reasons_list) > 1 else ""
+                full_remarks_blob = f"{dept_val}|{reason_detail}" if reason_detail else dept_val
             else:
                 full_remarks_blob = ""
+            # ==========================================
 
             rake_name = val_b
             col_d_val = row.iloc[3]
@@ -603,16 +614,24 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         orig_name = str(rake.get('Rake', ''))
         is_gs = rake.get('is_gs_unplanned', False)
         
+        # ==========================================
+        # UPDATED: BACKLOG & COLLISION NAMING LOGIC
+        # ==========================================
         if is_gs and '/' in orig_name:
             display_name = orig_name
             s, i = parse_last_sequence(display_name)
-            if s > 0: curr_seq, curr_id = s, i
+            # Push counters to absolute maximums, ensuring they NEVER decrement
+            if s > curr_seq or (s == curr_seq and i > curr_id):
+                curr_seq, curr_id = s, i
         else:
             curr_seq += 1
             curr_id += 1
+            # Force uniqueness if somehow reserved
             while (curr_seq, curr_id) in reserved_sequences:
                 curr_id += 1
             display_name = f"{curr_seq}/{curr_id}"
+            reserved_sequences.add((curr_seq, curr_id))
+        # ==========================================
         
         is_bobr = 'BOBR' in str(rake['Load Type']).upper()
 
