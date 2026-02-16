@@ -287,7 +287,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             wagons, load_type = parse_col_d_wagon_type(col_d_val)
 
             # ==========================================
-            # UPDATED: DYNAMIC DEMURRAGE REASON PARSER
+            # UPDATED: GROUPED DEMURRAGE REASON PARSER
             # ==========================================
             raw_texts = []
             curr_reason = str(row.iloc[11]).strip()
@@ -316,8 +316,10 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                 t_upper = text.strip().upper()
                 
                 if t_upper in known_depts:
+                    # If a previous department had actual lines of text below it, save it
                     if curr_header and curr_lines:
                         parsed_blocks.append((curr_header, " ".join(curr_lines)))
+                    # Start the new department, reset the lines
                     curr_header = t_upper
                     curr_lines = []
                 else:
@@ -325,15 +327,21 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                         curr_header = classify_reason(text)
                     curr_lines.append(text.strip())
                     
-            # Capture the last block
+            # Capture the last block (but ONLY if it actually has text lines under it)
             if curr_header and curr_lines:
                 parsed_blocks.append((curr_header, " ".join(curr_lines)))
 
-            # Format the output into a crisp list of strings for this rake
-            remarks_list = []
-            for dept, r_text in parsed_blocks:
-                std_dept = classify_reason(dept) if dept not in known_depts else classify_reason(dept)
-                remarks_list.append(f"[{rake_name}] - {std_dept}: {r_text}")
+            # Build the grouped string: [Rake Name] - Dept: Reason \n\n Dept2: Reason2
+            if parsed_blocks:
+                dept_strings = []
+                for dept, r_text in parsed_blocks:
+                    std_dept = classify_reason(dept) if dept not in known_depts else classify_reason(dept)
+                    dept_strings.append(f"{std_dept}: {r_text}")
+                
+                # Double newline creates the gap between departments of the same rake
+                full_remarks_blob = f"[{rake_name}] - " + "\n\n".join(dept_strings)
+            else:
+                full_remarks_blob = ""
             # ==========================================
 
             start_dt = safe_parse_date(row.iloc[5])
@@ -385,7 +393,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                     'Optimization Type': 'Auto-Planned (G-Sheet)',
                     'Extra Shunt (Mins)': 0,
                     'is_gs_unplanned': True,
-                    '_remarks': remarks_list
+                    '_remarks': full_remarks_blob
                 })
                 continue 
 
@@ -445,7 +453,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                 '_raw_tipplers_data': tippler_timings,
                 '_raw_wagon_counts': wagon_counts_map,
                 '_raw_tipplers': active_tipplers_row,
-                '_remarks': remarks_list
+                '_remarks': full_remarks_blob
             }
             for t, obj in tippler_objs.items():
                 entry[t] = obj 
@@ -583,7 +591,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                     'Optimization Type': 'Forecast',
                     'Extra Shunt (Mins)': 0,
                     'is_csv': True,
-                    '_remarks': [] 
+                    '_remarks': "" 
                 })
 
     plan_df = pd.DataFrame(to_plan)
@@ -674,7 +682,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
                 'Total Duration': "",
                 'Demurrage': "00:00",
                 '_raw_wagon_counts': {},
-                '_remarks': []
+                '_remarks': ""
             }
             for t in ['T1', 'T2', 'T3', 'T4']:
                  row_data[f"{t} Start"] = ""; row_data[f"{t} End"] = ""; row_data[f"{t} Idle"] = ""
@@ -730,7 +738,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             'Total Duration': format_duration_hhmm(tot_dur_final),
             'Demurrage': dem_str,
             '_raw_wagon_counts': best_wag,
-            '_remarks': rake.get('_remarks', [])
+            '_remarks': rake.get('_remarks', "")
         }
         for t in ['T1', 'T2', 'T3', 'T4']:
              row_data[f"{t} Start"] = format_dt(best_timings.get(f"{t}_Start", pd.NaT))
@@ -788,12 +796,9 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         daily_stats[d_str]['Demurrage'] += dem_hrs
         
         if dem_hrs > 0:
-            rems = row.get('_remarks', [])
-            if isinstance(rems, list):
-                for r in rems:
-                    daily_stats[d_str]['All_Reasons'].add(r)
-            elif isinstance(rems, str) and rems.strip():
-                daily_stats[d_str]['All_Reasons'].add(rems.strip())
+            rem = str(row.get('_remarks', '')).strip()
+            if rem:
+                daily_stats[d_str]['All_Reasons'].add(rem)
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
@@ -848,8 +853,8 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
     for d, v in sorted(daily_stats.items()):
         reasons_set = v['All_Reasons']
         
-        # This double-newline join creates the physical visual gap between reasons
-        major_reasons_str = "\n".join(sorted(reasons_set)) if reasons_set else "-"
+        # This separates entirely different rakes on the same day with a strong divider
+        major_reasons_str = "\n\n----------\n\n".join(sorted(reasons_set)) if reasons_set else "-"
 
         row = {
             'Date': d, 
@@ -985,4 +990,3 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
-
