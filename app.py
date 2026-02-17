@@ -310,7 +310,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             curr_header = None
             curr_lines = []
             
-            known_depts = ['MM', 'MECH', 'MECHANICAL', 'C&I', 'CNI', 'EMD', 'ELEC', 'ELECTRICAL', 'C&W', 'WAGON', 'MGR', 'CHEM', 'CHEMISTRY', 'OPR', 'OPER', 'OPERATIONS']
+            known_depts = ['MM',  'C&I', 'EMD', 'MGR', 'CHEMISTRY', 'OPR','OTHERS,]
             
             for text in raw_texts:
                 t_upper = text.strip().upper()
@@ -990,3 +990,4 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
+
