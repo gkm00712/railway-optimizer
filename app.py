@@ -220,8 +220,8 @@ def classify_reason(reason_text):
     chem_keys = ['CHEM', 'CHEMISTRY', 'LAB', 'QUALITY', 'SAMPLE', 'ASH', 'MOISTURE']
     opr_keys = ['OPR', 'OPER', 'OPERATIONS', 'CREW', 'SHIFT', 'MANPOWER', 'BUNKER', 'FULL', 'WAIT']
 
-    if any(k in txt for k in mm_keys): return "mm"
-    if any(k in txt for k in emd_keys): return "EMD"
+    if any(k in txt for k in mm_keys): return "Mechanical"
+    if any(k in txt for k in emd_keys): return "Electrical"
     if any(k in txt for k in cni_keys): return "C&I"
     if any(k in txt for k in rs_keys): return "Rolling Stock"
     if any(k in txt for k in mgr_keys): return "MGR"
@@ -310,7 +310,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             curr_header = None
             curr_lines = []
             
-            known_depts = ['MM',  'C&I', 'EMD', 'MGR', 'CHEMISTRY', 'OPR','OTHERS,]
+            known_depts = ['MM', 'MECH', 'MECHANICAL', 'C&I', 'CNI', 'EMD', 'ELEC', 'ELECTRICAL', 'C&W', 'WAGON', 'MGR', 'CHEM', 'CHEMISTRY', 'OPR', 'OPER', 'OPERATIONS']
             
             for text in raw_texts:
                 t_upper = text.strip().upper()
@@ -318,7 +318,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                 if t_upper in known_depts:
                     if curr_header and curr_lines:
                         parsed_blocks.append((curr_header, " ".join(curr_lines)))
-                    curr_header = t_upper
+                    curr_header = text.strip()  # Keeps the exact text as written in Col L
                     curr_lines = []
                 else:
                     if curr_header is None:
@@ -332,8 +332,8 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             if parsed_blocks:
                 dept_strings = []
                 for dept, r_text in parsed_blocks:
-                    std_dept = classify_reason(dept) if dept not in known_depts else classify_reason(dept)
-                    dept_strings.append(f"{std_dept}: {r_text}")
+                    # Append the exact department written instead of the standardized class
+                    dept_strings.append(f"{dept}: {r_text}")
                 
                 full_remarks_blob = f"[{rake_name}] - " + ", ".join(dept_strings)
             else:
@@ -852,7 +852,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         reasons_set = v['All_Reasons']
         
         if reasons_set:
-            major_reasons_str = "\n-----\n\n".join(sorted(reasons_set))
+            major_reasons_str = "\n\n----------\n\n".join(sorted(reasons_set))
         else:
             major_reasons_str = "-"
 
@@ -944,6 +944,8 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             yest_date = datetime.now(IST).date() - timedelta(days=1)
             daily_stats_df = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=yest_date)
             st.markdown("### 📊 Daily Performance & Demurrage Forecast")
+            
+            # Using native Streamlit Dataframe to restore sort/scroll interactivity
             st.dataframe(daily_stats_df, hide_index=True)
             
             st.download_button("📥 Download Final Report", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
@@ -974,6 +976,8 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             if start_f and end_f:
                 hist_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_f, end_filter_dt=end_f)
                 st.markdown(f"**Performance Summary ({start_f} to {end_f})**")
+                
+                # Using native Streamlit Dataframe to restore sort/scroll interactivity
                 st.dataframe(hist_stats, hide_index=True, use_container_width=True)
                 
                 st.markdown("---")
@@ -990,5 +994,3 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
-
-
