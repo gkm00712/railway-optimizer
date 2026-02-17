@@ -371,9 +371,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                         
                         if wc is not None: explicit_wagon_counts[t_name] = wc
 
-            # ==========================================
-            # UPDATED: PENDING TRIGGER (BASED ON COL H)
-            # ==========================================
             col_h_dt = safe_parse_date(row.iloc[7])
             is_unplanned = pd.isnull(col_h_dt) 
             
@@ -395,9 +392,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                     'is_gs_unplanned': True,
                     '_remarks': full_remarks_blob
                 })
-                # Skips adding to locked_actuals so it can be simulated natively
                 continue 
-            # ==========================================
 
             t_str_list = []
             wagon_counts_map = {}
@@ -852,18 +847,12 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                     curr = segment_end
 
     output_rows = []
-    # High contrast colors for both Light and Dark themes
-    colors = ["#00BFFF", "#FF8C00"] # DeepSkyBlue and DarkOrange
     
     for d, v in sorted(daily_stats.items()):
         reasons_set = v['All_Reasons']
         
         if reasons_set:
-            colored_reasons = []
-            for idx, r in enumerate(sorted(reasons_set)):
-                c = colors[idx % 2]
-                colored_reasons.append(f'<div style="color:{c}; font-weight:600; padding-bottom:8px;">{r}</div>')
-            major_reasons_str = "".join(colored_reasons)
+            major_reasons_str = "\n-----\n\n".join(sorted(reasons_set))
         else:
             major_reasons_str = "-"
 
@@ -879,18 +868,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         output_rows.append(row)
         
     return pd.DataFrame(output_rows)
-
-def render_html_table(df):
-    html_table = df.to_html(escape=False, index=False, classes='stTable')
-    # Minimal CSS to make the HTML table look exactly like a native Streamlit dataframe
-    return f"""
-    <style>
-        .stTable {{ width: 100%; border-collapse: collapse; text-align: left; font-family: sans-serif; }}
-        .stTable th, .stTable td {{ border: 1px solid #444; padding: 8px; }}
-        .stTable th {{ background-color: rgba(128, 128, 128, 0.2); }}
-    </style>
-    {html_table}
-    """
 
 def highlight_bobr(row):
     if 'BOBR' in str(row['Load Type']).upper():
@@ -967,8 +944,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             yest_date = datetime.now(IST).date() - timedelta(days=1)
             daily_stats_df = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=yest_date)
             st.markdown("### 📊 Daily Performance & Demurrage Forecast")
-            # Render as HTML so the colored fonts apply seamlessly
-            st.write(render_html_table(daily_stats_df), unsafe_allow_html=True)
+            st.dataframe(daily_stats_df, hide_index=True)
             
             st.download_button("📥 Download Final Report", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
 
@@ -998,8 +974,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             if start_f and end_f:
                 hist_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_f, end_filter_dt=end_f)
                 st.markdown(f"**Performance Summary ({start_f} to {end_f})**")
-                # Render as HTML so the colored fonts apply seamlessly
-                st.write(render_html_table(hist_stats), unsafe_allow_html=True)
+                st.dataframe(hist_stats, hide_index=True, use_container_width=True)
                 
                 st.markdown("---")
                 with st.expander("Show Detailed Rake List (Demurrage Only)"):
