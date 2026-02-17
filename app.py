@@ -335,7 +335,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                     # Append the exact department written instead of the standardized class
                     dept_strings.append(f"{dept}: {r_text}")
                 
-                full_remarks_blob = f"[{rake_name}] - " + ", ".join(dept_strings)
+                full_remarks_blob = f"[{rake_name}] - " + ". " \n ".join(dept_strings)
             else:
                 full_remarks_blob = ""
             # ==========================================
@@ -994,6 +994,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
+
 
 
 
