@@ -220,8 +220,8 @@ def classify_reason(reason_text):
     chem_keys = ['CHEM', 'CHEMISTRY', 'LAB', 'QUALITY', 'SAMPLE', 'ASH', 'MOISTURE']
     opr_keys = ['OPR', 'OPER', 'OPERATIONS', 'CREW', 'SHIFT', 'MANPOWER', 'BUNKER', 'FULL', 'WAIT']
 
-    if any(k in txt for k in mm_keys): return "Mechanical"
-    if any(k in txt for k in emd_keys): return "Electrical"
+    if any(k in txt for k in mm_keys): return "mm"
+    if any(k in txt for k in emd_keys): return "EMD"
     if any(k in txt for k in cni_keys): return "C&I"
     if any(k in txt for k in rs_keys): return "Rolling Stock"
     if any(k in txt for k in mgr_keys): return "MGR"
@@ -990,4 +990,5 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
+
 
