@@ -212,21 +212,21 @@ def classify_reason(reason_text):
     if not reason_text: return "Misc"
     txt = reason_text.upper()
     
-    mm_keys = ['MM', 'MECH', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
-    emd_keys = ['EMD', 'ELEC', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
+    mm_keys = ['MM', 'MECH', 'MECHANICAL', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
+    emd_keys = ['EMD', 'ELEC', 'ELECTRICAL', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
     cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
     rs_keys = ['C&W', 'WAGON', 'DOOR', 'COUPL', 'RAKE']
     mgr_keys = ['MGR', 'TRACK', 'LOCO', 'DERAIL', 'SLEEPER']
-    chem_keys = ['CHEM', 'LAB', 'QUALITY', 'SAMPLE', 'ASH', 'MOISTURE']
-    opr_keys = ['OPR', 'OPER', 'CREW', 'SHIFT', 'MANPOWER', 'BUNKER', 'FULL', 'WAIT']
+    chem_keys = ['CHEM', 'CHEMISTRY', 'LAB', 'QUALITY', 'SAMPLE', 'ASH', 'MOISTURE']
+    opr_keys = ['OPR', 'OPER', 'OPERATIONS', 'CREW', 'SHIFT', 'MANPOWER', 'BUNKER', 'FULL', 'WAIT']
 
-    if any(k in txt for k in mm_keys): return "MM"
-    if any(k in txt for k in emd_keys): return "EMD"
+    if any(k in txt for k in mm_keys): return "Mechanical"
+    if any(k in txt for k in emd_keys): return "Electrical"
     if any(k in txt for k in cni_keys): return "C&I"
     if any(k in txt for k in rs_keys): return "Rolling Stock"
     if any(k in txt for k in mgr_keys): return "MGR"
     if any(k in txt for k in chem_keys): return "Chemistry"
-    if any(k in txt for k in opr_keys): return "OPR"
+    if any(k in txt for k in opr_keys): return "Operations"
     
     return "Misc"
 
@@ -316,10 +316,8 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                 t_upper = text.strip().upper()
                 
                 if t_upper in known_depts:
-                    # If a previous department had actual lines of text below it, save it
                     if curr_header and curr_lines:
                         parsed_blocks.append((curr_header, " ".join(curr_lines)))
-                    # Start the new department, reset the lines
                     curr_header = t_upper
                     curr_lines = []
                 else:
@@ -327,7 +325,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                         curr_header = classify_reason(text)
                     curr_lines.append(text.strip())
                     
-            # Capture the last block (but ONLY if it actually has text lines under it)
             if curr_header and curr_lines:
                 parsed_blocks.append((curr_header, " ".join(curr_lines)))
 
@@ -338,7 +335,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                     std_dept = classify_reason(dept) if dept not in known_depts else classify_reason(dept)
                     dept_strings.append(f"{std_dept}: {r_text}")
                 
-                # A comma and a space creates a clean, continuous sentence
                 full_remarks_blob = f"[{rake_name}] - " + ", ".join(dept_strings)
             else:
                 full_remarks_blob = ""
@@ -375,7 +371,11 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                         
                         if wc is not None: explicit_wagon_counts[t_name] = wc
 
-            is_unplanned = (not active_tipplers_row and load_type != 'BOBR')
+            # ==========================================
+            # UPDATED: PENDING TRIGGER (BASED ON COL H)
+            # ==========================================
+            col_h_dt = safe_parse_date(row.iloc[7])
+            is_unplanned = pd.isnull(col_h_dt) 
             
             seq, rid = parse_last_sequence(rake_name)
             if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
@@ -395,7 +395,9 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                     'is_gs_unplanned': True,
                     '_remarks': full_remarks_blob
                 })
+                # Skips adding to locked_actuals so it can be simulated natively
                 continue 
+            # ==========================================
 
             t_str_list = []
             wagon_counts_map = {}
@@ -850,11 +852,20 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                     curr = segment_end
 
     output_rows = []
+    # High contrast colors for both Light and Dark themes
+    colors = ["#00BFFF", "#FF8C00"] # DeepSkyBlue and DarkOrange
+    
     for d, v in sorted(daily_stats.items()):
         reasons_set = v['All_Reasons']
         
-        # This separates entirely different rakes on the same day with a strong divider
-        major_reasons_str = "\n".join(sorted(reasons_set)) if reasons_set else "-"
+        if reasons_set:
+            colored_reasons = []
+            for idx, r in enumerate(sorted(reasons_set)):
+                c = colors[idx % 2]
+                colored_reasons.append(f'<div style="color:{c}; font-weight:600; padding-bottom:8px;">{r}</div>')
+            major_reasons_str = "".join(colored_reasons)
+        else:
+            major_reasons_str = "-"
 
         row = {
             'Date': d, 
@@ -868,6 +879,18 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         output_rows.append(row)
         
     return pd.DataFrame(output_rows)
+
+def render_html_table(df):
+    html_table = df.to_html(escape=False, index=False, classes='stTable')
+    # Minimal CSS to make the HTML table look exactly like a native Streamlit dataframe
+    return f"""
+    <style>
+        .stTable {{ width: 100%; border-collapse: collapse; text-align: left; font-family: sans-serif; }}
+        .stTable th, .stTable td {{ border: 1px solid #444; padding: 8px; }}
+        .stTable th {{ background-color: rgba(128, 128, 128, 0.2); }}
+    </style>
+    {html_table}
+    """
 
 def highlight_bobr(row):
     if 'BOBR' in str(row['Load Type']).upper():
@@ -944,7 +967,8 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             yest_date = datetime.now(IST).date() - timedelta(days=1)
             daily_stats_df = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=yest_date)
             st.markdown("### 📊 Daily Performance & Demurrage Forecast")
-            st.dataframe(daily_stats_df, hide_index=True)
+            # Render as HTML so the colored fonts apply seamlessly
+            st.write(render_html_table(daily_stats_df), unsafe_allow_html=True)
             
             st.download_button("📥 Download Final Report", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
 
@@ -974,7 +998,8 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             if start_f and end_f:
                 hist_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_f, end_filter_dt=end_f)
                 st.markdown(f"**Performance Summary ({start_f} to {end_f})**")
-                st.dataframe(hist_stats, hide_index=True, use_container_width=True)
+                # Render as HTML so the colored fonts apply seamlessly
+                st.write(render_html_table(hist_stats), unsafe_allow_html=True)
                 
                 st.markdown("---")
                 with st.expander("Show Detailed Rake List (Demurrage Only)"):
@@ -990,8 +1015,3 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
-
-
-
-
-
