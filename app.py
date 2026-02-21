@@ -33,11 +33,14 @@ st.sidebar.header("⚙️ Settings")
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=csv")
 
 # ==========================================
-# GEMINI API KEY INPUT (HARDCODED)
+# GEMINI API KEY INPUT (SECURE BACKGROUND FETCH)
 # ==========================================
-# The API key is set directly in the background. No sidebar box will appear.
-gemini_api_key = "AIzaSyCISS08a9FDzL_uf81ge-FmPcsFeEyBniY"
-# ==========================================
+# The API key is fetched securely from Streamlit Secrets. No sidebar box will appear.
+try:
+    gemini_api_key = st.secrets["GEMINI_API_KEY"]
+except KeyError:
+    gemini_api_key = None
+    st.sidebar.error("⚠️ Please add GEMINI_API_KEY to Streamlit Secrets.")
 # ==========================================
 
 st.sidebar.markdown("---")
@@ -1172,3 +1175,4 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     st.download_button("📥 Download Extracted Monthly Outage Report", report_df.to_csv(index=False).encode('utf-8'), "monthly_department_outages.csv", "text/csv")
                 else:
                     st.info("No outage times (Format: XX:XX - YY:YY) were found in the recent remarks.")
+
