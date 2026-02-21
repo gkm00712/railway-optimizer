@@ -16,7 +16,8 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("⚙️ Settings")
-gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
+# PASTE YOUR PUBLISHED GOOGLE SHEET CSV LINK BELOW:
+gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=csv)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📅 Data Limits (Tab 2)")
@@ -745,10 +746,12 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     df_sim = pd.DataFrame(assignments)
     
     if not df_locked.empty:
+        # ==========================================
+        # UPDATED: 7-DAY VISUAL FILTER
+        # ==========================================
         today_date = datetime.now(IST).date()
-        yesterday_date = today_date - timedelta(days=1)
+        yesterday_date = today_date - timedelta(days=7) # Show the last 7 days of actuals
         
-        # TAB 1 VISUAL FILTER
         def keep_row(r):
             ad = r['_Arrival_DT'].date()
             if ad >= yesterday_date: return True
@@ -780,12 +783,8 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         if arr_dt.tzinfo is None: arr_dt = IST.localize(arr_dt)
         d_str = arr_dt.strftime('%Y-%m-%d')
         
-        if start_filter_dt and arr_dt.date() < start_filter_dt: continue
-        if end_filter_dt and arr_dt.date() > end_filter_dt: continue
-
-        # ==========================================
-        # UPDATED: SHUNTING COUNTERS INITIALIZATION
-        # ==========================================
+        # We must NOT skip processing the row here so that we capture Shunting Averages and Rates correctly.
+        
         if d_str not in daily_stats: 
             daily_stats[d_str] = {
                 'Demurrage': 0, 'All_Reasons': set(),
@@ -803,9 +802,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             if rem:
                 daily_stats[d_str]['All_Reasons'].add(rem)
 
-        # ==========================================
-        # UPDATED: EXTRACT ACTUAL SHUNTING TIMES
-        # ==========================================
         opt_type = str(row.get('Optimization Type', ''))
         if "Actual" in opt_type:
             ready_dt = row.get('_Shunt_Ready_DT', pd.NaT)
@@ -824,7 +820,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                         elif 'T3' in tipps or 'T4' in tipps:
                             daily_stats[d_str]['L11_shunt_sec'] += shunt_sec
                             daily_stats[d_str]['L11_shunt_cnt'] += 1
-        # ==========================================
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
@@ -850,6 +845,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                 while curr < e_dt:
                     curr_day_str = curr.strftime('%Y-%m-%d')
                     
+                    # Apply date filters safely inside the loop
                     curr_date = curr.date()
                     in_range = True
                     if start_filter_dt and curr_date < start_filter_dt: in_range = False
@@ -881,7 +877,12 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
 
     output_rows = []
     
+    # Filter final output safely so days outside the requested range aren't displayed
     for d, v in sorted(daily_stats.items()):
+        d_obj = datetime.strptime(d, '%Y-%m-%d').date()
+        if start_filter_dt and d_obj < start_filter_dt: continue
+        if end_filter_dt and d_obj > end_filter_dt: continue
+
         reasons_set = v['All_Reasons']
         
         if reasons_set:
@@ -889,9 +890,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         else:
             major_reasons_str = "-"
 
-        # ==========================================
-        # UPDATED: SHUNTING AVERAGES CALCULATION
-        # ==========================================
         avg_8_10 = v['L8_10_shunt_sec'] / v['L8_10_shunt_cnt'] if v['L8_10_shunt_cnt'] > 0 else 0
         avg_11 = v['L11_shunt_sec'] / v['L11_shunt_cnt'] if v['L11_shunt_cnt'] > 0 else 0
 
@@ -902,8 +900,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             'Avg Shunt L11 (T3/T4)': f"{int(avg_11 // 60)} min" if avg_11 > 0 else "-",
             'Major Reasons': major_reasons_str
         }
-        # ==========================================
-        
         for t in ['T1', 'T2', 'T3', 'T4']:
             rate = 0.0
             if v[f'{t}_hrs'] > 0.1: rate = v[f'{t}_wag'] / v[f'{t}_hrs']
@@ -984,11 +980,13 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                 day_df.index = np.arange(1, len(day_df) + 1)
                 st.dataframe(day_df.style.apply(highlight_bobr, axis=1), use_container_width=True, column_config=col_cfg)
 
-            yest_date = datetime.now(IST).date() - timedelta(days=1)
+            # ==========================================
+            # UPDATED: 7-DAY PERFORMANCE FILTER
+            # ==========================================
+            yest_date = datetime.now(IST).date() - timedelta(days=7) # Show last 7 days of stats
             daily_stats_df = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=yest_date)
             st.markdown("### 📊 Daily Performance & Demurrage Forecast")
             
-            # Using native Streamlit Dataframe to restore sort/scroll interactivity
             st.dataframe(daily_stats_df, hide_index=True)
             
             st.download_button("📥 Download Final Report", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
@@ -1020,7 +1018,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                 hist_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_f, end_filter_dt=end_f)
                 st.markdown(f"**Performance Summary ({start_f} to {end_f})**")
                 
-                # Using native Streamlit Dataframe to restore sort/scroll interactivity
                 st.dataframe(hist_stats, hide_index=True, use_container_width=True)
                 
                 st.markdown("---")
