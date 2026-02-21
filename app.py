@@ -69,6 +69,14 @@ if st.session_state.downtimes:
         st.rerun()
 sim_params['downtimes'] = st.session_state.downtimes
 
+curr_params_hash = str(sim_params)
+params_changed = False
+if 'last_params_hash' not in st.session_state:
+    st.session_state.last_params_hash = curr_params_hash
+elif st.session_state.last_params_hash != curr_params_hash:
+    params_changed = True
+    st.session_state.last_params_hash = curr_params_hash
+
 # ==========================================
 # 2. HELPER FUNCTIONS
 # ==========================================
@@ -210,15 +218,14 @@ def classify_reason(reason_text):
     mm_keys = ['MM', 'MECH', 'MECHANICAL', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
     emd_keys = ['EMD', 'ELEC', 'ELECTRICAL', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
     cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
-    rs_keys = ['C&W', 'WAGON', 'DOOR', 'COUPL', 'RAKE']
-    mgr_keys = ['MGR', 'TRACK', 'LOCO', 'DERAIL', 'SLEEPER']
+    # WAGON and C&W moved strictly to MGR
+    mgr_keys = ['MGR', 'TRACK', 'LOCO', 'DERAIL', 'SLEEPER', 'C&W', 'WAGON', 'DOOR', 'COUPL', 'RAKE']
     chem_keys = ['CHEM', 'CHEMISTRY', 'LAB', 'QUALITY', 'SAMPLE', 'ASH', 'MOISTURE']
     opr_keys = ['OPR', 'OPER', 'OPERATIONS', 'CREW', 'SHIFT', 'MANPOWER', 'BUNKER', 'FULL', 'WAIT']
 
     if any(k in txt for k in mm_keys): return "Mechanical"
     if any(k in txt for k in emd_keys): return "Electrical"
     if any(k in txt for k in cni_keys): return "C&I"
-    if any(k in txt for k in rs_keys): return "Rolling Stock"
     if any(k in txt for k in mgr_keys): return "MGR"
     if any(k in txt for k in chem_keys): return "Chemistry"
     if any(k in txt for k in opr_keys): return "Operations"
@@ -241,10 +248,10 @@ def parse_demurrage_special(cell_val):
     return "00:00"
 
 # ==========================================
-# NEW AI-STYLE OUTAGE EXTRACTOR
+# UPGRADED SMART OUTAGE EXTRACTOR
 # ==========================================
 def extract_smart_outages(df_sim_full):
-    """Scans all remarks, extracts XX:XX - YY:YY formats, and calculates outage times per department."""
+    """Scans all remarks, extracts HH:MM - HH:MM formats (even with dots or 'to'), and calculates outage times."""
     records = []
     for _, row in df_sim_full.iterrows():
         arr_dt = row.get('_Arrival_DT', pd.NaT)
@@ -261,11 +268,14 @@ def extract_smart_outages(df_sim_full):
             line = line.strip()
             if not line: continue
             
-            # Smartly hunt for HH:MM - HH:MM
-            time_match = re.search(r'(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})', line)
+            # This smart regex now catches "14:30 - 15:30", "14.30-15.30", and "14:30 to 15:30"
+            time_match = re.search(r'(\d{1,2}[:.]\d{2})\s*(?:-|to|till|until)\s*(\d{1,2}[:.]\d{2})', line, re.IGNORECASE)
             hrs = 0.0
             if time_match:
                 start_str, end_str = time_match.groups()
+                # Normalize dots to colons
+                start_str = start_str.replace('.', ':')
+                end_str = end_str.replace('.', ':')
                 try:
                     sh, sm = map(int, start_str.split(':'))
                     eh, em = map(int, end_str.split(':'))
@@ -342,7 +352,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             wagons, load_type = parse_col_d_wagon_type(col_d_val)
 
             # ==========================================
-            # GROUPED DEMURRAGE REASON PARSER
+            # UPGRADED DEMURRAGE REASON PARSER
             # ==========================================
             raw_texts = []
             curr_reason = str(row.iloc[11]).strip()
@@ -364,15 +374,20 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             curr_header = None
             curr_lines = []
             
-            known_depts = ['MM', 'MECH', 'MECHANICAL', 'C&I', 'CNI', 'EMD', 'ELEC', 'ELECTRICAL', 'C&W', 'WAGON', 'MGR', 'CHEM', 'CHEMISTRY', 'OPR', 'OPER', 'OPERATIONS']
+            # Added OTHER and MISC so they act as their own clean boundaries
+            known_depts = ['MM', 'MECH', 'MECHANICAL', 'C&I', 'CNI', 'EMD', 'ELEC', 'ELECTRICAL', 'C&W', 'WAGON', 'MGR', 'CHEM', 'CHEMISTRY', 'OPR', 'OPER', 'OPERATIONS', 'OTHER', 'OTHERS', 'MISC', 'MISCELLANEOUS']
             
             for text in raw_texts:
                 t_upper = text.strip().upper()
+                clean_t = t_upper.replace(":", "").strip()
                 
-                if t_upper in known_depts:
+                if clean_t in known_depts:
+                    # Only save the previous header if it actually had text below it!
                     if curr_header and curr_lines:
-                        parsed_blocks.append((curr_header, " ".join(curr_lines)))
-                    curr_header = text.strip() 
+                        parsed_blocks.append((curr_header, ", ".join(curr_lines)))
+                    
+                    # Set the new header, wipe the lines clean
+                    curr_header = clean_t 
                     curr_lines = []
                 else:
                     if curr_header is None:
@@ -380,12 +395,14 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                     curr_lines.append(text.strip())
                     
             if curr_header and curr_lines:
-                parsed_blocks.append((curr_header, " ".join(curr_lines)))
+                parsed_blocks.append((curr_header, ", ".join(curr_lines)))
 
             if parsed_blocks:
                 dept_strings = []
                 for dept, r_text in parsed_blocks:
                     dept_strings.append(f"{dept}: {r_text}")
+                
+                # Joins completely different departments with a \n so they start on the next line
                 full_remarks_blob = f"[{rake_name}] - " + "\n".join(dept_strings)
             else:
                 full_remarks_blob = ""
@@ -793,9 +810,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     df_sim = pd.DataFrame(assignments)
     
     if not df_locked.empty:
-        # ==========================================
-        # REVERTED: 1-DAY (YESTERDAY ONWARDS) FILTER
-        # ==========================================
+        # VISUAL FILTER (1 DAY - YESTERDAY ONWARDS)
         today_date = datetime.now(IST).date()
         yesterday_date = today_date - timedelta(days=1) 
         
@@ -1016,58 +1031,13 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                 day_df.index = np.arange(1, len(day_df) + 1)
                 st.dataframe(day_df.style.apply(lambda x: ['background-color: #FFD700; color: black'] * len(x) if 'BOBR' in str(x['Load Type']).upper() else [''] * len(x), axis=1), use_container_width=True, column_config=col_cfg)
 
-            # ==========================================
-            # REVERTED TO 1-DAY (YESTERDAY) STATS FILTER
-            # ==========================================
             yest_date = datetime.now(IST).date() - timedelta(days=1)
             daily_stats_df = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=yest_date)
             st.markdown("### 📊 Daily Performance & Demurrage Forecast")
             
             st.dataframe(daily_stats_df, hide_index=True)
             
-            # ==========================================
-            # NEW: AI OUTAGE EXTRACTOR & PIE CHARTS
-            # ==========================================
-            st.markdown("---")
-            st.markdown("### 🥧 Monthly Department Outage Report (AI Extracted)")
-            
-            outage_df = extract_smart_outages(st.session_state.sim_full_result)
-            
-            if not outage_df.empty:
-                now_curr = datetime.now(IST)
-                curr_m, curr_y = now_ist.month, now_ist.year
-                prev_m, prev_y = (12, curr_y - 1) if curr_m == 1 else (curr_m - 1, curr_y)
-                
-                curr_df = outage_df[(outage_df['Month'] == curr_m) & (outage_df['Year'] == curr_y)]
-                prev_df = outage_df[(outage_df['Month'] == prev_m) & (outage_df['Year'] == prev_y)]
-                
-                if HAS_PLOTLY:
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.write(f"**Current Month ({now_curr.strftime('%B %Y')})**")
-                        if not curr_df.empty:
-                            pie_curr = curr_df.groupby('Department')['Outage Hours'].sum().reset_index()
-                            fig1 = px.pie(pie_curr, names='Department', values='Outage Hours', hole=0.3)
-                            st.plotly_chart(fig1, use_container_width=True)
-                        else:
-                            st.info("No formatted outage times found this month.")
-                            
-                    with c2:
-                        prev_dt_name = datetime(prev_y, prev_m, 1).strftime('%B %Y')
-                        st.write(f"**Last Month ({prev_dt_name})**")
-                        if not prev_df.empty:
-                            pie_prev = prev_df.groupby('Department')['Outage Hours'].sum().reset_index()
-                            fig2 = px.pie(pie_prev, names='Department', values='Outage Hours', hole=0.3)
-                            st.plotly_chart(fig2, use_container_width=True)
-                        else:
-                            st.info("No formatted outage times found last month.")
-                else:
-                    st.warning("⚠️ Please run `pip install plotly` in your terminal to see the Pie Charts.")
-
-                report_df = outage_df.drop(columns=['Month', 'Year'])
-                st.download_button("📥 Download Extracted Monthly Outage Report", report_df.to_csv(index=False).encode('utf-8'), "monthly_department_outages.csv", "text/csv")
-            else:
-                st.info("No outage times (Format: XX:XX - YY:YY) were found in the recent remarks.")
+            st.download_button("📥 Download Final Report", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
 
         with tab_hist:
             st.subheader("🔍 Past Performance Analysis")
@@ -1112,3 +1082,47 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
+
+                # ==========================================
+                # PIE CHARTS (Extracted without AI)
+                # ==========================================
+                st.markdown("---")
+                st.markdown("### 🥧 Monthly Department Outage Report")
+                
+                outage_df = extract_smart_outages(st.session_state.sim_full_result)
+                
+                if not outage_df.empty:
+                    now_curr = datetime.now(IST)
+                    curr_m, curr_y = now_curr.month, now_curr.year
+                    prev_m, prev_y = (12, curr_y - 1) if curr_m == 1 else (curr_m - 1, curr_y)
+                    
+                    curr_df = outage_df[(outage_df['Month'] == curr_m) & (outage_df['Year'] == curr_y)]
+                    prev_df = outage_df[(outage_df['Month'] == prev_m) & (outage_df['Year'] == prev_y)]
+                    
+                    if HAS_PLOTLY:
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.write(f"**Current Month ({now_curr.strftime('%B %Y')})**")
+                            if not curr_df.empty:
+                                pie_curr = curr_df.groupby('Department')['Outage Hours'].sum().reset_index()
+                                fig1 = px.pie(pie_curr, names='Department', values='Outage Hours', hole=0.3)
+                                st.plotly_chart(fig1, use_container_width=True)
+                            else:
+                                st.info("No formatted outage times found this month.")
+                                
+                        with c2:
+                            prev_dt_name = datetime(prev_y, prev_m, 1).strftime('%B %Y')
+                            st.write(f"**Last Month ({prev_dt_name})**")
+                            if not prev_df.empty:
+                                pie_prev = prev_df.groupby('Department')['Outage Hours'].sum().reset_index()
+                                fig2 = px.pie(pie_prev, names='Department', values='Outage Hours', hole=0.3)
+                                st.plotly_chart(fig2, use_container_width=True)
+                            else:
+                                st.info("No formatted outage times found last month.")
+                    else:
+                        st.warning("⚠️ Please run `pip install plotly` in your terminal to see the Pie Charts.")
+
+                    report_df = outage_df.drop(columns=['Month', 'Year'])
+                    st.download_button("📥 Download Extracted Monthly Outage Report", report_df.to_csv(index=False).encode('utf-8'), "monthly_department_outages.csv", "text/csv")
+                else:
+                    st.info("No outage times (Format: XX:XX - YY:YY) were found in the recent remarks.")
