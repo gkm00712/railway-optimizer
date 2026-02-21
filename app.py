@@ -100,6 +100,9 @@ sim_params['wb'] = st.sidebar.number_input("Wagons 1st Batch", value=30, step=1)
 sim_params['wd'] = st.sidebar.number_input("Delay 2nd Tippler (Mins)", value=0.0, step=5.0)
 
 st.sidebar.markdown("---")
+sim_params['zombie_limit'] = st.sidebar.number_input("🧟 Drop Zombie Rakes (Max Hrs)", value=500, step=50, help="Automatically ignores any FOIS ghosts with absurdly high hours.")
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("🛠️ Tippler Downtime")
 if 'downtimes' not in st.session_state: st.session_state.downtimes = []
 with st.sidebar.form("downtime_form"):
@@ -321,7 +324,7 @@ def extract_smart_outages(df_sim_full):
                     t_str = t_str.replace('.', ':')
                     if ':' in t_str:
                         return map(int, t_str.split(':'))
-                    else: # Handles 1400 railway format
+                    else: 
                         return int(t_str[:-2]), int(t_str[-2:])
                 
                 try:
@@ -329,7 +332,7 @@ def extract_smart_outages(df_sim_full):
                     eh, em = parse_hm(end_str)
                     s_min = sh * 60 + sm
                     e_min = eh * 60 + em
-                    if e_min < s_min: e_min += 24 * 60 # Handles cross-midnight outages
+                    if e_min < s_min: e_min += 24 * 60 
                     hrs = round((e_min - s_min) / 60.0, 2)
                 except: pass
             
@@ -408,13 +411,11 @@ def create_pdf_file(month_name, ai_summary):
     
     pdf.set_font("Arial", '', 11)
     
-    # Strip markdown and special characters that crash standard FPDF
     clean_ai = ai_summary.replace('**', '').replace('*', '-').replace('#', '')
     clean_ai = clean_ai.replace('\u2013', '-').replace('\u2014', '-')
     clean_ai = clean_ai.replace('\u2018', "'").replace('\u2019', "'")
     clean_ai = clean_ai.replace('\u201c', '"').replace('\u201d', '"')
     
-    # Safely encode to latin-1 to avoid emoji crashes
     clean_ai = clean_ai.encode('latin-1', 'replace').decode('latin-1')
     
     pdf.multi_cell(0, 7, clean_ai)
@@ -439,11 +440,9 @@ def safe_parse_date(val):
 @st.cache_data(ttl=60)
 def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
     try:
-        # Robust Download Method using requests
         response = requests.get(url)
         response.raise_for_status() 
         
-        # Read ALL sheets from the published Excel file
         all_sheets = pd.read_excel(BytesIO(response.content), sheet_name=None, header=None, skiprows=1, engine='openpyxl')
         
         df_list = []
@@ -455,7 +454,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             st.warning("⚠️ No tabs found in the Google Sheet with 18 or more columns.")
             return pd.DataFrame(), pd.DataFrame(), (0,0)
             
-        # Combine all valid tabs into one main dataframe
         df_gs = pd.concat(df_list, ignore_index=True)
 
         locked_actuals = []
@@ -463,6 +461,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
         
         dynamic_cutoff = IST.localize(datetime.combine(cutoff_date_input, datetime.min.time()))
         last_seq_tuple = (0, 0)
+        now_ist = datetime.now(IST)
 
         for i in range(len(df_gs)):
             row = df_gs.iloc[i]
@@ -566,6 +565,10 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                 last_seq_tuple = (seq, rid)
 
             if is_unplanned:
+                # AUTO-DROP OLD PENDING RAKES (> 3 DAYS)
+                if pd.notnull(arrival_dt) and (now_ist - arrival_dt).total_seconds() > (3 * 24 * 3600):
+                    continue 
+
                 unplanned_actuals.append({
                     'Rake': rake_name,  
                     'Coal Source': source_val,
@@ -956,11 +959,19 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
 def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=None):
     daily_stats = {} 
     
+    zombie_limit = st.session_state.get('last_params_hash', 500)
+    if isinstance(sim_params, dict) and 'zombie_limit' in sim_params:
+        zombie_limit = sim_params['zombie_limit']
+    
     for _, row in df_all.iterrows():
         dem_val = str(row['Demurrage']).strip()
         dem_hrs = 0
         if ":" in dem_val: dem_hrs = int(dem_val.split(":")[0])
         elif dem_val.isdigit(): dem_hrs = int(dem_val)
+        
+        # 🧟 ZOMBIE SLAYER
+        if dem_hrs > zombie_limit:
+            continue
         
         arr_dt = pd.to_datetime(row['_Arrival_DT'])
         if arr_dt.tzinfo is None: arr_dt = IST.localize(arr_dt)
@@ -1234,7 +1245,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                         )
                 else:
                     st.warning("⚠️ Run `pip install fpdf` to enable PDF downloads.")
-
 
         with tab_hist:
             st.subheader("🔍 Past Performance Analysis")
