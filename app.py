@@ -287,11 +287,11 @@ def parse_demurrage_special(cell_val):
         except: pass
     return "00:00"
 
-# ==========================================
-# UPGRADED SMART OUTAGE EXTRACTOR
+## ==========================================
+# UPGRADED SUPER-SMART OUTAGE EXTRACTOR
 # ==========================================
 def extract_smart_outages(df_sim_full):
-    """Scans all remarks, extracts HH:MM - HH:MM formats (even with dots or 'to'), and calculates outage times."""
+    """Scans all remarks, extracts HH:MM - HH:MM, HH.MM to HH.MM, or HHMM-HHMM formats."""
     records = []
     for _, row in df_sim_full.iterrows():
         arr_dt = row.get('_Arrival_DT', pd.NaT)
@@ -308,33 +308,41 @@ def extract_smart_outages(df_sim_full):
             line = line.strip()
             if not line: continue
             
-            time_match = re.search(r'(\d{1,2}[:.]\d{2})\s*(?:-|to|till|until)\s*(\d{1,2}[:.]\d{2})', line, re.IGNORECASE)
+            # Smart Regex: Catches 14:30 - 15:30, 14.30 to 15.30, 14:30 hrs - 15:30 hrs, and 1400-1500
+            time_match = re.search(r'\b(\d{1,2}[:.]\d{2}|\d{4})\s*(?:hrs?|hours?)?\s*(?:-|to|till|until)\s*(\d{1,2}[:.]\d{2}|\d{4})\s*(?:hrs?|hours?)?\b', line, re.IGNORECASE)
             hrs = 0.0
+            
             if time_match:
                 start_str, end_str = time_match.groups()
-                start_str = start_str.replace('.', ':')
-                end_str = end_str.replace('.', ':')
+                
+                def parse_hm(t_str):
+                    t_str = t_str.replace('.', ':')
+                    if ':' in t_str:
+                        return map(int, t_str.split(':'))
+                    else: # Handles 1400 railway format
+                        return int(t_str[:-2]), int(t_str[-2:])
+                
                 try:
-                    sh, sm = map(int, start_str.split(':'))
-                    eh, em = map(int, end_str.split(':'))
+                    sh, sm = parse_hm(start_str)
+                    eh, em = parse_hm(end_str)
                     s_min = sh * 60 + sm
                     e_min = eh * 60 + em
-                    if e_min < s_min: e_min += 24 * 60
+                    if e_min < s_min: e_min += 24 * 60 # Handles cross-midnight outages
                     hrs = round((e_min - s_min) / 60.0, 2)
                 except: pass
             
             if hrs > 0:
+                clean_reason = re.sub(r'\[.*?\]\s*-\s*', '', line).strip()
                 dept = "Misc"
-                dept_match = re.search(r'([A-Za-z\&]+):', line)
+                dept_match = re.search(r'^([A-Za-z\&]+):', clean_reason)
                 if dept_match:
                     dept = classify_reason(dept_match.group(1))
                 else:
                     for k in ['MM', 'MECH', 'C&I', 'CNI', 'EMD', 'ELEC', 'C&W', 'WAGON', 'MGR', 'CHEM', 'OPR', 'OPER']:
-                        if k in line.upper():
+                        if k in clean_reason.upper():
                             dept = classify_reason(k)
                             break
                             
-                clean_reason = re.sub(r'\[.*?\]\s*-\s*', '', line)
                 records.append({
                     'Date': date_str,
                     'Month': arr_dt.month,
@@ -1256,3 +1264,4 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
+
