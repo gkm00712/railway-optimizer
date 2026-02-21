@@ -8,6 +8,8 @@ import re
 import tempfile
 import calendar
 from dateutil.relativedelta import relativedelta
+import requests
+from io import BytesIO
 
 try:
     import plotly.express as px
@@ -421,21 +423,27 @@ def create_pdf_file(month_name, ai_summary):
             return f.read()
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (MULTI-TAB EXCEL)
+# 3. GOOGLE SHEET PARSER (UPGRADED FOR TABS & DEBUGGING)
 # ==========================================
 
 @st.cache_data(ttl=60)
 def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
     try:
-        # Read ALL sheets from the published Excel file
-        all_sheets = pd.read_excel(url, sheet_name=None, header=None, skiprows=1, engine='openpyxl')
+        # Robust Download Method using requests
+        response = requests.get(url)
+        response.raise_for_status() # This will catch 404 (Not Found) or 403 (Private) errors
+        
+        # Read ALL sheets from the downloaded Excel bytes
+        all_sheets = pd.read_excel(BytesIO(response.content), sheet_name=None, header=None, skiprows=1, engine='openpyxl')
         
         df_list = []
         for sheet_name, df_sheet in all_sheets.items():
+            # Check if the tab actually has data (at least 18 columns)
             if len(df_sheet.columns) >= 18:
                 df_list.append(df_sheet)
                 
         if not df_list: 
+            st.warning("⚠️ No tabs found in the Google Sheet with 18 or more columns.")
             return pd.DataFrame(), pd.DataFrame(), (0,0)
             
         # Combine all valid tabs into one main dataframe
@@ -635,8 +643,9 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
         return pd.DataFrame(locked_actuals), pd.DataFrame(unplanned_actuals), last_seq_tuple
 
     except Exception as e:
+        # THIS WILL PRINT THE EXACT ERROR ON YOUR APP SCREEN
+        st.error(f"🚨 Google Sheet Error: {str(e)}")
         return pd.DataFrame(), pd.DataFrame(), (0,0)
-
 # ==========================================
 # 4. CORE SIMULATION LOGIC
 # ==========================================
@@ -1262,3 +1271,4 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
+
