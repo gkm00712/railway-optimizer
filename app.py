@@ -27,6 +27,12 @@ try:
 except ImportError:
     HAS_FPDF = False
 
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
 # ==========================================
 # 1. PAGE CONFIGURATION & INPUTS
 # ==========================================
@@ -35,18 +41,22 @@ st.title("🚂 BOXN & BOBR Rake Logistics Dashboard (IST)")
 
 IST = pytz.timezone('Asia/Kolkata')
 
+if not HAS_OPENPYXL:
+    st.error("⚠️ Missing dependency! Please run `pip install openpyxl` (or add it to requirements.txt) so the app can read multi-tab Google Sheets.")
+    st.stop()
+
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("⚙️ Settings")
 
-# GOOGLE SHEET LINK
+# GOOGLE SHEET LINK - Updated to your explicit multi-tab Excel link
 raw_gs_url = st.sidebar.text_input(
-    "Google Sheet CSV Link", 
-    value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=csv"
+    "Google Sheet XLSX Link", 
+    value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=xlsx"
 )
 
-# Smartly auto-convert pubhtml to CSV format if pasted accidentally
-if "pubhtml" in raw_gs_url:
-    gs_url = raw_gs_url.replace("pubhtml", "pub?output=csv")
+# Safety check in case the URL gets changed by accident
+if "pubhtml" in raw_gs_url or "pub?output=csv" in raw_gs_url:
+    gs_url = re.sub(r'pubhtml.*|pub\?output=csv.*', 'pub?output=xlsx', raw_gs_url)
 else:
     gs_url = raw_gs_url
 
@@ -56,7 +66,6 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.subheader("✨ AI Integrations")
 
-# Safely fetch the API key from Streamlit's backend secrets
 gemini_api_key = None
 if "GEMINI_API_KEY" in st.secrets:
     gemini_api_key = st.secrets["GEMINI_API_KEY"]
@@ -67,7 +76,7 @@ else:
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📅 Data Limits (Tab 2)")
-# Hardcoded to Jan 1, 2026 onwards
+# Strictly locked to Jan 1, 2026 onwards
 history_start_date = st.sidebar.date_input("Load History From", value=datetime(2026, 1, 1).date(), min_value=datetime(2026, 1, 1).date())
 
 st.sidebar.markdown("---")
@@ -109,14 +118,6 @@ if st.session_state.downtimes:
         st.session_state.downtimes = []
         st.rerun()
 sim_params['downtimes'] = st.session_state.downtimes
-
-curr_params_hash = str(sim_params)
-params_changed = False
-if 'last_params_hash' not in st.session_state:
-    st.session_state.last_params_hash = curr_params_hash
-elif st.session_state.last_params_hash != curr_params_hash:
-    params_changed = True
-    st.session_state.last_params_hash = curr_params_hash
 
 # ==========================================
 # 2. HELPER FUNCTIONS
@@ -287,11 +288,11 @@ def parse_demurrage_special(cell_val):
         except: pass
     return "00:00"
 
-## ==========================================
-# UPGRADED SUPER-SMART OUTAGE EXTRACTOR
+# ==========================================
+# UPGRADED SMART OUTAGE EXTRACTOR
 # ==========================================
 def extract_smart_outages(df_sim_full):
-    """Scans all remarks, extracts HH:MM - HH:MM, HH.MM to HH.MM, or HHMM-HHMM formats."""
+    """Scans all remarks, extracts HH:MM - HH:MM formats (even with dots or 'to'), and calculates outage times."""
     records = []
     for _, row in df_sim_full.iterrows():
         arr_dt = row.get('_Arrival_DT', pd.NaT)
@@ -308,8 +309,7 @@ def extract_smart_outages(df_sim_full):
             line = line.strip()
             if not line: continue
             
-            # Smart Regex: Catches 14:30 - 15:30, 14.30 to 15.30, 14:30 hrs - 15:30 hrs, and 1400-1500
-            time_match = re.search(r'\b(\d{1,2}[:.]\d{2}|\d{4})\s*(?:hrs?|hours?)?\s*(?:-|to|till|until)\s*(\d{1,2}[:.]\d{2}|\d{4})\s*(?:hrs?|hours?)?\b', line, re.IGNORECASE)
+            time_match = re.search(r'(\d{1,2}[:.]\d{2}|\d{4})\s*(?:hrs?|hours?)?\s*(?:-|to|till|until)\s*(\d{1,2}[:.]\d{2}|\d{4})\s*(?:hrs?|hours?)?\b', line, re.IGNORECASE)
             hrs = 0.0
             
             if time_match:
@@ -319,7 +319,7 @@ def extract_smart_outages(df_sim_full):
                     t_str = t_str.replace('.', ':')
                     if ':' in t_str:
                         return map(int, t_str.split(':'))
-                    else: # Handles 1400 railway format
+                    else:
                         return int(t_str[:-2]), int(t_str[-2:])
                 
                 try:
@@ -327,7 +327,7 @@ def extract_smart_outages(df_sim_full):
                     eh, em = parse_hm(end_str)
                     s_min = sh * 60 + sm
                     e_min = eh * 60 + em
-                    if e_min < s_min: e_min += 24 * 60 # Handles cross-midnight outages
+                    if e_min < s_min: e_min += 24 * 60 
                     hrs = round((e_min - s_min) / 60.0, 2)
                 except: pass
             
@@ -406,13 +406,11 @@ def create_pdf_file(month_name, ai_summary):
     
     pdf.set_font("Arial", '', 11)
     
-    # Strip markdown and special characters that crash standard FPDF
     clean_ai = ai_summary.replace('**', '').replace('*', '-').replace('#', '')
     clean_ai = clean_ai.replace('\u2013', '-').replace('\u2014', '-')
     clean_ai = clean_ai.replace('\u2018', "'").replace('\u2019', "'")
     clean_ai = clean_ai.replace('\u201c', '"').replace('\u201d', '"')
     
-    # Safely encode to latin-1 to avoid emoji crashes
     clean_ai = clean_ai.encode('latin-1', 'replace').decode('latin-1')
     
     pdf.multi_cell(0, 7, clean_ai)
@@ -423,22 +421,25 @@ def create_pdf_file(month_name, ai_summary):
             return f.read()
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER
+# 3. GOOGLE SHEET PARSER (MULTI-TAB EXCEL)
 # ==========================================
-
-def safe_parse_date(val):
-    if pd.isnull(val) or str(val).strip() == "" or str(val).strip().upper() == "U/P": return pd.NaT
-    try:
-        dt = pd.to_datetime(val, dayfirst=True, errors='coerce') 
-        if pd.isnull(dt): return pd.NaT 
-        return to_ist(dt)
-    except: return pd.NaT
 
 @st.cache_data(ttl=60)
 def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
     try:
-        df_gs = pd.read_csv(url, header=None, skiprows=1) 
-        if len(df_gs.columns) < 18: return pd.DataFrame(), pd.DataFrame(), (0,0)
+        # Read ALL sheets from the published Excel file
+        all_sheets = pd.read_excel(url, sheet_name=None, header=None, skiprows=1, engine='openpyxl')
+        
+        df_list = []
+        for sheet_name, df_sheet in all_sheets.items():
+            if len(df_sheet.columns) >= 18:
+                df_list.append(df_sheet)
+                
+        if not df_list: 
+            return pd.DataFrame(), pd.DataFrame(), (0,0)
+            
+        # Combine all valid tabs into one main dataframe
+        df_gs = pd.concat(df_list, ignore_index=True)
 
         locked_actuals = []
         unplanned_actuals = [] 
@@ -456,6 +457,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
+            # STRICT FILTER: Discard any data older than Jan 1, 2026
             if arrival_dt < dynamic_cutoff:
                 continue 
             
@@ -913,7 +915,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     df_sim = pd.DataFrame(assignments)
     
     if not df_locked.empty:
-        # VISUAL FILTER (1 DAY - YESTERDAY ONWARDS)
         today_date = datetime.now(IST).date()
         yesterday_date = today_date - timedelta(days=1) 
         
@@ -1165,7 +1166,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             start_m = sel_dt.date()
             end_m = start_m.replace(day=calendar.monthrange(start_m.year, start_m.month)[1])
             
-            # Extract and Display Pie Chart
             outage_df = extract_smart_outages(st.session_state.sim_full_result)
             if not outage_df.empty:
                 month_outage_df = outage_df[(outage_df['Month'] == sel_dt.month) & (outage_df['Year'] == sel_dt.year)]
@@ -1182,7 +1182,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             else:
                 st.warning("⚠️ Please run `pip install plotly` to see the Pie Charts.")
 
-            # Gemini AI Generator
             col_a1, col_a2 = st.columns([1, 2])
             with col_a1:
                 if st.button(f"✨ Generate AI Report for {selected_my}"):
@@ -1203,7 +1202,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                                 st.session_state[f'ai_summary_{selected_my}'] = ai_summary
                                 st.success("Summary Generated!")
             
-            # Display Summary and PDF Download
             if f'ai_summary_{selected_my}' in st.session_state:
                 summary_text = st.session_state[f'ai_summary_{selected_my}']
                 st.info(summary_text)
@@ -1264,4 +1262,3 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
-
