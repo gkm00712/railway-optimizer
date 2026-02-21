@@ -5,6 +5,7 @@ import pytz
 import math
 import numpy as np
 import re
+import tempfile
 
 try:
     import plotly.express as px
@@ -12,12 +13,17 @@ try:
 except ImportError:
     HAS_PLOTLY = False
 
-# Import the Gemini SDK
 try:
     from google import genai
     HAS_GEMINI = True
 except ImportError:
     HAS_GEMINI = False
+
+try:
+    from fpdf import FPDF
+    HAS_FPDF = True
+except ImportError:
+    HAS_FPDF = False
 
 # ==========================================
 # 1. PAGE CONFIGURATION & INPUTS
@@ -33,14 +39,11 @@ st.sidebar.header("⚙️ Settings")
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=csv")
 
 # ==========================================
-# GEMINI API KEY INPUT (SECURE BACKGROUND FETCH)
+# GEMINI API KEY INPUT (BLANK / NO HARDCODING)
 # ==========================================
-# The API key is fetched securely from Streamlit Secrets. No sidebar box will appear.
-try:
-    gemini_api_key = st.secrets["GEMINI_API_KEY"]
-except KeyError:
-    gemini_api_key = None
-    st.sidebar.error("⚠️ Please add GEMINI_API_KEY to Streamlit Secrets.")
+st.sidebar.markdown("---")
+st.sidebar.subheader("✨ AI Integrations")
+gemini_api_key = st.sidebar.text_input("Gemini API Key", type="password", help="Paste your Gemini API Key here to enable Smart Summaries")
 # ==========================================
 
 st.sidebar.markdown("---")
@@ -265,7 +268,7 @@ def parse_demurrage_special(cell_val):
     return "00:00"
 
 # ==========================================
-# SMART OUTAGE EXTRACTOR (FOR PIE CHARTS)
+# UPGRADED SMART OUTAGE EXTRACTOR
 # ==========================================
 def extract_smart_outages(df_sim_full):
     """Scans all remarks, extracts HH:MM - HH:MM formats (even with dots or 'to'), and calculates outage times."""
@@ -324,6 +327,76 @@ def extract_smart_outages(df_sim_full):
     return pd.DataFrame(records)
 
 # ==========================================
+# GEMINI SMART SUMMARY ENGINE
+# ==========================================
+def generate_gemini_summary(raw_reasons_list, api_key):
+    if not HAS_GEMINI:
+        return "Error: Please run `pip install google-genai` to use AI features."
+    if not api_key:
+        return "Error: No API key provided in the sidebar."
+    
+    combined_text = "\n".join([str(r) for r in raw_reasons_list if r and str(r).strip() != "-"])
+    if not combined_text.strip():
+        return "No outage remarks found for this period to summarize."
+
+    prompt = f"""
+    You are an expert Railway Logistics Manager analyzing coal train unloading delays.
+    Please read the following raw operator notes and create a beautifully formatted Executive Summary.
+    
+    Raw Notes:
+    {combined_text}
+    
+    Formatting Rules:
+    1. Group the summary cleanly by Department.
+    2. Accurately list the estimated outage times mentioned.
+    3. Briefly highlight any recurring trends.
+    4. Keep it concise, professional, and use bullet points.
+    """
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        return f"Gemini API Error: {str(e)}"
+
+# ==========================================
+# PDF GENERATOR
+# ==========================================
+def create_pdf_file(month_name, ai_summary):
+    """Generates a PDF using the fpdf library."""
+    if not HAS_FPDF: return None
+    
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(0, 10, f"AI Executive Summary - {month_name}", 0, 1, 'C')
+    pdf.ln(5)
+    
+    pdf.set_font("Arial", '', 11)
+    
+    # Strip markdown bold formatting so the standard FPDF text looks clean
+    clean_ai = ai_summary.replace('**', '').replace('*', '-')
+    
+    # Fix common unicode characters that crash standard fpdf
+    clean_ai = clean_ai.replace('\u2013', '-').replace('\u2014', '-')
+    clean_ai = clean_ai.replace('\u2018', "'").replace('\u2019', "'")
+    clean_ai = clean_ai.replace('\u201c', '"').replace('\u201d', '"')
+    
+    # Safely encode to latin-1
+    clean_ai = clean_ai.encode('latin-1', 'replace').decode('latin-1')
+    
+    pdf.multi_cell(0, 7, clean_ai)
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        pdf.output(tmp.name)
+        with open(tmp.name, "rb") as f:
+            return f.read()
+
+# ==========================================
 # 3. GOOGLE SHEET PARSER
 # ==========================================
 
@@ -364,9 +437,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             col_d_val = row.iloc[3]
             wagons, load_type = parse_col_d_wagon_type(col_d_val)
 
-            # ==========================================
             # GROUPED DEMURRAGE REASON PARSER
-            # ==========================================
             raw_texts = []
             curr_reason = str(row.iloc[11]).strip()
             if curr_reason and curr_reason.lower() not in ['nan', 'none', '']:
@@ -413,7 +484,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                 full_remarks_blob = f"[{rake_name}] - " + "\n".join(dept_strings)
             else:
                 full_remarks_blob = ""
-            # ==========================================
 
             start_dt = safe_parse_date(row.iloc[5])
             end_dt = safe_parse_date(row.iloc[6])
@@ -1041,10 +1111,88 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             yest_date = datetime.now(IST).date() - timedelta(days=1)
             daily_stats_df = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=yest_date)
             st.markdown("### 📊 Daily Performance & Demurrage Forecast")
-            
             st.dataframe(daily_stats_df, hide_index=True)
+            st.download_button("📥 Download Final Schedule", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
             
-            st.download_button("📥 Download Final Report", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
+            # ==========================================
+            # NEW: MONTHLY AI REPORT & PIE CHART ON TAB 1
+            # ==========================================
+            st.markdown("---")
+            st.markdown("### 🥧 Monthly Overview & AI Summary")
+            
+            # Generate available months dynamically
+            sim_full_result['MonthYear'] = sim_full_result['_Arrival_DT'].dt.strftime('%B %Y')
+            available_months = sim_full_result['MonthYear'].dropna().unique().tolist()
+            
+            curr_my = datetime.now(IST).strftime('%B %Y')
+            if curr_my not in available_months:
+                available_months.insert(0, curr_my)
+            
+            try:
+                def_idx = available_months.index(curr_my)
+            except ValueError:
+                def_idx = 0
+                
+            selected_my = st.selectbox("Select Month for Report", available_months, index=def_idx)
+            
+            # Extract date boundaries for the selected month
+            sel_dt = datetime.strptime(selected_my, "%B %Y")
+            start_m = sel_dt.date()
+            import calendar
+            end_m = start_m.replace(day=calendar.monthrange(start_m.year, start_m.month)[1])
+            
+            # Render Pie Chart
+            outage_df = extract_smart_outages(sim_full_result)
+            month_outage_df = outage_df[(outage_df['Month'] == sel_dt.month) & (outage_df['Year'] == sel_dt.year)]
+            
+            if HAS_PLOTLY:
+                if not month_outage_df.empty:
+                    pie_data = month_outage_df.groupby('Department')['Outage Hours'].sum().reset_index()
+                    fig = px.pie(pie_data, names='Department', values='Outage Hours', hole=0.3, title=f"Total Department Outages: {selected_my}")
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info(f"No formatted outage times (XX:XX - YY:YY) found for {selected_my}.")
+            else:
+                st.warning("⚠️ Please run `pip install plotly` to see the Pie Charts.")
+
+            # Gemini AI Generator
+            col_a1, col_a2 = st.columns([1, 2])
+            with col_a1:
+                if st.button(f"✨ Generate AI Report for {selected_my}"):
+                    if not gemini_api_key:
+                        st.error("Please add your Gemini API Key in the sidebar.")
+                    elif not HAS_GEMINI:
+                        st.error("Please run `pip install google-genai`.")
+                    else:
+                        with st.spinner(f"Analyzing notes for {selected_my}..."):
+                            month_stats = recalculate_cascade_reactive(sim_full_result, start_filter_dt=start_m, end_filter_dt=end_m)
+                            raw_reasons = month_stats['Major Reasons'].dropna().tolist()
+                            combined_text = "\n".join([str(r) for r in raw_reasons if r and str(r).strip() != "-"])
+                            
+                            if not combined_text.strip():
+                                st.warning("There are no operator remarks for this month to summarize.")
+                            else:
+                                ai_summary = generate_gemini_summary([combined_text], gemini_api_key)
+                                st.session_state[f'ai_summary_{selected_my}'] = ai_summary
+                                st.success("Summary Generated!")
+            
+            # Display Summary and PDF Download
+            if f'ai_summary_{selected_my}' in st.session_state:
+                summary_text = st.session_state[f'ai_summary_{selected_my}']
+                st.info(summary_text)
+                
+                if HAS_FPDF:
+                    pdf_bytes = create_pdf_file(selected_my, summary_text)
+                    if pdf_bytes:
+                        st.download_button(
+                            label="📥 Download Extracted Report as PDF",
+                            data=pdf_bytes,
+                            file_name=f"AI_Executive_Summary_{selected_my.replace(' ', '_')}.pdf",
+                            mime="application/pdf"
+                        )
+                else:
+                    st.warning("⚠️ Run `pip install fpdf` to enable PDF downloads.")
+
 
         with tab_hist:
             st.subheader("🔍 Past Performance Analysis")
@@ -1086,93 +1234,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     
                     hist_raw = hist_raw[hist_raw['Demurrage'].apply(has_demurrage)]
                     
-                    cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
+                    cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data', 'MonthYear']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
-
-                # ==========================================
-                # NEW: AI EXECUTIVE SUMMARY BUTTON
-                # ==========================================
-                st.markdown("---")
-                st.markdown("### ✨ AI Monthly Executive Summary")
-                
-                if st.button("Generate Professional AI Report"):
-                    if not gemini_api_key:
-                        st.error("Please paste your Gemini API Key in the sidebar to use this feature.")
-                    elif not HAS_GEMINI:
-                        st.error("Missing dependency. Please add `google-genai` to your requirements.txt file.")
-                    else:
-                        with st.spinner("Gemini is reading the operator notes and generating the report..."):
-                            raw_reasons = hist_stats['Major Reasons'].dropna().tolist()
-                            if not raw_reasons:
-                                st.warning("No recorded delays in this timeframe to analyze.")
-                            else:
-                                combined_text = "\n".join([str(r) for r in raw_reasons if r and str(r).strip() != "-"])
-                                prompt = f"""
-                                You are an expert Railway Logistics Manager analyzing coal train unloading delays.
-                                Please read the following raw operator notes and create a beautifully formatted Executive Summary.
-                                
-                                Raw Notes:
-                                {combined_text}
-                                
-                                Formatting Rules:
-                                1. Group the summary by Department (Mechanical, Electrical, MGR, C&I, Chemistry, Operations, Misc).
-                                2. Accurately list the estimated outage times mentioned.
-                                3. Briefly highlight any recurring trends or major issues.
-                                4. Keep it concise and use bullet points for easy reading.
-                                """
-                                try:
-                                    client = genai.Client(api_key=gemini_api_key)
-                                    response = client.models.generate_content(
-                                        model='gemini-2.5-flash',
-                                        contents=prompt,
-                                    )
-                                    st.success("Analysis Complete!")
-                                    st.info(response.text)
-                                except Exception as e:
-                                    st.error(f"Error communicating with Gemini API: {str(e)}")
-
-                # ==========================================
-                # PIE CHARTS (Extracted without AI)
-                # ==========================================
-                st.markdown("---")
-                st.markdown("### 🥧 Monthly Department Outage Report")
-                
-                outage_df = extract_smart_outages(st.session_state.sim_full_result)
-                
-                if not outage_df.empty:
-                    now_curr = datetime.now(IST)
-                    curr_m, curr_y = now_curr.month, now_curr.year
-                    prev_m, prev_y = (12, curr_y - 1) if curr_m == 1 else (curr_m - 1, curr_y)
-                    
-                    curr_df = outage_df[(outage_df['Month'] == curr_m) & (outage_df['Year'] == curr_y)]
-                    prev_df = outage_df[(outage_df['Month'] == prev_m) & (outage_df['Year'] == prev_y)]
-                    
-                    if HAS_PLOTLY:
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            st.write(f"**Current Month ({now_curr.strftime('%B %Y')})**")
-                            if not curr_df.empty:
-                                pie_curr = curr_df.groupby('Department')['Outage Hours'].sum().reset_index()
-                                fig1 = px.pie(pie_curr, names='Department', values='Outage Hours', hole=0.3)
-                                st.plotly_chart(fig1, use_container_width=True)
-                            else:
-                                st.info("No formatted outage times found this month.")
-                                
-                        with c2:
-                            prev_dt_name = datetime(prev_y, prev_m, 1).strftime('%B %Y')
-                            st.write(f"**Last Month ({prev_dt_name})**")
-                            if not prev_df.empty:
-                                pie_prev = prev_df.groupby('Department')['Outage Hours'].sum().reset_index()
-                                fig2 = px.pie(pie_prev, names='Department', values='Outage Hours', hole=0.3)
-                                st.plotly_chart(fig2, use_container_width=True)
-                            else:
-                                st.info("No formatted outage times found last month.")
-                    else:
-                        st.warning("⚠️ Please run `pip install plotly` in your terminal to see the Pie Charts.")
-
-                    report_df = outage_df.drop(columns=['Month', 'Year'])
-                    st.download_button("📥 Download Extracted Monthly Outage Report", report_df.to_csv(index=False).encode('utf-8'), "monthly_department_outages.csv", "text/csv")
-                else:
-                    st.info("No outage times (Format: XX:XX - YY:YY) were found in the recent remarks.")
-
