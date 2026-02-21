@@ -3,3 +3,4 @@ plotly
 pandas
 google-genai 
 fpdf
+openpyxl
