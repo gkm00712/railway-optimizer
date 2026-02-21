@@ -2,3 +2,4 @@ streamlit
 plotly
 pandas
 google-genai 
+fpdf
