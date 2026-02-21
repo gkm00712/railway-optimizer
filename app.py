@@ -6,6 +6,12 @@ import math
 import numpy as np
 import re
 
+try:
+    import plotly.express as px
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
+
 # ==========================================
 # 1. PAGE CONFIGURATION & INPUTS
 # ==========================================
@@ -16,7 +22,7 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("⚙️ Settings")
-# THE GOOGLE SHEET LINK IS NOW HARDCODED HERE
+# GOOGLE SHEET LINK
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=csv")
 
 st.sidebar.markdown("---")
@@ -63,14 +69,6 @@ if st.session_state.downtimes:
         st.rerun()
 sim_params['downtimes'] = st.session_state.downtimes
 
-curr_params_hash = str(sim_params)
-params_changed = False
-if 'last_params_hash' not in st.session_state:
-    st.session_state.last_params_hash = curr_params_hash
-elif st.session_state.last_params_hash != curr_params_hash:
-    params_changed = True
-    st.session_state.last_params_hash = curr_params_hash
-
 # ==========================================
 # 2. HELPER FUNCTIONS
 # ==========================================
@@ -101,15 +99,11 @@ def parse_dt_from_str(dt_str, ref_dt):
         day = int(parts[0])
         hm = parts[1].split(':')
         h, m = int(hm[0]), int(hm[1])
-        
         dt = datetime(ref_dt.year, ref_dt.month, day, h, m)
         dt = IST.localize(dt)
-        
         if (dt - ref_dt).days < -10:
-            if ref_dt.month == 12:
-                dt = dt.replace(year=ref_dt.year + 1, month=1)
-            else:
-                dt = dt.replace(month=ref_dt.month + 1)
+            if ref_dt.month == 12: dt = dt.replace(year=ref_dt.year + 1, month=1)
+            else: dt = dt.replace(month=ref_dt.month + 1)
         return dt
     except: return pd.NaT
 
@@ -247,6 +241,66 @@ def parse_demurrage_special(cell_val):
     return "00:00"
 
 # ==========================================
+# NEW AI-STYLE OUTAGE EXTRACTOR
+# ==========================================
+def extract_smart_outages(df_sim_full):
+    """Scans all remarks, extracts XX:XX - YY:YY formats, and calculates outage times per department."""
+    records = []
+    for _, row in df_sim_full.iterrows():
+        arr_dt = row.get('_Arrival_DT', pd.NaT)
+        if pd.isnull(arr_dt): continue
+        
+        remarks = str(row.get('_remarks', ''))
+        if not remarks or remarks.lower() in ['nan', 'none', '']: continue
+        
+        rake = str(row.get('Rake', 'Unknown'))
+        date_str = arr_dt.strftime('%Y-%m-%d')
+        
+        lines = remarks.split('\n')
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            
+            # Smartly hunt for HH:MM - HH:MM
+            time_match = re.search(r'(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})', line)
+            hrs = 0.0
+            if time_match:
+                start_str, end_str = time_match.groups()
+                try:
+                    sh, sm = map(int, start_str.split(':'))
+                    eh, em = map(int, end_str.split(':'))
+                    s_min = sh * 60 + sm
+                    e_min = eh * 60 + em
+                    # Handle cross-midnight
+                    if e_min < s_min: e_min += 24 * 60
+                    hrs = round((e_min - s_min) / 60.0, 2)
+                except: pass
+            
+            if hrs > 0:
+                # Classify the department for charting
+                dept = "Misc"
+                dept_match = re.search(r'([A-Za-z\&]+):', line)
+                if dept_match:
+                    dept = classify_reason(dept_match.group(1))
+                else:
+                    for k in ['MM', 'MECH', 'C&I', 'CNI', 'EMD', 'ELEC', 'C&W', 'WAGON', 'MGR', 'CHEM', 'OPR', 'OPER']:
+                        if k in line.upper():
+                            dept = classify_reason(k)
+                            break
+                            
+                clean_reason = re.sub(r'\[.*?\]\s*-\s*', '', line)
+                records.append({
+                    'Date': date_str,
+                    'Month': arr_dt.month,
+                    'Year': arr_dt.year,
+                    'Rake': rake,
+                    'Department': dept,
+                    'Outage Hours': hrs,
+                    'Extracted Text': clean_reason
+                })
+    return pd.DataFrame(records)
+
+# ==========================================
 # 3. GOOGLE SHEET PARSER
 # ==========================================
 
@@ -295,7 +349,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             if curr_reason and curr_reason.lower() not in ['nan', 'none', '']:
                 raw_texts.append(curr_reason)
                 
-            # Scan down column L until a new rake appears in Column B
             j = i + 1
             while j < len(df_gs):
                 next_rake_name = str(df_gs.iloc[j, 1]).strip()
@@ -319,7 +372,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                 if t_upper in known_depts:
                     if curr_header and curr_lines:
                         parsed_blocks.append((curr_header, " ".join(curr_lines)))
-                    curr_header = text.strip()  # Keeps the exact text as written in Col L
+                    curr_header = text.strip() 
                     curr_lines = []
                 else:
                     if curr_header is None:
@@ -329,12 +382,10 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             if curr_header and curr_lines:
                 parsed_blocks.append((curr_header, " ".join(curr_lines)))
 
-            # Build the grouped string: [Rake Name] - Dept: Reason \n Dept2: Reason2
             if parsed_blocks:
                 dept_strings = []
                 for dept, r_text in parsed_blocks:
                     dept_strings.append(f"{dept}: {r_text}")
-                
                 full_remarks_blob = f"[{rake_name}] - " + "\n".join(dept_strings)
             else:
                 full_remarks_blob = ""
@@ -347,7 +398,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             tippler_timings = {}
             active_tipplers_row = []
             explicit_wagon_counts = {}
-            
             tippler_objs = {} 
 
             for t_name, idx in [('T1', 14), ('T2', 15), ('T3', 16), ('T4', 17)]:
@@ -365,10 +415,8 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                         tippler_timings[f"{t_name} Start"] = format_dt(ts)
                         tippler_timings[f"{t_name} End"] = format_dt(te)
                         tippler_timings[f"{t_name}_Obj_End"] = te
-                        
                         tippler_objs[f"{t_name}_Start_Obj"] = ts
                         tippler_objs[f"{t_name}_End_Obj"] = te
-                        
                         if wc is not None: explicit_wagon_counts[t_name] = wc
 
             col_h_dt = safe_parse_date(row.iloc[7])
@@ -540,7 +588,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     w_batch, w_delay, downtimes = params['wb'], params['wd'], params['downtimes']
 
     to_plan = []
-    
     if not df_unplanned.empty:
         for _, row in df_unplanned.iterrows():
             to_plan.append(row.to_dict())
@@ -747,7 +794,7 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     
     if not df_locked.empty:
         # ==========================================
-        # REVERTED TO 1-DAY (YESTERDAY) VISUAL FILTER
+        # REVERTED: 1-DAY (YESTERDAY ONWARDS) FILTER
         # ==========================================
         today_date = datetime.now(IST).date()
         yesterday_date = today_date - timedelta(days=1) 
@@ -762,7 +809,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
         actuals_clean = df_locked_visible.drop(columns=[c for c in cols_to_drop if c in df_locked_visible.columns], errors='ignore')
         
         final_df_display = pd.concat([actuals_clean, df_sim], ignore_index=True) if not df_sim.empty else actuals_clean
-        # FULL HISTORY FOR TAB 2
         final_df_all = pd.concat([df_locked, df_sim], ignore_index=True)
     else:
         final_df_display = df_sim
@@ -783,7 +829,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         if arr_dt.tzinfo is None: arr_dt = IST.localize(arr_dt)
         d_str = arr_dt.strftime('%Y-%m-%d')
         
-        # Initialize dictionary structures even if we filter later to ensure accurate averages
         if d_str not in daily_stats: 
             daily_stats[d_str] = {
                 'Demurrage': 0, 'All_Reasons': set(),
@@ -881,7 +926,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         if end_filter_dt and d_obj > end_filter_dt: continue
 
         reasons_set = v['All_Reasons']
-        
         if reasons_set:
             major_reasons_str = "\n\n----------\n\n".join(sorted(reasons_set))
         else:
@@ -904,11 +948,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         output_rows.append(row)
         
     return pd.DataFrame(output_rows)
-
-def highlight_bobr(row):
-    if 'BOBR' in str(row['Load Type']).upper():
-        return ['background-color: #FFD700; color: black'] * len(row)
-    return [''] * len(row)
 
 # ==========================================
 # 6. MAIN EXECUTION
@@ -975,7 +1014,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                 st.markdown(f"### 📅 Schedule for {d}")
                 day_df = df_final[df_final['Date_Str'] == d].copy()
                 day_df.index = np.arange(1, len(day_df) + 1)
-                st.dataframe(day_df.style.apply(highlight_bobr, axis=1), use_container_width=True, column_config=col_cfg)
+                st.dataframe(day_df.style.apply(lambda x: ['background-color: #FFD700; color: black'] * len(x) if 'BOBR' in str(x['Load Type']).upper() else [''] * len(x), axis=1), use_container_width=True, column_config=col_cfg)
 
             # ==========================================
             # REVERTED TO 1-DAY (YESTERDAY) STATS FILTER
@@ -986,7 +1025,49 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             
             st.dataframe(daily_stats_df, hide_index=True)
             
-            st.download_button("📥 Download Final Report", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
+            # ==========================================
+            # NEW: AI OUTAGE EXTRACTOR & PIE CHARTS
+            # ==========================================
+            st.markdown("---")
+            st.markdown("### 🥧 Monthly Department Outage Report (AI Extracted)")
+            
+            outage_df = extract_smart_outages(st.session_state.sim_full_result)
+            
+            if not outage_df.empty:
+                now_curr = datetime.now(IST)
+                curr_m, curr_y = now_ist.month, now_ist.year
+                prev_m, prev_y = (12, curr_y - 1) if curr_m == 1 else (curr_m - 1, curr_y)
+                
+                curr_df = outage_df[(outage_df['Month'] == curr_m) & (outage_df['Year'] == curr_y)]
+                prev_df = outage_df[(outage_df['Month'] == prev_m) & (outage_df['Year'] == prev_y)]
+                
+                if HAS_PLOTLY:
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.write(f"**Current Month ({now_curr.strftime('%B %Y')})**")
+                        if not curr_df.empty:
+                            pie_curr = curr_df.groupby('Department')['Outage Hours'].sum().reset_index()
+                            fig1 = px.pie(pie_curr, names='Department', values='Outage Hours', hole=0.3)
+                            st.plotly_chart(fig1, use_container_width=True)
+                        else:
+                            st.info("No formatted outage times found this month.")
+                            
+                    with c2:
+                        prev_dt_name = datetime(prev_y, prev_m, 1).strftime('%B %Y')
+                        st.write(f"**Last Month ({prev_dt_name})**")
+                        if not prev_df.empty:
+                            pie_prev = prev_df.groupby('Department')['Outage Hours'].sum().reset_index()
+                            fig2 = px.pie(pie_prev, names='Department', values='Outage Hours', hole=0.3)
+                            st.plotly_chart(fig2, use_container_width=True)
+                        else:
+                            st.info("No formatted outage times found last month.")
+                else:
+                    st.warning("⚠️ Please run `pip install plotly` in your terminal to see the Pie Charts.")
+
+                report_df = outage_df.drop(columns=['Month', 'Year'])
+                st.download_button("📥 Download Extracted Monthly Outage Report", report_df.to_csv(index=False).encode('utf-8'), "monthly_department_outages.csv", "text/csv")
+            else:
+                st.info("No outage times (Format: XX:XX - YY:YY) were found in the recent remarks.")
 
         with tab_hist:
             st.subheader("🔍 Past Performance Analysis")
