@@ -50,7 +50,7 @@ if not HAS_OPENPYXL:
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("⚙️ Settings")
 
-# GOOGLE SHEET LINK - Updated to your explicit multi-tab Excel link
+# GOOGLE SHEET LINK
 raw_gs_url = st.sidebar.text_input(
     "Google Sheet XLSX Link", 
     value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=xlsx"
@@ -321,7 +321,7 @@ def extract_smart_outages(df_sim_full):
                     t_str = t_str.replace('.', ':')
                     if ':' in t_str:
                         return map(int, t_str.split(':'))
-                    else:
+                    else: # Handles 1400 railway format
                         return int(t_str[:-2]), int(t_str[-2:])
                 
                 try:
@@ -329,7 +329,7 @@ def extract_smart_outages(df_sim_full):
                     eh, em = parse_hm(end_str)
                     s_min = sh * 60 + sm
                     e_min = eh * 60 + em
-                    if e_min < s_min: e_min += 24 * 60 
+                    if e_min < s_min: e_min += 24 * 60 # Handles cross-midnight outages
                     hrs = round((e_min - s_min) / 60.0, 2)
                 except: pass
             
@@ -408,11 +408,13 @@ def create_pdf_file(month_name, ai_summary):
     
     pdf.set_font("Arial", '', 11)
     
+    # Strip markdown and special characters that crash standard FPDF
     clean_ai = ai_summary.replace('**', '').replace('*', '-').replace('#', '')
     clean_ai = clean_ai.replace('\u2013', '-').replace('\u2014', '-')
     clean_ai = clean_ai.replace('\u2018', "'").replace('\u2019', "'")
     clean_ai = clean_ai.replace('\u201c', '"').replace('\u201d', '"')
     
+    # Safely encode to latin-1 to avoid emoji crashes
     clean_ai = clean_ai.encode('latin-1', 'replace').decode('latin-1')
     
     pdf.multi_cell(0, 7, clean_ai)
@@ -423,22 +425,29 @@ def create_pdf_file(month_name, ai_summary):
             return f.read()
 
 # ==========================================
-# 3. GOOGLE SHEET PARSER (UPGRADED FOR TABS & DEBUGGING)
+# 3. GOOGLE SHEET PARSER (MULTI-TAB EXCEL)
 # ==========================================
+
+def safe_parse_date(val):
+    if pd.isnull(val) or str(val).strip() == "" or str(val).strip().upper() == "U/P": return pd.NaT
+    try:
+        dt = pd.to_datetime(val, dayfirst=True, errors='coerce') 
+        if pd.isnull(dt): return pd.NaT 
+        return to_ist(dt)
+    except: return pd.NaT
 
 @st.cache_data(ttl=60)
 def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
     try:
         # Robust Download Method using requests
         response = requests.get(url)
-        response.raise_for_status() # This will catch 404 (Not Found) or 403 (Private) errors
+        response.raise_for_status() 
         
-        # Read ALL sheets from the downloaded Excel bytes
+        # Read ALL sheets from the published Excel file
         all_sheets = pd.read_excel(BytesIO(response.content), sheet_name=None, header=None, skiprows=1, engine='openpyxl')
         
         df_list = []
         for sheet_name, df_sheet in all_sheets.items():
-            # Check if the tab actually has data (at least 18 columns)
             if len(df_sheet.columns) >= 18:
                 df_list.append(df_sheet)
                 
@@ -643,9 +652,9 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
         return pd.DataFrame(locked_actuals), pd.DataFrame(unplanned_actuals), last_seq_tuple
 
     except Exception as e:
-        # THIS WILL PRINT THE EXACT ERROR ON YOUR APP SCREEN
         st.error(f"🚨 Google Sheet Error: {str(e)}")
         return pd.DataFrame(), pd.DataFrame(), (0,0)
+
 # ==========================================
 # 4. CORE SIMULATION LOGIC
 # ==========================================
@@ -1156,7 +1165,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             st.markdown("---")
             st.markdown("### 🥧 Monthly Overview & AI Summary")
             
-            # Smart Dynamic List: Start from Jan 2026, go up to Current Date
             today_real = datetime.now(IST).date()
             limit_date = datetime(2026, 1, 1).date()
             available_months = []
@@ -1271,4 +1279,3 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
-
