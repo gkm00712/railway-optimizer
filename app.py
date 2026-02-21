@@ -6,6 +6,8 @@ import math
 import numpy as np
 import re
 import tempfile
+import calendar
+from dateutil.relativedelta import relativedelta
 
 try:
     import plotly.express as px
@@ -35,10 +37,20 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("⚙️ Settings")
-# GOOGLE SHEET LINK
-gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=csv")
 
-# # ==========================================
+# GOOGLE SHEET LINK
+raw_gs_url = st.sidebar.text_input(
+    "Google Sheet CSV Link", 
+    value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=csv"
+)
+
+# Smartly auto-convert pubhtml to CSV format if pasted accidentally
+if "pubhtml" in raw_gs_url:
+    gs_url = raw_gs_url.replace("pubhtml", "pub?output=csv")
+else:
+    gs_url = raw_gs_url
+
+# ==========================================
 # GEMINI API KEY INPUT (STREAMLIT SECRETS)
 # ==========================================
 st.sidebar.markdown("---")
@@ -55,7 +67,8 @@ else:
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📅 Data Limits (Tab 2)")
-history_start_date = st.sidebar.date_input("Load History From", value=datetime(2026, 1, 1).date())
+# Hardcoded to Jan 1, 2026 onwards
+history_start_date = st.sidebar.date_input("Load History From", value=datetime(2026, 1, 1).date(), min_value=datetime(2026, 1, 1).date())
 
 st.sidebar.markdown("---")
 sim_params = {}
@@ -340,7 +353,7 @@ def generate_gemini_summary(raw_reasons_list, api_key):
     if not HAS_GEMINI:
         return "Error: Please run `pip install google-genai` to use AI features."
     if not api_key:
-        return "Error: No API key provided in the sidebar."
+        return "Error: No API key provided in Streamlit Secrets."
     
     combined_text = "\n".join([str(r) for r in raw_reasons_list if r and str(r).strip() != "-"])
     if not combined_text.strip():
@@ -357,7 +370,7 @@ def generate_gemini_summary(raw_reasons_list, api_key):
     1. Group the summary cleanly by Department.
     2. Accurately list the estimated outage times mentioned.
     3. Briefly highlight any recurring trends.
-    4. Keep it concise, professional, and use bullet points.
+    4. Keep it concise, professional, and use simple bullet points (do not use complex markdown formatting or emojis).
     """
 
     try:
@@ -374,7 +387,7 @@ def generate_gemini_summary(raw_reasons_list, api_key):
 # PDF GENERATOR
 # ==========================================
 def create_pdf_file(month_name, ai_summary):
-    """Generates a PDF using the fpdf library."""
+    """Generates a PDF using the fpdf library safely."""
     if not HAS_FPDF: return None
     
     pdf = FPDF()
@@ -385,15 +398,13 @@ def create_pdf_file(month_name, ai_summary):
     
     pdf.set_font("Arial", '', 11)
     
-    # Strip markdown bold formatting so the standard FPDF text looks clean
-    clean_ai = ai_summary.replace('**', '').replace('*', '-')
-    
-    # Fix common unicode characters that crash standard fpdf
+    # Strip markdown and special characters that crash standard FPDF
+    clean_ai = ai_summary.replace('**', '').replace('*', '-').replace('#', '')
     clean_ai = clean_ai.replace('\u2013', '-').replace('\u2014', '-')
     clean_ai = clean_ai.replace('\u2018', "'").replace('\u2019', "'")
     clean_ai = clean_ai.replace('\u201c', '"').replace('\u201d', '"')
     
-    # Safely encode to latin-1
+    # Safely encode to latin-1 to avoid emoji crashes
     clean_ai = clean_ai.encode('latin-1', 'replace').decode('latin-1')
     
     pdf.multi_cell(0, 7, clean_ai)
@@ -1122,36 +1133,37 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             st.download_button("📥 Download Final Schedule", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
             
             # ==========================================
-            # NEW: MONTHLY AI REPORT & PIE CHART ON TAB 1
+            # DYNAMIC MONTHLY AI REPORT & PIE CHART
             # ==========================================
             st.markdown("---")
             st.markdown("### 🥧 Monthly Overview & AI Summary")
             
-            # Generate available months dynamically
-            sim_full_result['MonthYear'] = sim_full_result['_Arrival_DT'].dt.strftime('%B %Y')
-            available_months = sim_full_result['MonthYear'].dropna().unique().tolist()
+            # Smart Dynamic List: Start from Jan 2026, go up to Current Date
+            today_real = datetime.now(IST).date()
+            limit_date = datetime(2026, 1, 1).date()
+            available_months = []
             
-            curr_my = datetime.now(IST).strftime('%B %Y')
-            if curr_my not in available_months:
-                available_months.insert(0, curr_my)
+            curr_iter = today_real.replace(day=1)
+            while curr_iter >= limit_date:
+                available_months.append(curr_iter.strftime('%B %Y'))
+                curr_iter -= relativedelta(months=1)
             
-            try:
-                def_idx = available_months.index(curr_my)
-            except ValueError:
-                def_idx = 0
+            if not available_months:
+                available_months.append(today_real.strftime('%B %Y'))
                 
-            selected_my = st.selectbox("Select Month for Report", available_months, index=def_idx)
+            selected_my = st.selectbox("Select Month for Report", available_months, index=0)
             
-            # Extract date boundaries for the selected month
             sel_dt = datetime.strptime(selected_my, "%B %Y")
             start_m = sel_dt.date()
-            import calendar
             end_m = start_m.replace(day=calendar.monthrange(start_m.year, start_m.month)[1])
             
-            # Render Pie Chart
-            outage_df = extract_smart_outages(sim_full_result)
-            month_outage_df = outage_df[(outage_df['Month'] == sel_dt.month) & (outage_df['Year'] == sel_dt.year)]
-            
+            # Extract and Display Pie Chart
+            outage_df = extract_smart_outages(st.session_state.sim_full_result)
+            if not outage_df.empty:
+                month_outage_df = outage_df[(outage_df['Month'] == sel_dt.month) & (outage_df['Year'] == sel_dt.year)]
+            else:
+                month_outage_df = pd.DataFrame()
+
             if HAS_PLOTLY:
                 if not month_outage_df.empty:
                     pie_data = month_outage_df.groupby('Department')['Outage Hours'].sum().reset_index()
@@ -1167,12 +1179,12 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             with col_a1:
                 if st.button(f"✨ Generate AI Report for {selected_my}"):
                     if not gemini_api_key:
-                        st.error("Please add your Gemini API Key in the sidebar.")
+                        st.error("Please add your Gemini API Key to Streamlit Secrets.")
                     elif not HAS_GEMINI:
                         st.error("Please run `pip install google-genai`.")
                     else:
                         with st.spinner(f"Analyzing notes for {selected_my}..."):
-                            month_stats = recalculate_cascade_reactive(sim_full_result, start_filter_dt=start_m, end_filter_dt=end_m)
+                            month_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_m, end_filter_dt=end_m)
                             raw_reasons = month_stats['Major Reasons'].dropna().tolist()
                             combined_text = "\n".join([str(r) for r in raw_reasons if r and str(r).strip() != "-"])
                             
@@ -1241,7 +1253,6 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     
                     hist_raw = hist_raw[hist_raw['Demurrage'].apply(has_demurrage)]
                     
-                    cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data', 'MonthYear']
+                    cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
-
