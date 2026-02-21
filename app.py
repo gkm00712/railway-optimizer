@@ -12,6 +12,13 @@ try:
 except ImportError:
     HAS_PLOTLY = False
 
+# Import the Gemini SDK
+try:
+    from google import genai
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
+
 # ==========================================
 # 1. PAGE CONFIGURATION & INPUTS
 # ==========================================
@@ -24,6 +31,14 @@ IST = pytz.timezone('Asia/Kolkata')
 st.sidebar.header("⚙️ Settings")
 # GOOGLE SHEET LINK
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=csv")
+
+# ==========================================
+# GEMINI API KEY INPUT (HARDCODED)
+# ==========================================
+# The API key is set directly in the background. No sidebar box will appear.
+gemini_api_key = "AIzaSyCISS08a9FDzL_uf81ge-FmPcsFeEyBniY"
+# ==========================================
+# ==========================================
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📅 Data Limits (Tab 2)")
@@ -218,7 +233,6 @@ def classify_reason(reason_text):
     mm_keys = ['MM', 'MECH', 'MECHANICAL', 'BELT', 'ROLL', 'IDLER', 'LINER', 'CHUTE', 'GEAR', 'BEARING', 'PULLEY']
     emd_keys = ['EMD', 'ELEC', 'ELECTRICAL', 'MOTOR', 'POWER', 'SUPPLY', 'CABLE', 'TRIP', 'FUSE']
     cni_keys = ['C&I', 'CNI', 'SENSOR', 'PROBE', 'SIGNAL', 'PLC', 'COMM', 'ZERO']
-    # WAGON and C&W moved strictly to MGR
     mgr_keys = ['MGR', 'TRACK', 'LOCO', 'DERAIL', 'SLEEPER', 'C&W', 'WAGON', 'DOOR', 'COUPL', 'RAKE']
     chem_keys = ['CHEM', 'CHEMISTRY', 'LAB', 'QUALITY', 'SAMPLE', 'ASH', 'MOISTURE']
     opr_keys = ['OPR', 'OPER', 'OPERATIONS', 'CREW', 'SHIFT', 'MANPOWER', 'BUNKER', 'FULL', 'WAIT']
@@ -248,7 +262,7 @@ def parse_demurrage_special(cell_val):
     return "00:00"
 
 # ==========================================
-# UPGRADED SMART OUTAGE EXTRACTOR
+# SMART OUTAGE EXTRACTOR (FOR PIE CHARTS)
 # ==========================================
 def extract_smart_outages(df_sim_full):
     """Scans all remarks, extracts HH:MM - HH:MM formats (even with dots or 'to'), and calculates outage times."""
@@ -268,12 +282,10 @@ def extract_smart_outages(df_sim_full):
             line = line.strip()
             if not line: continue
             
-            # This smart regex now catches "14:30 - 15:30", "14.30-15.30", and "14:30 to 15:30"
             time_match = re.search(r'(\d{1,2}[:.]\d{2})\s*(?:-|to|till|until)\s*(\d{1,2}[:.]\d{2})', line, re.IGNORECASE)
             hrs = 0.0
             if time_match:
                 start_str, end_str = time_match.groups()
-                # Normalize dots to colons
                 start_str = start_str.replace('.', ':')
                 end_str = end_str.replace('.', ':')
                 try:
@@ -281,13 +293,11 @@ def extract_smart_outages(df_sim_full):
                     eh, em = map(int, end_str.split(':'))
                     s_min = sh * 60 + sm
                     e_min = eh * 60 + em
-                    # Handle cross-midnight
                     if e_min < s_min: e_min += 24 * 60
                     hrs = round((e_min - s_min) / 60.0, 2)
                 except: pass
             
             if hrs > 0:
-                # Classify the department for charting
                 dept = "Misc"
                 dept_match = re.search(r'([A-Za-z\&]+):', line)
                 if dept_match:
@@ -352,7 +362,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             wagons, load_type = parse_col_d_wagon_type(col_d_val)
 
             # ==========================================
-            # UPGRADED DEMURRAGE REASON PARSER
+            # GROUPED DEMURRAGE REASON PARSER
             # ==========================================
             raw_texts = []
             curr_reason = str(row.iloc[11]).strip()
@@ -374,7 +384,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             curr_header = None
             curr_lines = []
             
-            # Added OTHER and MISC so they act as their own clean boundaries
             known_depts = ['MM', 'MECH', 'MECHANICAL', 'C&I', 'CNI', 'EMD', 'ELEC', 'ELECTRICAL', 'C&W', 'WAGON', 'MGR', 'CHEM', 'CHEMISTRY', 'OPR', 'OPER', 'OPERATIONS', 'OTHER', 'OTHERS', 'MISC', 'MISCELLANEOUS']
             
             for text in raw_texts:
@@ -382,11 +391,8 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                 clean_t = t_upper.replace(":", "").strip()
                 
                 if clean_t in known_depts:
-                    # Only save the previous header if it actually had text below it!
                     if curr_header and curr_lines:
                         parsed_blocks.append((curr_header, ", ".join(curr_lines)))
-                    
-                    # Set the new header, wipe the lines clean
                     curr_header = clean_t 
                     curr_lines = []
                 else:
@@ -401,8 +407,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
                 dept_strings = []
                 for dept, r_text in parsed_blocks:
                     dept_strings.append(f"{dept}: {r_text}")
-                
-                # Joins completely different departments with a \n so they start on the next line
                 full_remarks_blob = f"[{rake_name}] - " + "\n".join(dept_strings)
             else:
                 full_remarks_blob = ""
@@ -1082,6 +1086,48 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
+
+                # ==========================================
+                # NEW: AI EXECUTIVE SUMMARY BUTTON
+                # ==========================================
+                st.markdown("---")
+                st.markdown("### ✨ AI Monthly Executive Summary")
+                
+                if st.button("Generate Professional AI Report"):
+                    if not gemini_api_key:
+                        st.error("Please paste your Gemini API Key in the sidebar to use this feature.")
+                    elif not HAS_GEMINI:
+                        st.error("Missing dependency. Please add `google-genai` to your requirements.txt file.")
+                    else:
+                        with st.spinner("Gemini is reading the operator notes and generating the report..."):
+                            raw_reasons = hist_stats['Major Reasons'].dropna().tolist()
+                            if not raw_reasons:
+                                st.warning("No recorded delays in this timeframe to analyze.")
+                            else:
+                                combined_text = "\n".join([str(r) for r in raw_reasons if r and str(r).strip() != "-"])
+                                prompt = f"""
+                                You are an expert Railway Logistics Manager analyzing coal train unloading delays.
+                                Please read the following raw operator notes and create a beautifully formatted Executive Summary.
+                                
+                                Raw Notes:
+                                {combined_text}
+                                
+                                Formatting Rules:
+                                1. Group the summary by Department (Mechanical, Electrical, MGR, C&I, Chemistry, Operations, Misc).
+                                2. Accurately list the estimated outage times mentioned.
+                                3. Briefly highlight any recurring trends or major issues.
+                                4. Keep it concise and use bullet points for easy reading.
+                                """
+                                try:
+                                    client = genai.Client(api_key=gemini_api_key)
+                                    response = client.models.generate_content(
+                                        model='gemini-2.5-flash',
+                                        contents=prompt,
+                                    )
+                                    st.success("Analysis Complete!")
+                                    st.info(response.text)
+                                except Exception as e:
+                                    st.error(f"Error communicating with Gemini API: {str(e)}")
 
                 # ==========================================
                 # PIE CHARTS (Extracted without AI)
