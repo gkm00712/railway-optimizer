@@ -16,8 +16,7 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("⚙️ Settings")
-# REPLACE THE LINK BELOW WITH YOUR "RAKE UNLOADING REPORT" CSV LINK
-gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=csv")
+gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vTlqPtwJyVkJYLs3V2t1kMw0It1zURfH3fU7vtLKX0BaQ_p71b2xvkH4NRazgD9Bg/pub?output=csv")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📅 Data Limits (Tab 2)")
@@ -288,7 +287,7 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             wagons, load_type = parse_col_d_wagon_type(col_d_val)
 
             # ==========================================
-            # UPDATED: GROUPED DEMURRAGE REASON PARSER
+            # GROUPED DEMURRAGE REASON PARSER
             # ==========================================
             raw_texts = []
             curr_reason = str(row.iloc[11]).strip()
@@ -333,7 +332,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             if parsed_blocks:
                 dept_strings = []
                 for dept, r_text in parsed_blocks:
-                    # Append the exact department written instead of the standardized class
                     dept_strings.append(f"{dept}: {r_text}")
                 
                 full_remarks_blob = f"[{rake_name}] - " + "\n".join(dept_strings)
@@ -785,8 +783,15 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         if start_filter_dt and arr_dt.date() < start_filter_dt: continue
         if end_filter_dt and arr_dt.date() > end_filter_dt: continue
 
+        # ==========================================
+        # UPDATED: SHUNTING COUNTERS INITIALIZATION
+        # ==========================================
         if d_str not in daily_stats: 
-            daily_stats[d_str] = {'Demurrage': 0, 'All_Reasons': set()}
+            daily_stats[d_str] = {
+                'Demurrage': 0, 'All_Reasons': set(),
+                'L8_10_shunt_sec': 0.0, 'L8_10_shunt_cnt': 0,
+                'L11_shunt_sec': 0.0, 'L11_shunt_cnt': 0
+            }
             for t in ['T1', 'T2', 'T3', 'T4']: 
                 daily_stats[d_str][f'{t}_hrs'] = 0.0
                 daily_stats[d_str][f'{t}_wag'] = 0.0
@@ -797,6 +802,29 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             rem = str(row.get('_remarks', '')).strip()
             if rem:
                 daily_stats[d_str]['All_Reasons'].add(rem)
+
+        # ==========================================
+        # UPDATED: EXTRACT ACTUAL SHUNTING TIMES
+        # ==========================================
+        opt_type = str(row.get('Optimization Type', ''))
+        if "Actual" in opt_type:
+            ready_dt = row.get('_Shunt_Ready_DT', pd.NaT)
+            if pd.notnull(arr_dt) and pd.notnull(ready_dt):
+                if isinstance(ready_dt, str):
+                    ready_dt = pd.to_datetime(ready_dt, errors='coerce')
+                
+                if pd.notnull(ready_dt) and ready_dt >= arr_dt:
+                    shunt_sec = (ready_dt - arr_dt).total_seconds()
+                    tipps = row.get('_raw_tipplers', [])
+                    
+                    if isinstance(tipps, list):
+                        if 'T1' in tipps or 'T2' in tipps:
+                            daily_stats[d_str]['L8_10_shunt_sec'] += shunt_sec
+                            daily_stats[d_str]['L8_10_shunt_cnt'] += 1
+                        elif 'T3' in tipps or 'T4' in tipps:
+                            daily_stats[d_str]['L11_shunt_sec'] += shunt_sec
+                            daily_stats[d_str]['L11_shunt_cnt'] += 1
+        # ==========================================
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
@@ -834,7 +862,11 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                     
                     if in_range:
                         if curr_day_str not in daily_stats: 
-                            daily_stats[curr_day_str] = {'Demurrage': 0, 'All_Reasons': set()}
+                            daily_stats[curr_day_str] = {
+                                'Demurrage': 0, 'All_Reasons': set(),
+                                'L8_10_shunt_sec': 0.0, 'L8_10_shunt_cnt': 0,
+                                'L11_shunt_sec': 0.0, 'L11_shunt_cnt': 0
+                            }
                             for tx in ['T1', 'T2', 'T3', 'T4']: 
                                 daily_stats[curr_day_str][f'{tx}_hrs'] = 0.0
                                 daily_stats[curr_day_str][f'{tx}_wag'] = 0.0
@@ -853,15 +885,25 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         reasons_set = v['All_Reasons']
         
         if reasons_set:
-            major_reasons_str = "\n---".join(sorted(reasons_set))
+            major_reasons_str = "\n\n----------\n\n".join(sorted(reasons_set))
         else:
             major_reasons_str = "-"
+
+        # ==========================================
+        # UPDATED: SHUNTING AVERAGES CALCULATION
+        # ==========================================
+        avg_8_10 = v['L8_10_shunt_sec'] / v['L8_10_shunt_cnt'] if v['L8_10_shunt_cnt'] > 0 else 0
+        avg_11 = v['L11_shunt_sec'] / v['L11_shunt_cnt'] if v['L11_shunt_cnt'] > 0 else 0
 
         row = {
             'Date': d, 
             'Demurrage': f"{int(v['Demurrage'])} Hours",
+            'Avg Shunt L8-10 (T1/T2)': f"{int(avg_8_10 // 60)} min" if avg_8_10 > 0 else "-",
+            'Avg Shunt L11 (T3/T4)': f"{int(avg_11 // 60)} min" if avg_11 > 0 else "-",
             'Major Reasons': major_reasons_str
         }
+        # ==========================================
+        
         for t in ['T1', 'T2', 'T3', 'T4']:
             rate = 0.0
             if v[f'{t}_hrs'] > 0.1: rate = v[f'{t}_wag'] / v[f'{t}_hrs']
@@ -995,4 +1037,3 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
-
