@@ -17,7 +17,7 @@ IST = pytz.timezone('Asia/Kolkata')
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("⚙️ Settings")
 # PASTE YOUR PUBLISHED GOOGLE SHEET CSV LINK BELOW:
-gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=csv)
+gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=csv")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📅 Data Limits (Tab 2)")
@@ -1034,3 +1034,4 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
+
