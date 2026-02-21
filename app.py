@@ -38,12 +38,19 @@ st.sidebar.header("⚙️ Settings")
 # GOOGLE SHEET LINK
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=csv")
 
-# ==========================================
-# GEMINI API KEY INPUT (BLANK / NO HARDCODING)
+# # ==========================================
+# GEMINI API KEY INPUT (STREAMLIT SECRETS)
 # ==========================================
 st.sidebar.markdown("---")
 st.sidebar.subheader("✨ AI Integrations")
-gemini_api_key = st.sidebar.text_input("Gemini API Key", type="password", help="Paste your Gemini API Key here to enable Smart Summaries")
+
+# Safely fetch the API key from Streamlit's backend secrets
+gemini_api_key = None
+if "GEMINI_API_KEY" in st.secrets:
+    gemini_api_key = st.secrets["GEMINI_API_KEY"]
+    st.sidebar.success("✅ AI Connected via Secrets")
+else:
+    st.sidebar.error("⚠️ AI Key missing from Secrets")
 # ==========================================
 
 st.sidebar.markdown("---")
@@ -1237,3 +1244,4 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data', 'MonthYear']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
+
