@@ -16,7 +16,7 @@ IST = pytz.timezone('Asia/Kolkata')
 
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("⚙️ Settings")
-# PASTE YOUR PUBLISHED GOOGLE SHEET CSV LINK BELOW:
+# THE GOOGLE SHEET LINK IS NOW HARDCODED HERE
 gs_url = st.sidebar.text_input("Google Sheet CSV Link", value="https://docs.google.com/spreadsheets/d/e/2PACX-1vQT79KpkyFotkO0RfgaOlidKhprpDl-bksFTxSbO_9UPERTl0dbGtGyLqftKzEQ8WcS97e3-dAO-IRK/pub?output=csv")
 
 st.sidebar.markdown("---")
@@ -747,10 +747,10 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     
     if not df_locked.empty:
         # ==========================================
-        # UPDATED: 7-DAY VISUAL FILTER
+        # REVERTED TO 1-DAY (YESTERDAY) VISUAL FILTER
         # ==========================================
         today_date = datetime.now(IST).date()
-        yesterday_date = today_date - timedelta(days=7) # Show the last 7 days of actuals
+        yesterday_date = today_date - timedelta(days=1) 
         
         def keep_row(r):
             ad = r['_Arrival_DT'].date()
@@ -783,8 +783,7 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         if arr_dt.tzinfo is None: arr_dt = IST.localize(arr_dt)
         d_str = arr_dt.strftime('%Y-%m-%d')
         
-        # We must NOT skip processing the row here so that we capture Shunting Averages and Rates correctly.
-        
+        # Initialize dictionary structures even if we filter later to ensure accurate averages
         if d_str not in daily_stats: 
             daily_stats[d_str] = {
                 'Demurrage': 0, 'All_Reasons': set(),
@@ -845,7 +844,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                 while curr < e_dt:
                     curr_day_str = curr.strftime('%Y-%m-%d')
                     
-                    # Apply date filters safely inside the loop
                     curr_date = curr.date()
                     in_range = True
                     if start_filter_dt and curr_date < start_filter_dt: in_range = False
@@ -877,7 +875,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
 
     output_rows = []
     
-    # Filter final output safely so days outside the requested range aren't displayed
     for d, v in sorted(daily_stats.items()):
         d_obj = datetime.strptime(d, '%Y-%m-%d').date()
         if start_filter_dt and d_obj < start_filter_dt: continue
@@ -981,9 +978,9 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                 st.dataframe(day_df.style.apply(highlight_bobr, axis=1), use_container_width=True, column_config=col_cfg)
 
             # ==========================================
-            # UPDATED: 7-DAY PERFORMANCE FILTER
+            # REVERTED TO 1-DAY (YESTERDAY) STATS FILTER
             # ==========================================
-            yest_date = datetime.now(IST).date() - timedelta(days=7) # Show last 7 days of stats
+            yest_date = datetime.now(IST).date() - timedelta(days=1)
             daily_stats_df = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=yest_date)
             st.markdown("### 📊 Daily Performance & Demurrage Forecast")
             
@@ -1034,4 +1031,3 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
                     hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
                     st.dataframe(hist_raw_clean, use_container_width=True)
-
