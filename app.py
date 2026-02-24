@@ -297,7 +297,6 @@ def parse_demurrage_special(cell_val):
 # UPGRADED SMART OUTAGE EXTRACTOR
 # ==========================================
 def extract_smart_outages(df_sim_full):
-    """Scans all remarks, extracts HH:MM - HH:MM formats (even with dots or 'to'), and calculates outage times."""
     records = []
     for _, row in df_sim_full.iterrows():
         arr_dt = row.get('_Arrival_DT', pd.NaT)
@@ -400,7 +399,6 @@ def generate_gemini_summary(raw_reasons_list, api_key):
 # PDF GENERATOR
 # ==========================================
 def create_pdf_file(month_name, ai_summary):
-    """Generates a PDF using the fpdf library safely."""
     if not HAS_FPDF: return None
     
     pdf = FPDF()
@@ -473,7 +471,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             arrival_dt = safe_parse_date(row.iloc[4]) 
             if pd.isnull(arrival_dt): continue
             
-            # STRICT FILTER: Discard any data older than Jan 1, 2026
             if arrival_dt < dynamic_cutoff:
                 continue 
             
@@ -481,7 +478,6 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             col_d_val = row.iloc[3]
             wagons, load_type = parse_col_d_wagon_type(col_d_val)
 
-            # GROUPED DEMURRAGE REASON PARSER
             raw_texts = []
             curr_reason = str(row.iloc[11]).strip()
             if curr_reason and curr_reason.lower() not in ['nan', 'none', '']:
@@ -560,8 +556,9 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             col_h_dt = safe_parse_date(row.iloc[7])
             is_unplanned = pd.isnull(col_h_dt) 
             
+            # Smart Continuation Logic: Overwrite sequence if valid numbers found
             seq, rid = parse_last_sequence(rake_name)
-            if seq > last_seq_tuple[0] or (seq == last_seq_tuple[0] and rid > last_seq_tuple[1]):
+            if seq > 0 or rid > 0:
                 last_seq_tuple = (seq, rid)
 
             if is_unplanned:
@@ -820,30 +817,35 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
     curr_seq = last_seq_tuple[0]
     curr_id = last_seq_tuple[1]
     assignments = []
-
     reserved_sequences = set()
-    for _, rake in plan_df.iterrows():
-        if rake.get('is_gs_unplanned', False) and '/' in str(rake.get('Rake', '')):
-            s, i = parse_last_sequence(str(rake.get('Rake', '')))
-            if s > 0:
-                reserved_sequences.add((s, i))
 
     for _, rake in plan_df.iterrows():
         orig_name = str(rake.get('Rake', ''))
         is_gs = rake.get('is_gs_unplanned', False)
         
-        if is_gs and '/' in orig_name:
+        if is_gs:
             display_name = orig_name
             s, i = parse_last_sequence(display_name)
-            if s > curr_seq or (s == curr_seq and i > curr_id):
+            if i > 0 or s > 0:
                 curr_seq, curr_id = s, i
         else:
-            curr_seq += 1
-            curr_id += 1
+            if curr_id > 0: curr_id += 1
+            else: curr_seq += 1
+            
+            if curr_seq > 0 and curr_id > 0:
+                display_name = f"{curr_seq}/{curr_id}"
+            else:
+                display_name = str(max(curr_seq, curr_id))
+            
+            # Ensure unique forecast numbering
             while (curr_seq, curr_id) in reserved_sequences:
-                curr_id += 1
-            display_name = f"{curr_seq}/{curr_id}"
-            reserved_sequences.add((curr_seq, curr_id))
+                if curr_id > 0: curr_id += 1
+                else: curr_seq += 1
+                
+                if curr_seq > 0 and curr_id > 0: display_name = f"{curr_seq}/{curr_id}"
+                else: display_name = str(max(curr_seq, curr_id))
+                
+        reserved_sequences.add((curr_seq, curr_id))
         
         is_bobr = 'BOBR' in str(rake['Load Type']).upper()
 
@@ -979,13 +981,14 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         
         if d_str not in daily_stats: 
             daily_stats[d_str] = {
-                'Demurrage': 0, 'All_Reasons': set(),
-                'L8_10_shunt_sec': 0.0, 'L8_10_shunt_cnt': 0,
-                'L11_shunt_sec': 0.0, 'L11_shunt_cnt': 0
+                'Demurrage': 0, 'All_Reasons': set()
             }
+            # Initialize specifically for all 4 tipplers
             for t in ['T1', 'T2', 'T3', 'T4']: 
                 daily_stats[d_str][f'{t}_hrs'] = 0.0
                 daily_stats[d_str][f'{t}_wag'] = 0.0
+                daily_stats[d_str][f'{t}_shunt_sec'] = 0.0
+                daily_stats[d_str][f'{t}_shunt_cnt'] = 0
         
         daily_stats[d_str]['Demurrage'] += dem_hrs
         
@@ -995,6 +998,8 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                 daily_stats[d_str]['All_Reasons'].add(rem)
 
         opt_type = str(row.get('Optimization Type', ''))
+        
+        # Smart Shunting Breakdown to specific tipplers
         if "Actual" in opt_type:
             ready_dt = row.get('_Shunt_Ready_DT', pd.NaT)
             if pd.notnull(arr_dt) and pd.notnull(ready_dt):
@@ -1006,12 +1011,10 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                     tipps = row.get('_raw_tipplers', [])
                     
                     if isinstance(tipps, list):
-                        if 'T1' in tipps or 'T2' in tipps:
-                            daily_stats[d_str]['L8_10_shunt_sec'] += shunt_sec
-                            daily_stats[d_str]['L8_10_shunt_cnt'] += 1
-                        elif 'T3' in tipps or 'T4' in tipps:
-                            daily_stats[d_str]['L11_shunt_sec'] += shunt_sec
-                            daily_stats[d_str]['L11_shunt_cnt'] += 1
+                        for tx in ['T1', 'T2', 'T3', 'T4']:
+                            if tx in tipps:
+                                daily_stats[d_str][f'{tx}_shunt_sec'] += shunt_sec
+                                daily_stats[d_str][f'{tx}_shunt_cnt'] += 1
         
         wag_map = row.get('_raw_wagon_counts', {})
         if not isinstance(wag_map, dict): wag_map = {}
@@ -1050,13 +1053,13 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
                     if in_range:
                         if curr_day_str not in daily_stats: 
                             daily_stats[curr_day_str] = {
-                                'Demurrage': 0, 'All_Reasons': set(),
-                                'L8_10_shunt_sec': 0.0, 'L8_10_shunt_cnt': 0,
-                                'L11_shunt_sec': 0.0, 'L11_shunt_cnt': 0
+                                'Demurrage': 0, 'All_Reasons': set()
                             }
                             for tx in ['T1', 'T2', 'T3', 'T4']: 
                                 daily_stats[curr_day_str][f'{tx}_hrs'] = 0.0
                                 daily_stats[curr_day_str][f'{tx}_wag'] = 0.0
+                                daily_stats[curr_day_str][f'{tx}_shunt_sec'] = 0.0
+                                daily_stats[curr_day_str][f'{tx}_shunt_cnt'] = 0
                         
                         if total_dur_sec > 0:
                             fraction = segment_dur_sec / total_dur_sec
@@ -1074,25 +1077,25 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
         if end_filter_dt and d_obj > end_filter_dt: continue
 
         reasons_set = v['All_Reasons']
-        if reasons_set:
-            major_reasons_str = "\n\n----------\n\n".join(sorted(reasons_set))
-        else:
-            major_reasons_str = "-"
-
-        avg_8_10 = v['L8_10_shunt_sec'] / v['L8_10_shunt_cnt'] if v['L8_10_shunt_cnt'] > 0 else 0
-        avg_11 = v['L11_shunt_sec'] / v['L11_shunt_cnt'] if v['L11_shunt_cnt'] > 0 else 0
+        major_reasons_str = "\n\n----------\n\n".join(sorted(reasons_set)) if reasons_set else "-"
 
         row = {
             'Date': d, 
             'Demurrage': f"{int(v['Demurrage'])} Hours",
-            'Avg Shunt L8-10 (T1/T2)': f"{int(avg_8_10 // 60)} min" if avg_8_10 > 0 else "-",
-            'Avg Shunt L11 (T3/T4)': f"{int(avg_11 // 60)} min" if avg_11 > 0 else "-",
             'Major Reasons': major_reasons_str
         }
+        
+        # Add Tippler Rates
         for t in ['T1', 'T2', 'T3', 'T4']:
             rate = 0.0
             if v[f'{t}_hrs'] > 0.1: rate = v[f'{t}_wag'] / v[f'{t}_hrs']
             row[f"{t} Rate (W/Hr)"] = f"{rate:.2f}"
+            
+        # Add Individual Tippler Shunt Averages (Appended after T4 Rate)
+        for t in ['T1', 'T2', 'T3', 'T4']:
+            avg_shunt_sec = v[f'{t}_shunt_sec'] / v[f'{t}_shunt_cnt'] if v[f'{t}_shunt_cnt'] > 0 else 0
+            row[f"Avg Shunt {t} (min)"] = f"{int(avg_shunt_sec // 60)}" if avg_shunt_sec > 0 else "-"
+            
         output_rows.append(row)
         
     return pd.DataFrame(output_rows)
@@ -1148,6 +1151,22 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
         tab_live, tab_hist = st.tabs(["🚀 Live Schedule", "📜 Historical Analysis"])
 
         with tab_live:
+            # --- CUMULATIVE MONTH-TO-DATE METRICS ---
+            now_dt = datetime.now(IST)
+            mask_mtd = (st.session_state.sim_full_result['_Arrival_DT'].dt.month == now_dt.month) & \
+                       (st.session_state.sim_full_result['_Arrival_DT'].dt.year == now_dt.year) & \
+                       (st.session_state.sim_full_result['_Arrival_DT'] <= now_dt)
+            mtd_df = st.session_state.sim_full_result[mask_mtd]
+            mtd_boxn = mtd_df['Load Type'].astype(str).str.upper().str.contains('BOXN').sum()
+            mtd_bobr = mtd_df['Load Type'].astype(str).str.upper().str.contains('BOBR').sum()
+            
+            st.markdown(f"### 📈 Current Month Handled ({now_dt.strftime('%B %Y')})")
+            col_m1, col_m2, col_m3 = st.columns(3)
+            col_m1.metric("📦 Total Rakes Handled", f"{len(mtd_df)}")
+            col_m2.metric("🚂 BOXN Rakes", f"{mtd_boxn}")
+            col_m3.metric("⚡ BOBR Rakes", f"{mtd_bobr}")
+            st.markdown("---")
+
             col_cfg = {
                 "Rake": st.column_config.TextColumn("Rake Name", disabled=True),
                 "Coal Source": st.column_config.TextColumn("Source/Mine", disabled=True),
@@ -1270,8 +1289,21 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     if isinstance(dr, tuple) and len(dr) == 2: start_f, end_f = dr
             
             if start_f and end_f:
+                # --- CUMULATIVE METRICS FOR SELECTED HISTORICAL RANGE ---
+                mask_hist = (st.session_state.sim_full_result['_Arrival_DT'].dt.date >= start_f) & \
+                            (st.session_state.sim_full_result['_Arrival_DT'].dt.date <= end_f)
+                hist_df_filtered = st.session_state.sim_full_result[mask_hist]
+                hist_boxn = hist_df_filtered['Load Type'].astype(str).str.upper().str.contains('BOXN').sum()
+                hist_bobr = hist_df_filtered['Load Type'].astype(str).str.upper().str.contains('BOBR').sum()
+                
+                st.markdown(f"### 📈 Period Handled ({start_f} to {end_f})")
+                col_hm1, col_hm2, col_hm3 = st.columns(3)
+                col_hm1.metric("📦 Total Rakes Handled", f"{len(hist_df_filtered)}")
+                col_hm2.metric("🚂 BOXN Rakes", f"{hist_boxn}")
+                col_hm3.metric("⚡ BOBR Rakes", f"{hist_bobr}")
+                
                 hist_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_f, end_filter_dt=end_f)
-                st.markdown(f"**Performance Summary ({start_f} to {end_f})**")
+                st.markdown(f"**Performance Summary**")
                 
                 st.dataframe(hist_stats, hide_index=True, use_container_width=True)
                 
