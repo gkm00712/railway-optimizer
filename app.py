@@ -371,10 +371,10 @@ def generate_gemini_summary(raw_reasons_list, api_key):
     if not combined_text.strip():
         return "No outage remarks found for this period to summarize."
 
-    # Updated Prompt to strictly enforce Dates in the output
+    # Updated Prompt to strictly enforce Dates in the output, while maintaining original title request
     prompt = f"""
     You are an expert Railway Logistics Manager analyzing coal train unloading delays.
-    Please read the following daily operator notes and create a beautifully formatted Outages Summary.
+    Please read the following daily operator notes and create a beautifully formatted Executive Summary.
     
     Raw Notes:
     {combined_text}
@@ -405,7 +405,7 @@ def create_pdf_file(month_name, ai_summary):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", 'B', 16)
-    pdf.cell(0, 10, f"Outages Summary - {month_name}", 0, 1, 'C')
+    pdf.cell(0, 10, f"AI Executive Summary - {month_name}", 0, 1, 'C')
     pdf.ln(5)
     
     pdf.set_font("Arial", '', 11)
@@ -1198,7 +1198,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             # DYNAMIC MONTHLY AI REPORT & PIE CHART
             # ==========================================
             st.markdown("---")
-            st.markdown("### 🥧 Outages summary for the Month (AI Generated)")
+            st.markdown("### 🥧 Monthly Overview & AI Summary")
             
             today_real = datetime.now(IST).date()
             limit_date = datetime(2026, 1, 1).date()
@@ -1236,7 +1236,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
 
             col_a1, col_a2 = st.columns([1, 2])
             with col_a1:
-                if st.button(f"✨ Generate Outages Summary for {selected_my}"):
+                if st.button(f"✨ Generate AI Report for {selected_my}"):
                     if not gemini_api_key:
                         st.error("Please add your Gemini API Key to Streamlit Secrets.")
                     elif not HAS_GEMINI:
@@ -1268,7 +1268,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                         st.download_button(
                             label="📥 Download Extracted Report as PDF",
                             data=pdf_bytes,
-                            file_name=f"Outages_Summary_{selected_my.replace(' ', '_')}.pdf",
+                            file_name=f"AI_Executive_Summary_{selected_my.replace(' ', '_')}.pdf",
                             mime="application/pdf"
                         )
                 else:
