@@ -367,21 +367,22 @@ def generate_gemini_summary(raw_reasons_list, api_key):
     if not api_key:
         return "Error: No API key provided in Streamlit Secrets."
     
-    combined_text = "\n".join([str(r) for r in raw_reasons_list if r and str(r).strip() != "-"])
+    combined_text = "\n\n".join([str(r) for r in raw_reasons_list if r and str(r).strip() != "-"])
     if not combined_text.strip():
         return "No outage remarks found for this period to summarize."
 
+    # Updated Prompt to strictly enforce Dates in the output
     prompt = f"""
     You are an expert Railway Logistics Manager analyzing coal train unloading delays.
-    Please read the following raw operator notes and create a beautifully formatted Executive Summary.
+    Please read the following daily operator notes and create a beautifully formatted Outages Summary.
     
     Raw Notes:
     {combined_text}
     
     Formatting Rules:
     1. Group the summary cleanly by Department.
-    2. Accurately list the estimated outage times mentioned.
-    3. Briefly highlight any recurring trends.
+    2. For each issue, accurately list the specific Date, the estimated outage time, and the problem details.
+    3. Briefly highlight any recurring trends at the bottom.
     4. Keep it concise, professional, and use simple bullet points (do not use complex markdown formatting or emojis).
     """
 
@@ -404,7 +405,7 @@ def create_pdf_file(month_name, ai_summary):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", 'B', 16)
-    pdf.cell(0, 10, f"AI Executive Summary - {month_name}", 0, 1, 'C')
+    pdf.cell(0, 10, f"Outages Summary - {month_name}", 0, 1, 'C')
     pdf.ln(5)
     
     pdf.set_font("Arial", '', 11)
@@ -556,13 +557,11 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             col_h_dt = safe_parse_date(row.iloc[7])
             is_unplanned = pd.isnull(col_h_dt) 
             
-            # Smart Continuation Logic: Overwrite sequence if valid numbers found
             seq, rid = parse_last_sequence(rake_name)
             if seq > 0 or rid > 0:
                 last_seq_tuple = (seq, rid)
 
             if is_unplanned:
-                # AUTO-DROP OLD PENDING RAKES (> 3 DAYS)
                 if pd.notnull(arrival_dt) and (now_ist - arrival_dt).total_seconds() > (3 * 24 * 3600):
                     continue 
 
@@ -837,7 +836,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             else:
                 display_name = str(max(curr_seq, curr_id))
             
-            # Ensure unique forecast numbering
             while (curr_seq, curr_id) in reserved_sequences:
                 if curr_id > 0: curr_id += 1
                 else: curr_seq += 1
@@ -1186,14 +1184,21 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             yest_date = datetime.now(IST).date() - timedelta(days=1)
             daily_stats_df = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=yest_date)
             st.markdown("### 📊 Daily Performance & Demurrage Forecast")
-            st.dataframe(daily_stats_df, hide_index=True)
+            
+            # Using st.column_config to keep "Major Reasons" narrow for mobile viewing
+            st.dataframe(
+                daily_stats_df, 
+                hide_index=True, 
+                use_container_width=True,
+                column_config={"Major Reasons": st.column_config.TextColumn("Major Reasons", width="medium")}
+            )
             st.download_button("📥 Download Final Schedule", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
             
             # ==========================================
             # DYNAMIC MONTHLY AI REPORT & PIE CHART
             # ==========================================
             st.markdown("---")
-            st.markdown("### 🥧 Monthly Overview & AI Summary")
+            st.markdown("### 🥧 Outages summary for the Month (AI Generated)")
             
             today_real = datetime.now(IST).date()
             limit_date = datetime(2026, 1, 1).date()
@@ -1231,7 +1236,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
 
             col_a1, col_a2 = st.columns([1, 2])
             with col_a1:
-                if st.button(f"✨ Generate AI Report for {selected_my}"):
+                if st.button(f"✨ Generate Outages Summary for {selected_my}"):
                     if not gemini_api_key:
                         st.error("Please add your Gemini API Key to Streamlit Secrets.")
                     elif not HAS_GEMINI:
@@ -1239,13 +1244,17 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                     else:
                         with st.spinner(f"Analyzing notes for {selected_my}..."):
                             month_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_m, end_filter_dt=end_m)
-                            raw_reasons = month_stats['Major Reasons'].dropna().tolist()
-                            combined_text = "\n".join([str(r) for r in raw_reasons if r and str(r).strip() != "-"])
                             
-                            if not combined_text.strip():
+                            # Inject Dates alongside the Operator Notes so the AI can list them chronologically
+                            raw_reasons_with_dates = []
+                            for _, row in month_stats.iterrows():
+                                if row['Major Reasons'] and row['Major Reasons'] != "-":
+                                    raw_reasons_with_dates.append(f"Date: {row['Date']}\nIssues: {row['Major Reasons']}")
+                            
+                            if not raw_reasons_with_dates:
                                 st.warning("There are no operator remarks for this month to summarize.")
                             else:
-                                ai_summary = generate_gemini_summary([combined_text], gemini_api_key)
+                                ai_summary = generate_gemini_summary(raw_reasons_with_dates, gemini_api_key)
                                 st.session_state[f'ai_summary_{selected_my}'] = ai_summary
                                 st.success("Summary Generated!")
             
@@ -1259,7 +1268,7 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                         st.download_button(
                             label="📥 Download Extracted Report as PDF",
                             data=pdf_bytes,
-                            file_name=f"AI_Executive_Summary_{selected_my.replace(' ', '_')}.pdf",
+                            file_name=f"Outages_Summary_{selected_my.replace(' ', '_')}.pdf",
                             mime="application/pdf"
                         )
                 else:
@@ -1305,7 +1314,13 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
                 hist_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_f, end_filter_dt=end_f)
                 st.markdown(f"**Performance Summary**")
                 
-                st.dataframe(hist_stats, hide_index=True, use_container_width=True)
+                # Using column_config to wrap "Major Reasons" cleanly for mobile viewing
+                st.dataframe(
+                    hist_stats, 
+                    hide_index=True, 
+                    use_container_width=True,
+                    column_config={"Major Reasons": st.column_config.TextColumn("Major Reasons", width="medium")}
+                )
                 
                 st.markdown("---")
                 with st.expander("Show Detailed Rake List (Demurrage Only)"):
