@@ -47,6 +47,38 @@ if not HAS_OPENPYXL:
     st.error("⚠️ Missing dependency! Please run `pip install openpyxl` (or add it to requirements.txt) so the app can read multi-tab Google Sheets.")
     st.stop()
 
+# ==========================================
+# 1.5 ADMIN LOGIN SYSTEM
+# ==========================================
+if 'is_admin' not in st.session_state:
+    st.session_state['is_admin'] = False
+
+st.sidebar.header("🔒 Admin Login")
+if not st.session_state['is_admin']:
+    with st.sidebar.form("admin_login"):
+        st.caption("Required to view AI & Historical Analysis")
+        admin_user = st.text_input("User ID")
+        admin_pass = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
+        
+        # Allows you to securely change passwords in Streamlit Secrets, but defaults to admin/admin123
+        expected_user = st.secrets.get("ADMIN_USER", "admin")
+        expected_pass = st.secrets.get("ADMIN_PASS", "admin123")
+        
+        if submitted:
+            if admin_user == expected_user and admin_pass == expected_pass:
+                st.session_state['is_admin'] = True
+                st.rerun()
+            else:
+                st.error("Incorrect User ID or Password")
+else:
+    st.sidebar.success("✅ Logged in as Super Admin")
+    if st.sidebar.button("Logout"):
+        st.session_state['is_admin'] = False
+        st.rerun()
+
+st.sidebar.markdown("---")
+
 # --- SIDEBAR INPUTS ---
 st.sidebar.header("⚙️ Settings")
 
@@ -77,7 +109,7 @@ else:
 # ==========================================
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("📅 Data Limits (Tab 2)")
+st.sidebar.subheader("📅 Data Limits")
 # Strictly locked to Jan 1, 2026 onwards
 history_start_date = st.sidebar.date_input("Load History From", value=datetime(2026, 1, 1).date(), min_value=datetime(2026, 1, 1).date())
 
@@ -367,21 +399,22 @@ def generate_gemini_summary(raw_reasons_list, api_key):
     if not api_key:
         return "Error: No API key provided in Streamlit Secrets."
     
-    combined_text = "\n".join([str(r) for r in raw_reasons_list if r and str(r).strip() != "-"])
+    combined_text = "\n\n".join([str(r) for r in raw_reasons_list if r and str(r).strip() != "-"])
     if not combined_text.strip():
         return "No outage remarks found for this period to summarize."
 
+    # Updated Prompt to strictly enforce Dates in the output
     prompt = f"""
     You are an expert Railway Logistics Manager analyzing coal train unloading delays.
-    Please read the following raw operator notes and create a beautifully formatted Executive Summary.
+    Please read the following daily operator notes and create a beautifully formatted Outages Summary.
     
     Raw Notes:
     {combined_text}
     
     Formatting Rules:
     1. Group the summary cleanly by Department.
-    2. Accurately list the estimated outage times mentioned.
-    3. Briefly highlight any recurring trends.
+    2. For each issue, accurately list the specific Date, the estimated outage time, and the problem details.
+    3. Briefly highlight any recurring trends at the bottom.
     4. Keep it concise, professional, and use simple bullet points (do not use complex markdown formatting or emojis).
     """
 
@@ -404,7 +437,7 @@ def create_pdf_file(month_name, ai_summary):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", 'B', 16)
-    pdf.cell(0, 10, f"AI Executive Summary - {month_name}", 0, 1, 'C')
+    pdf.cell(0, 10, f"Outages Summary - {month_name}", 0, 1, 'C')
     pdf.ln(5)
     
     pdf.set_font("Arial", '', 11)
@@ -556,13 +589,11 @@ def fetch_google_sheet_actuals(url, free_time_hours, cutoff_date_input):
             col_h_dt = safe_parse_date(row.iloc[7])
             is_unplanned = pd.isnull(col_h_dt) 
             
-            # Smart Continuation Logic: Overwrite sequence if valid numbers found
             seq, rid = parse_last_sequence(rake_name)
             if seq > 0 or rid > 0:
                 last_seq_tuple = (seq, rid)
 
             if is_unplanned:
-                # AUTO-DROP OLD PENDING RAKES (> 3 DAYS)
                 if pd.notnull(arrival_dt) and (now_ist - arrival_dt).total_seconds() > (3 * 24 * 3600):
                     continue 
 
@@ -837,7 +868,6 @@ def run_full_simulation_initial(df_csv, params, df_locked, df_unplanned, last_se
             else:
                 display_name = str(max(curr_seq, curr_id))
             
-            # Ensure unique forecast numbering
             while (curr_seq, curr_id) in reserved_sequences:
                 if curr_id > 0: curr_id += 1
                 else: curr_seq += 1
@@ -983,7 +1013,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             daily_stats[d_str] = {
                 'Demurrage': 0, 'All_Reasons': set()
             }
-            # Initialize specifically for all 4 tipplers
             for t in ['T1', 'T2', 'T3', 'T4']: 
                 daily_stats[d_str][f'{t}_hrs'] = 0.0
                 daily_stats[d_str][f'{t}_wag'] = 0.0
@@ -999,7 +1028,6 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
 
         opt_type = str(row.get('Optimization Type', ''))
         
-        # Smart Shunting Breakdown to specific tipplers
         if "Actual" in opt_type:
             ready_dt = row.get('_Shunt_Ready_DT', pd.NaT)
             if pd.notnull(arr_dt) and pd.notnull(ready_dt):
@@ -1085,13 +1113,11 @@ def recalculate_cascade_reactive(df_all, start_filter_dt=None, end_filter_dt=Non
             'Major Reasons': major_reasons_str
         }
         
-        # Add Tippler Rates
         for t in ['T1', 'T2', 'T3', 'T4']:
             rate = 0.0
             if v[f'{t}_hrs'] > 0.1: rate = v[f'{t}_wag'] / v[f'{t}_hrs']
             row[f"{t} Rate (W/Hr)"] = f"{rate:.2f}"
             
-        # Add Individual Tippler Shunt Averages (Appended after T4 Rate)
         for t in ['T1', 'T2', 'T3', 'T4']:
             avg_shunt_sec = v[f'{t}_shunt_sec'] / v[f'{t}_shunt_cnt'] if v[f'{t}_shunt_cnt'] > 0 else 0
             row[f"Avg Shunt {t} (min)"] = f"{int(avg_shunt_sec // 60)}" if avg_shunt_sec > 0 else "-"
@@ -1147,8 +1173,14 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
         df_final = st.session_state.sim_result
         df_final['Date_Str'] = df_final['_Arrival_DT'].dt.strftime('%Y-%m-%d')
         unique_dates = sorted(df_final['Date_Str'].unique())
+        
+        is_admin = st.session_state.get('is_admin', False)
 
-        tab_live, tab_hist = st.tabs(["🚀 Live Schedule", "📜 Historical Analysis"])
+        if is_admin:
+            tab_live, tab_hist = st.tabs(["🚀 Live Schedule", "📜 Historical Analysis"])
+        else:
+            # If not admin, only create the Live Schedule tab
+            tab_live = st.tabs(["🚀 Live Schedule"])[0]
 
         with tab_live:
             # --- CUMULATIVE MONTH-TO-DATE METRICS ---
@@ -1186,138 +1218,152 @@ if 'raw_data_cached' in st.session_state or 'actuals_df' in st.session_state:
             yest_date = datetime.now(IST).date() - timedelta(days=1)
             daily_stats_df = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=yest_date)
             st.markdown("### 📊 Daily Performance & Demurrage Forecast")
-            st.dataframe(daily_stats_df, hide_index=True)
+            
+            st.dataframe(
+                daily_stats_df, 
+                hide_index=True, 
+                use_container_width=True,
+                column_config={"Major Reasons": st.column_config.TextColumn("Major Reasons", width="medium")}
+            )
             st.download_button("📥 Download Final Schedule", df_final.drop(columns=["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"]).to_csv(index=False).encode('utf-8'), "optimized_schedule.csv", "text/csv")
             
-            # ==========================================
-            # DYNAMIC MONTHLY AI REPORT & PIE CHART
-            # ==========================================
-            st.markdown("---")
-            st.markdown("### 🥧 Monthly Overview & AI Summary")
-            
-            today_real = datetime.now(IST).date()
-            limit_date = datetime(2026, 1, 1).date()
-            available_months = []
-            
-            curr_iter = today_real.replace(day=1)
-            while curr_iter >= limit_date:
-                available_months.append(curr_iter.strftime('%B %Y'))
-                curr_iter -= relativedelta(months=1)
-            
-            if not available_months:
-                available_months.append(today_real.strftime('%B %Y'))
-                
-            selected_my = st.selectbox("Select Month for Report", available_months, index=0)
-            
-            sel_dt = datetime.strptime(selected_my, "%B %Y")
-            start_m = sel_dt.date()
-            end_m = start_m.replace(day=calendar.monthrange(start_m.year, start_m.month)[1])
-            
-            outage_df = extract_smart_outages(st.session_state.sim_full_result)
-            if not outage_df.empty:
-                month_outage_df = outage_df[(outage_df['Month'] == sel_dt.month) & (outage_df['Year'] == sel_dt.year)]
-            else:
-                month_outage_df = pd.DataFrame()
-
-            if HAS_PLOTLY:
-                if not month_outage_df.empty:
-                    pie_data = month_outage_df.groupby('Department')['Outage Hours'].sum().reset_index()
-                    fig = px.pie(pie_data, names='Department', values='Outage Hours', hole=0.3, title=f"Total Department Outages: {selected_my}")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info(f"No formatted outage times (XX:XX - YY:YY) found for {selected_my}.")
-            else:
-                st.warning("⚠️ Please run `pip install plotly` to see the Pie Charts.")
-
-            col_a1, col_a2 = st.columns([1, 2])
-            with col_a1:
-                if st.button(f"✨ Generate AI Report for {selected_my}"):
-                    if not gemini_api_key:
-                        st.error("Please add your Gemini API Key to Streamlit Secrets.")
-                    elif not HAS_GEMINI:
-                        st.error("Please run `pip install google-genai`.")
-                    else:
-                        with st.spinner(f"Analyzing notes for {selected_my}..."):
-                            month_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_m, end_filter_dt=end_m)
-                            raw_reasons = month_stats['Major Reasons'].dropna().tolist()
-                            combined_text = "\n".join([str(r) for r in raw_reasons if r and str(r).strip() != "-"])
-                            
-                            if not combined_text.strip():
-                                st.warning("There are no operator remarks for this month to summarize.")
-                            else:
-                                ai_summary = generate_gemini_summary([combined_text], gemini_api_key)
-                                st.session_state[f'ai_summary_{selected_my}'] = ai_summary
-                                st.success("Summary Generated!")
-            
-            if f'ai_summary_{selected_my}' in st.session_state:
-                summary_text = st.session_state[f'ai_summary_{selected_my}']
-                st.info(summary_text)
-                
-                if HAS_FPDF:
-                    pdf_bytes = create_pdf_file(selected_my, summary_text)
-                    if pdf_bytes:
-                        st.download_button(
-                            label="📥 Download Extracted Report as PDF",
-                            data=pdf_bytes,
-                            file_name=f"AI_Executive_Summary_{selected_my.replace(' ', '_')}.pdf",
-                            mime="application/pdf"
-                        )
-                else:
-                    st.warning("⚠️ Run `pip install fpdf` to enable PDF downloads.")
-
-        with tab_hist:
-            st.subheader("🔍 Past Performance Analysis")
-            col_h1, col_h2 = st.columns(2)
-            with col_h1:
-                view_mode = st.radio("Select View Mode", ["Day View", "Month View", "Custom Range"], horizontal=True)
-            
-            start_f, end_f = None, None
-            with col_h2:
-                if view_mode == "Day View":
-                    sel_date = st.date_input("Select Date", value=datetime.now(IST).date() - timedelta(days=1))
-                    start_f, end_f = sel_date, sel_date
-                elif view_mode == "Month View":
-                    c_m1, c_m2 = st.columns(2)
-                    with c_m1: sel_month = st.selectbox("Month", range(1, 13), index=datetime.now().month - 1)
-                    with c_m2: sel_year = st.number_input("Year", value=datetime.now().year)
-                    import calendar
-                    last_day = calendar.monthrange(sel_year, sel_month)[1]
-                    start_f = datetime(sel_year, sel_month, 1).date()
-                    end_f = datetime(sel_year, sel_month, last_day).date()
-                else: 
-                    dr = st.date_input("Select Date Range", value=(datetime.now(IST).date()-timedelta(days=7), datetime.now(IST).date()))
-                    if isinstance(dr, tuple) and len(dr) == 2: start_f, end_f = dr
-            
-            if start_f and end_f:
-                # --- CUMULATIVE METRICS FOR SELECTED HISTORICAL RANGE ---
-                mask_hist = (st.session_state.sim_full_result['_Arrival_DT'].dt.date >= start_f) & \
-                            (st.session_state.sim_full_result['_Arrival_DT'].dt.date <= end_f)
-                hist_df_filtered = st.session_state.sim_full_result[mask_hist]
-                hist_boxn = hist_df_filtered['Load Type'].astype(str).str.upper().str.contains('BOXN').sum()
-                hist_bobr = hist_df_filtered['Load Type'].astype(str).str.upper().str.contains('BOBR').sum()
-                
-                st.markdown(f"### 📈 Period Handled ({start_f} to {end_f})")
-                col_hm1, col_hm2, col_hm3 = st.columns(3)
-                col_hm1.metric("📦 Total Rakes Handled", f"{len(hist_df_filtered)}")
-                col_hm2.metric("🚂 BOXN Rakes", f"{hist_boxn}")
-                col_hm3.metric("⚡ BOBR Rakes", f"{hist_bobr}")
-                
-                hist_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_f, end_filter_dt=end_f)
-                st.markdown(f"**Performance Summary**")
-                
-                st.dataframe(hist_stats, hide_index=True, use_container_width=True)
-                
+            # --- PROTECTED ADMIN AI SECTION ---
+            if is_admin:
                 st.markdown("---")
-                with st.expander("Show Detailed Rake List (Demurrage Only)"):
-                    mask = (st.session_state.sim_full_result['_Arrival_DT'].dt.date >= start_f) & (st.session_state.sim_full_result['_Arrival_DT'].dt.date <= end_f)
-                    hist_raw = st.session_state.sim_full_result[mask].copy()
+                st.markdown("### 🥧 Outages summary for the Month (AI Generated)")
+                
+                today_real = datetime.now(IST).date()
+                limit_date = datetime(2026, 1, 1).date()
+                available_months = []
+                
+                curr_iter = today_real.replace(day=1)
+                while curr_iter >= limit_date:
+                    available_months.append(curr_iter.strftime('%B %Y'))
+                    curr_iter -= relativedelta(months=1)
+                
+                if not available_months:
+                    available_months.append(today_real.strftime('%B %Y'))
                     
-                    def has_demurrage(val):
-                        s = str(val).strip()
-                        return s != "00:00" and s != "0"
+                selected_my = st.selectbox("Select Month for Report", available_months, index=0)
+                
+                sel_dt = datetime.strptime(selected_my, "%B %Y")
+                start_m = sel_dt.date()
+                end_m = start_m.replace(day=calendar.monthrange(start_m.year, start_m.month)[1])
+                
+                outage_df = extract_smart_outages(st.session_state.sim_full_result)
+                if not outage_df.empty:
+                    month_outage_df = outage_df[(outage_df['Month'] == sel_dt.month) & (outage_df['Year'] == sel_dt.year)]
+                else:
+                    month_outage_df = pd.DataFrame()
+
+                if HAS_PLOTLY:
+                    if not month_outage_df.empty:
+                        pie_data = month_outage_df.groupby('Department')['Outage Hours'].sum().reset_index()
+                        fig = px.pie(pie_data, names='Department', values='Outage Hours', hole=0.3, title=f"Total Department Outages: {selected_my}")
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info(f"No formatted outage times (XX:XX - YY:YY) found for {selected_my}.")
+                else:
+                    st.warning("⚠️ Please run `pip install plotly` to see the Pie Charts.")
+
+                col_a1, col_a2 = st.columns([1, 2])
+                with col_a1:
+                    if st.button(f"✨ Generate Outages Summary for {selected_my}"):
+                        if not gemini_api_key:
+                            st.error("Please add your Gemini API Key to Streamlit Secrets.")
+                        elif not HAS_GEMINI:
+                            st.error("Please run `pip install google-genai`.")
+                        else:
+                            with st.spinner(f"Analyzing notes for {selected_my}..."):
+                                month_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_m, end_filter_dt=end_m)
+                                
+                                raw_reasons_with_dates = []
+                                for _, row in month_stats.iterrows():
+                                    if row['Major Reasons'] and row['Major Reasons'] != "-":
+                                        raw_reasons_with_dates.append(f"Date: {row['Date']}\nIssues: {row['Major Reasons']}")
+                                
+                                if not raw_reasons_with_dates:
+                                    st.warning("There are no operator remarks for this month to summarize.")
+                                else:
+                                    ai_summary = generate_gemini_summary(raw_reasons_with_dates, gemini_api_key)
+                                    st.session_state[f'ai_summary_{selected_my}'] = ai_summary
+                                    st.success("Summary Generated!")
+                
+                if f'ai_summary_{selected_my}' in st.session_state:
+                    summary_text = st.session_state[f'ai_summary_{selected_my}']
+                    st.info(summary_text)
                     
-                    hist_raw = hist_raw[hist_raw['Demurrage'].apply(has_demurrage)]
+                    if HAS_FPDF:
+                        pdf_bytes = create_pdf_file(selected_my, summary_text)
+                        if pdf_bytes:
+                            st.download_button(
+                                label="📥 Download Extracted Report as PDF",
+                                data=pdf_bytes,
+                                file_name=f"Outages_Summary_{selected_my.replace(' ', '_')}.pdf",
+                                mime="application/pdf"
+                            )
+                    else:
+                        st.warning("⚠️ Run `pip install fpdf` to enable PDF downloads.")
+
+        # --- PROTECTED ADMIN HISTORY TAB ---
+        if is_admin:
+            with tab_hist:
+                st.subheader("🔍 Past Performance Analysis")
+                col_h1, col_h2 = st.columns(2)
+                with col_h1:
+                    view_mode = st.radio("Select View Mode", ["Day View", "Month View", "Custom Range"], horizontal=True)
+                
+                start_f, end_f = None, None
+                with col_h2:
+                    if view_mode == "Day View":
+                        sel_date = st.date_input("Select Date", value=datetime.now(IST).date() - timedelta(days=1))
+                        start_f, end_f = sel_date, sel_date
+                    elif view_mode == "Month View":
+                        c_m1, c_m2 = st.columns(2)
+                        with c_m1: sel_month = st.selectbox("Month", range(1, 13), index=datetime.now().month - 1)
+                        with c_m2: sel_year = st.number_input("Year", value=datetime.now().year)
+                        import calendar
+                        last_day = calendar.monthrange(sel_year, sel_month)[1]
+                        start_f = datetime(sel_year, sel_month, 1).date()
+                        end_f = datetime(sel_year, sel_month, last_day).date()
+                    else: 
+                        dr = st.date_input("Select Date Range", value=(datetime.now(IST).date()-timedelta(days=7), datetime.now(IST).date()))
+                        if isinstance(dr, tuple) and len(dr) == 2: start_f, end_f = dr
+                
+                if start_f and end_f:
+                    mask_hist = (st.session_state.sim_full_result['_Arrival_DT'].dt.date >= start_f) & \
+                                (st.session_state.sim_full_result['_Arrival_DT'].dt.date <= end_f)
+                    hist_df_filtered = st.session_state.sim_full_result[mask_hist]
+                    hist_boxn = hist_df_filtered['Load Type'].astype(str).str.upper().str.contains('BOXN').sum()
+                    hist_bobr = hist_df_filtered['Load Type'].astype(str).str.upper().str.contains('BOBR').sum()
                     
-                    cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
-                    hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
-                    st.dataframe(hist_raw_clean, use_container_width=True)
+                    st.markdown(f"### 📈 Period Handled ({start_f} to {end_f})")
+                    col_hm1, col_hm2, col_hm3 = st.columns(3)
+                    col_hm1.metric("📦 Total Rakes Handled", f"{len(hist_df_filtered)}")
+                    col_hm2.metric("🚂 BOXN Rakes", f"{hist_boxn}")
+                    col_hm3.metric("⚡ BOBR Rakes", f"{hist_bobr}")
+                    
+                    hist_stats = recalculate_cascade_reactive(st.session_state.sim_full_result, start_filter_dt=start_f, end_filter_dt=end_f)
+                    st.markdown(f"**Performance Summary**")
+                    
+                    st.dataframe(
+                        hist_stats, 
+                        hide_index=True, 
+                        use_container_width=True,
+                        column_config={"Major Reasons": st.column_config.TextColumn("Major Reasons", width="medium")}
+                    )
+                    
+                    st.markdown("---")
+                    with st.expander("Show Detailed Rake List (Demurrage Only)"):
+                        mask = (st.session_state.sim_full_result['_Arrival_DT'].dt.date >= start_f) & (st.session_state.sim_full_result['_Arrival_DT'].dt.date <= end_f)
+                        hist_raw = st.session_state.sim_full_result[mask].copy()
+                        
+                        def has_demurrage(val):
+                            s = str(val).strip()
+                            return s != "00:00" and s != "0"
+                        
+                        hist_raw = hist_raw[hist_raw['Demurrage'].apply(has_demurrage)]
+                        
+                        cols_to_drop_hist = ["_Arrival_DT", "_Shunt_Ready_DT", "_Form_Mins", "Date_Str", "_raw_wagon_counts", "_remarks"] + [f"{t}_{x}_Obj" for t in ['T1','T2','T3','T4'] for x in ['Start','End']] + ['_raw_end_dt', '_raw_tipplers', '_raw_tipplers_data']
+                        hist_raw_clean = hist_raw.drop(columns=cols_to_drop_hist, errors='ignore')
+                        st.dataframe(hist_raw_clean, use_container_width=True)
